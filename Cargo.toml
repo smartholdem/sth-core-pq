@@ -1,0 +1,49 @@
+[package]
+name = "sth-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["TechnoL0g"]
+description = "SmartHoldem relay node core (Rust rewrite of @smartholdem/core)"
+license = "MIT"
+
+[lib]
+name = "sth_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sth-core"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+sled = { version = "0.34", features = ["compression"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+k256 = { version = "0.13", features = ["ecdsa", "sha256", "std"] }
+sha2 = "0.10"
+ripemd = "0.1"
+bs58 = { version = "0.5", features = ["check"] }
+hex = "0.4"
+num-bigint = "0.4"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+indicatif = "0.17"
+futures = "0.3"
+flate2 = "1"
+tar = "0.4"
+rmpv = "1"
+axum = "0.7"
+tokio-tungstenite = "0.24"
+prost = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
