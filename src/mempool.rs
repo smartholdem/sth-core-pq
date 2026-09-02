@@ -1,0 +1,228 @@
+//! Author: TechnoL0g
+//!
+//! In-memory transaction pool with legacy-compatible admission checks and best-effort
+//! relaying to the legacy node pool (until iroh gossip takes over in Phase 5).
+
+use crate::config::Network;
+use crate::crypto::{address_from_public_key, transaction_id, validate_address, verify_transaction_signature};
+use crate::models::{tx_type, Transaction, TYPE_GROUP_CORE};
+use crate::storage::Storage;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Result of `POST /api/transactions` in the legacy `{ accept, broadcast, excess, invalid }` shape.
+#[derive(Debug, Default, Serialize)]
+pub struct PoolResponse {
+    pub accept: Vec<String>,
+    pub broadcast: Vec<String>,
+    pub excess: Vec<String>,
+    pub invalid: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolError {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub message: String,
+}
+
+pub struct Mempool {
+    txs: RwLock<HashMap<String, Transaction>>,
+    storage: Arc<Storage>,
+    network: Network,
+    relay_nodes: Vec<String>,
+    client: reqwest::Client,
+    max_size: usize,
+}
+
+impl Mempool {
+    pub fn new(storage: Arc<Storage>, relay_nodes: Vec<String>, max_size: usize) -> Self {
+        let network = storage.network().clone();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent(concat!("sth-core/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_default();
+        Self { txs: RwLock::new(HashMap::new()), storage, network, relay_nodes, client, max_size }
+    }
+
+    pub async fn len(&self) -> usize {
+        self.txs.read().await.len()
+    }
+
+    pub async fn get(&self, id: &str) -> Option<Transaction> {
+        self.txs.read().await.get(id).cloned()
+    }
+
+    /// Pending transactions, newest nonce first is irrelevant here — insertion order is not kept.
+    pub async fn all(&self) -> Vec<Transaction> {
+        self.txs.read().await.values().cloned().collect()
+    }
+
+    /// Validate and admit transactions; returns the legacy response plus per-id errors.
+    pub async fn add_many(&self, incoming: Vec<Transaction>) -> (PoolResponse, HashMap<String, PoolError>) {
+        let mut resp = PoolResponse::default();
+        let mut errors = HashMap::new();
+        for mut tx in incoming {
+            let id = match transaction_id(&tx) {
+                Ok(id) => id,
+                Err(e) => {
+                    errors.insert("unknown".into(), PoolError { type_: "ERR_BAD_DATA".into(), message: e.to_string() });
+                    resp.invalid.push("unknown".into());
+                    continue;
+                }
+            };
+            if let Some(given) = &tx.id {
+                if given != &id {
+                    errors.insert(given.clone(), PoolError { type_: "ERR_BAD_DATA".into(), message: format!("Transaction id {given} does not match its bytes ({id})") });
+                    resp.invalid.push(given.clone());
+                    continue;
+                }
+            }
+            tx.id = Some(id.clone());
+            match self.validate(&tx).await {
+                Ok(()) => {
+                    self.txs.write().await.insert(id.clone(), tx);
+                    resp.accept.push(id.clone());
+                    resp.broadcast.push(id);
+                }
+                Err((type_, message)) => {
+                    errors.insert(id.clone(), PoolError { type_, message });
+                    resp.invalid.push(id);
+                }
+            }
+        }
+        if !resp.broadcast.is_empty() {
+            self.relay(&resp.broadcast).await;
+        }
+        (resp, errors)
+    }
+
+    async fn validate(&self, tx: &Transaction) -> std::result::Result<(), (String, String)> {
+        let id = tx.id.clone().unwrap_or_default();
+        let pool = self.txs.read().await;
+        if pool.contains_key(&id) {
+            return Err(("ERR_DUPLICATE".into(), format!("Transaction {id} is already in the pool")));
+        }
+        if pool.len() >= self.max_size {
+            return Err(("ERR_POOL_FULL".into(), "Transaction pool is full".into()));
+        }
+        if self.storage.get_transaction(&id).map_err(storage_err)?.is_some() {
+            return Err(("ERR_FORGED".into(), format!("Transaction {id} is already forged")));
+        }
+        if tx.version != 2 || tx.type_group != TYPE_GROUP_CORE {
+            return Err(("ERR_UNKNOWN".into(), "Only version 2 core transactions are supported".into()));
+        }
+        if let Some(n) = tx.network {
+            if n != self.network.pubkey_hash {
+                return Err(("ERR_WRONG_NETWORK".into(), format!("Transaction network {n} does not match {}", self.network.pubkey_hash)));
+            }
+        }
+        match verify_transaction_signature(tx) {
+            Ok(true) => {}
+            Ok(false) => return Err(("ERR_BAD_DATA".into(), "Transaction signature is invalid".into())),
+            Err(e) => return Err(("ERR_BAD_DATA".into(), e.to_string())),
+        }
+        let sender = address_from_public_key(&tx.sender_public_key, self.network.pubkey_hash)
+            .map_err(|e| ("ERR_BAD_DATA".into(), e.to_string()))?;
+        for recipient in recipients(tx) {
+            if !validate_address(recipient, self.network.pubkey_hash) {
+                return Err(("ERR_BAD_DATA".into(), format!("Invalid recipient {recipient}")));
+            }
+        }
+
+        let wallet = self.storage.get_wallet(&sender).map_err(storage_err)?;
+        let (balance, nonce) = wallet.map(|w| (w.balance, w.nonce)).unwrap_or((0, 0));
+        let pending: Vec<&Transaction> = pool.values().filter(|p| p.sender_public_key == tx.sender_public_key).collect();
+        let pending_spent: i128 = pending.iter().map(|p| spent(p)).sum();
+        let expected_nonce = nonce + 1 + pending.len() as u64;
+        match tx.nonce {
+            Some(n) if n == expected_nonce => {}
+            Some(n) => {
+                return Err(("ERR_BAD_NONCE".into(), format!("Sender {sender}: nonce {n}, expected {expected_nonce}")));
+            }
+            None => return Err(("ERR_BAD_NONCE".into(), "Transaction nonce is missing".into())),
+        }
+        if (balance as i128) - pending_spent < spent(tx) {
+            return Err(("ERR_LOW_BALANCE".into(), format!("Sender {sender} has insufficient balance")));
+        }
+        if tx.type_ == tx_type::TRANSFER && tx.recipient_id.is_none() {
+            return Err(("ERR_BAD_DATA".into(), "Transfer without recipient".into()));
+        }
+        Ok(())
+    }
+
+    /// Drop transactions that made it into a block or whose nonce is now stale.
+    pub async fn prune_confirmed(&self) {
+        let snapshot: Vec<(String, Transaction)> =
+            self.txs.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut stale = Vec::new();
+        for (id, tx) in snapshot {
+            let forged = self.storage.get_transaction(&id).ok().flatten().is_some();
+            let stale_nonce = address_from_public_key(&tx.sender_public_key, self.network.pubkey_hash)
+                .ok()
+                .and_then(|a| self.storage.get_wallet(&a).ok().flatten())
+                .map(|w| tx.nonce.unwrap_or(0) <= w.nonce)
+                .unwrap_or(false);
+            if forged || stale_nonce {
+                stale.push(id);
+            }
+        }
+        if !stale.is_empty() {
+            let mut pool = self.txs.write().await;
+            for id in &stale {
+                pool.remove(id);
+            }
+            tracing::debug!(removed = stale.len(), "mempool pruned");
+        }
+    }
+
+    /// Best-effort forward to one legacy node so the transaction reaches the forging network.
+    async fn relay(&self, ids: &[String]) {
+        if self.relay_nodes.is_empty() {
+            return;
+        }
+        let txs: Vec<Transaction> = {
+            let pool = self.txs.read().await;
+            ids.iter().filter_map(|id| pool.get(id).cloned()).collect()
+        };
+        let body = serde_json::json!({ "transactions": txs });
+        for node in &self.relay_nodes {
+            let url = format!("{node}/api/transactions");
+            match self.client.post(&url).json(&body).send().await {
+                Ok(r) if r.status().is_success() => {
+                    tracing::info!(node, count = txs.len(), "transactions relayed to legacy network");
+                    return;
+                }
+                Ok(r) => tracing::warn!(node, status = %r.status(), "relay rejected"),
+                Err(e) => tracing::warn!(node, error = %e, "relay failed"),
+            }
+        }
+    }
+}
+
+fn storage_err(e: crate::error::Error) -> (String, String) {
+    ("ERR_UNKNOWN".into(), e.to_string())
+}
+
+fn recipients(tx: &Transaction) -> Vec<&str> {
+    let mut out: Vec<&str> = tx.recipient_id.iter().map(|s| s.as_str()).collect();
+    if let Some(p) = tx.asset.as_ref().and_then(|a| a.payments.as_ref()) {
+        out.extend(p.iter().map(|p| p.recipient_id.as_str()));
+    }
+    out
+}
+
+/// Total outflow of a transaction (amount + fee + multipayment sum).
+fn spent(tx: &Transaction) -> i128 {
+    let payments: u128 = tx
+        .asset
+        .as_ref()
+        .and_then(|a| a.payments.as_ref())
+        .map(|p| p.iter().map(|x| x.amount as u128).sum())
+        .unwrap_or(0);
+    tx.amount as i128 + tx.fee as i128 + payments as i128
+}
