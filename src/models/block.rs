@@ -1,6 +1,6 @@
 //! Author: TechnoL0g
 //!
-//! `Block` - 1:1 JSON mirror of core's `IBlockData` (header + embedded transactions).
+//! `Block` — 1:1 JSON mirror of core's `IBlockData` (header + embedded transactions).
 
 use super::serde_utils::string_u64;
 use super::Transaction;

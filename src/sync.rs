@@ -1,16 +1,16 @@
 //! Author: TechnoL0g
 //!
-//! legacy bootstrap sync over the public REST API of existing SmartHoldem
+//! Phase 3 — legacy bootstrap sync over the public REST API of existing SmartHoldem
 //! nodes (port 4003 behind HTTPS), rate-limit aware.
 //!
 //! TEMPORARY: SmartHoldem nodes talk to each other over the dedicated P2P port
 //! (`p2p.blocks.getBlocks` over WebSocket/protobuf); this module only exists to catch up
 //! quickly with the chain. Phase 5 (iroh) replaces it.
 //!
-//! Pipeline: `[fetch ranges concurrently through NodePool] -> mpsc -> [verify + apply in order]`.
+//! Pipeline: `[fetch ranges concurrently through NodePool] → mpsc → [verify + apply in order]`.
 //! * `NodePool` enforces ≤4 req/s per node, ≤250 req/60 s per node, parks a node for 60 s on
 //!   HTTP 429 and after 5 consecutive failures, and spreads workers over all nodes.
-//! * Errors back off 1 s -> 2 s -> 4 s -> 8 s -> 16 s (max) before the next attempt.
+//! * Errors back off 1 s → 2 s → 4 s → 8 s → 16 s (max) before the next attempt.
 //! * Every block is linked to the stored tip (`previousBlock == tip.id`), fully verified and
 //!   applied atomically via `Storage::apply_block`, so Ctrl+C can never corrupt state and
 //!   `sth-core sync` resumes from `get_last_height()`.
@@ -305,7 +305,7 @@ impl Syncer {
         let outcome = loop {
             tokio::select! {
                 _ = &mut ctrl_c => {
-                    self.info("SIGINT received - state is saved after every block; stopping (resume with `sth-core sync`)".to_string());
+                    self.info("SIGINT received — state is saved after every block; stopping (resume with `sth-core sync`)".to_string());
                     break Outcome::Interrupted;
                 }
                 next = receiver.recv() => match next {

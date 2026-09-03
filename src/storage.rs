@@ -3,15 +3,15 @@
 //! Sled-backed chain state.
 //!
 //! Key layout (single tree):
-//!   `b:<height BE u64>`  -> compact block: [u32 LE len][header bytes] then [u32 LE len][tx bytes]*
+//!   `b:<height BE u64>`  → compact block: [u32 LE len][header bytes] then [u32 LE len][tx bytes]*
 //!                          (wire format, ~5x smaller than JSON; decoded on read)
-//!   `bid:<block id>`     -> height BE u64
-//!   `t:<tx id>`          -> height BE u64 (secondary index)
-//!   `w:<address>`        -> wallet state JSON
-//!   `wp:<publicKey>` / `wu:<username>` -> address (wallet lookup by key / delegate name)
-//!   `tl:<height BE><seq BE>`             -> tx id (global transaction order)
-//!   `wt:<address>:<height BE><seq BE>`   -> tx id (per-wallet transaction history)
-//!   `meta:last_height`   -> height BE u64
+//!   `bid:<block id>`     → height BE u64
+//!   `t:<tx id>`          → height BE u64 (secondary index)
+//!   `w:<address>`        → wallet state JSON
+//!   `wp:<publicKey>` / `wu:<username>` → address (wallet lookup by key / delegate name)
+//!   `tl:<height BE><seq BE>`             → tx id (global transaction order)
+//!   `wt:<address>:<height BE><seq BE>`   → tx id (per-wallet transaction history)
+//!   `meta:last_height`   → height BE u64
 
 use crate::config::Network;
 use crate::crypto::{

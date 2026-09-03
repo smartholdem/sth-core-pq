@@ -1,6 +1,6 @@
 //! Author: TechnoL0g
 //!
-//! Block header deserialisation inverse of `serialize_block`, port of
+//! Block header deserialisation — inverse of `serialize_block`, port of
 //! `Blocks.Deserializer.deserializeHeader` (snapshot `blocks` records and P2P payloads).
 
 use super::block_serializer::block_id;

@@ -1,6 +1,6 @@
 //! Author: TechnoL0g
 //!
-//! AIP-11 (v2) transaction wire serialisation byte-exact port of
+//! AIP-11 (v2) transaction wire serialisation — byte-exact port of
 //! `Transactions.Serializer` + per-type `serialize()` from `@smartholdem/crypto`.
 
 use super::address::address_to_bytes;

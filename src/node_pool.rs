@@ -6,8 +6,8 @@
 //! Every node in the pool gets its own budget:
 //!   * spacing: at most `per_node_rps` requests per second (default 4 = 20 % headroom),
 //!   * sliding window: at most `window_limit` requests per `window` (default 250 / 60 s),
-//!   * 429 > node is parked for `ban_on_429` (default 60 s),
-//!   * `max_failures` consecutive network / 5xx errors > node is parked for `ban_on_failures`.
+//!   * 429 → node is parked for `ban_on_429` (default 60 s),
+//!   * `max_failures` consecutive network / 5xx errors → node is parked for `ban_on_failures`.
 //! `acquire()` hands out the earliest free slot across all eligible nodes, so concurrent
 //! workers are automatically spread over the pool (6 nodes × 4 req/s ≈ 24 req/s aggregate).
 

@@ -19,6 +19,56 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub const DEFAULT_P2P_PORT: u16 = 4001;
+
+/// Published peer list of the mainnet (maintained by the SmartHoldem team).
+pub const PEERS_URL: &str = "https://raw.githubusercontent.com/smartholdem/data/main/mainnet/peers.json";
+
+/// Fetch `peers.json` (`[{ "ip", "port" }]`) and return `ip` entries for `port`; falls back to `P2P_SEEDS`.
+pub async fn fetch_peer_list(port: u16) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        ip: String,
+        port: u16,
+    }
+    let fetched = async {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+        client.get(PEERS_URL).send().await?.error_for_status()?.json::<Vec<Entry>>().await
+    }
+    .await;
+    match fetched {
+        Ok(list) if !list.is_empty() => {
+            let mut ips: Vec<String> = list.into_iter().filter(|e| e.port == port).map(|e| e.ip).collect();
+            for seed in P2P_SEEDS {
+                if !ips.iter().any(|ip| ip == seed) {
+                    ips.push(seed.to_string());
+                }
+            }
+            tracing::info!(count = ips.len(), url = PEERS_URL, "peer list loaded");
+            ips
+        }
+        Ok(_) => P2P_SEEDS.iter().map(|s| s.to_string()).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot fetch peers.json, using built-in seeds");
+            P2P_SEEDS.iter().map(|s| s.to_string()).collect()
+        }
+    }
+}
+
+/// Seed peers of the legacy network. The P2P port must be addressed by IP — the
+/// `nodeN.smartholdem.io` hostnames sit behind a reverse proxy that answers 403 on 4001.
+pub const P2P_SEEDS: &[&str] = &[
+    "138.199.164.235",
+    "138.199.149.214",
+    "116.202.32.250",
+    "188.245.166.98",
+    "188.245.206.222",
+    "136.243.144.114",
+    "91.99.119.119",
+    "159.69.188.60",
+    "78.47.194.10",
+    "157.180.114.125",
+    "95.217.132.244",
+];
 /// Version advertised in `headers.version` (peers reject unknown majors).
 pub const PEER_VERSION: &str = "3.8.2";
 /// Server-side hard limit of `p2p.blocks.getBlocks`.
@@ -395,6 +445,7 @@ pub async fn follow(
     use crate::sync::{apply_blocks, ChainTip};
     let network = storage.network().clone();
     let timeout = Duration::from_secs(20);
+    let mut hosts: Vec<String> = if hosts.is_empty() { P2P_SEEDS.iter().map(|s| s.to_string()).collect() } else { hosts };
     let mut idx = 0usize;
     loop {
         let host = hosts[idx % hosts.len()].clone();
@@ -408,6 +459,18 @@ pub async fn follow(
             }
         };
         tracing::info!(host, port, "connected to legacy peer");
+        // Peer discovery: learn new addresses from the peer table (IPs only, same port).
+        if let Ok(peers) = peer.get_peers().await {
+            let before = hosts.len();
+            for p in peers.iter().filter(|p| p.port as u16 == port) {
+                if !hosts.contains(&p.ip) {
+                    hosts.push(p.ip.clone());
+                }
+            }
+            if hosts.len() > before {
+                tracing::info!(discovered = hosts.len() - before, total = hosts.len(), "peer table updated");
+            }
+        }
         loop {
             let tip = match storage.get_last_block() {
                 Ok(Some(b)) => ChainTip { height: b.height, id: b.id },

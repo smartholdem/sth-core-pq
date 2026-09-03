@@ -1,6 +1,6 @@
 //! Author: TechnoL0g
 //!
-//! `sth-core` - SmartHoldem relay node core.
+//! `sth-core` — SmartHoldem relay node core.
 //! Rust rewrite of the `@smartholdem/core` data structures, cryptography and state storage.
 
 pub mod api;

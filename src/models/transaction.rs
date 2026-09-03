@@ -1,6 +1,6 @@
 //! Author: TechnoL0g
 //!
-//! `Transaction` 1:1 JSON mirror of core's `ITransactionData` (AIP-11 / v2 format).
+//! `Transaction` — 1:1 JSON mirror of core's `ITransactionData` (AIP-11 / v2 format).
 
 use super::serde_utils::{opt_string_u64, string_u64};
 use serde::{Deserialize, Serialize};

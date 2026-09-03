@@ -1,14 +1,14 @@
 //! Author: TechnoL0g
 //!
-//! Snapshot import - reads dumps produced by `yarn sth snapshot:dump` (core-snapshots,
+//! Snapshot import — reads dumps produced by `yarn sth snapshot:dump` (core-snapshots,
 //! codec "default" = MessagePack codec) and applies them to Sled. Also downloads the
 //! latest `<start>-<end>.tgz` from https://snapshots.smartholdem.io/.
 //!
 //! Dump layout: `<start>-<end>/{meta.json, blocks, transactions, rounds}`.
 //! Each stream is gzip (unless `skipCompression`) of `[u32 LE length][record]*`:
-//!   * blocks       > serialised block header incl. signature (`Blocks.Serializer.serialize(block, true)`)
-//!   * transactions > msgpack `[id, blockId, blockHeight, sequence, timestamp, serialized(bin)]`
-//!   * rounds       > msgpack `[publicKey, balance, round]` (delegate ranking - not needed by a relay)
+//!   * blocks       → serialised block header incl. signature (`Blocks.Serializer.serialize(block, true)`)
+//!   * transactions → msgpack `[id, blockId, blockHeight, sequence, timestamp, serialized(bin)]`
+//!   * rounds       → msgpack `[publicKey, balance, round]` (delegate ranking — not needed by a relay)
 
 use crate::config::Network;
 use crate::crypto::{block_payload_hash, deserialize_block_header, deserialize_transaction, verify_block};

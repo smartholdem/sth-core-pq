@@ -1,6 +1,6 @@
 //! Author: TechnoL0g
 //!
-//! AIP-11 (v2) transaction wire deserialisation inverse of `tx_serializer.rs`, port of
+//! AIP-11 (v2) transaction wire deserialisation — inverse of `tx_serializer.rs`, port of
 //! `Transactions.Deserializer` + per-type `deserialize()` (used for snapshot import and P2P).
 
 use super::address::address_from_bytes;

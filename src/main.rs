@@ -121,6 +121,9 @@ enum Command {
         p2p: bool,
         #[arg(long, env = "CORE_P2P_PORT", default_value_t = 4001)]
         p2p_port: u16,
+        /// Legacy P2P seed peers as IPs (default: built-in seed list; hostnames answer 403 on 4001).
+        #[arg(long, value_delimiter = ',')]
+        peers: Option<Vec<String>>,
     },
     /// Query a legacy node over its P2P port (getStatus + getPeers) — connectivity check.
     PeerStatus {
@@ -294,7 +297,7 @@ async fn main() -> anyhow::Result<()> {
                 None => println!("wallet {address} not found"),
             }
         }
-        Command::Run { network: net_name, api_host, api_port, no_api, nodes, concurrency, skip_verify, quiet, from_dump, fast_import, snapshot_dir, mempool_size, p2p, p2p_port } => {
+        Command::Run { network: net_name, api_host, api_port, no_api, nodes, concurrency, skip_verify, quiet, from_dump, fast_import, snapshot_dir, mempool_size, p2p, p2p_port, peers } => {
             if net_name != "mainnet" {
                 return Err(anyhow!("only mainnet is supported (got {net_name})"));
             }
@@ -328,11 +331,10 @@ async fn main() -> anyhow::Result<()> {
                     pool_for_prune.prune_confirmed().await;
                 }
             });
-            let hosts: Vec<String> = cfg
-                .nodes
-                .iter()
-                .map(|n| n.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string())
-                .collect();
+            let hosts: Vec<String> = match peers {
+                Some(p) => p,
+                None => sth_core::p2p_legacy::fetch_peer_list(p2p_port).await,
+            };
             if p2p {
                 // Legacy P2P: 400 blocks per call, no REST rate limit — used for catch-up and live follow.
                 tracing::info!(port = p2p_port, "relay node running over legacy P2P (Ctrl+C to stop)");
