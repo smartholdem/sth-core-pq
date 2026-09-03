@@ -1,0 +1,41 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>sth-core status</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--ink:#e6e6e6;--dim:#8b93a7;--ok:#3ddc84;--warn:#ffb454;--bad:#ff5c5c;--line:#262a35}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 ui-monospace,Menlo,Consolas,monospace}
+header{padding:20px 28px;border-bottom:1px solid var(--line);display:flex;gap:28px;align-items:baseline}
+h1{font-size:18px;margin:0;letter-spacing:.04em}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:18px;padding:22px 28px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);margin:0 0 12px}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:4px 6px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--dim);font-weight:normal}.big{font-size:28px}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.dim{color:var(--dim)}
+</style></head><body>
+<header><h1>sth-core</h1><span id="height" class="big">…</span><span id="sync" class="dim"></span><span id="clock" class="dim"></span></header>
+<main>
+<section><h2>Forging</h2><div id="forging" class="dim">delegate module disabled</div></section>
+<section><h2>Peers</h2><div id="peersmeta" class="dim"></div><table id="peers"></table></section>
+<section style="grid-column:1/-1"><h2>Last blocks</h2><table id="blocks"></table></section>
+</main>
+<script>
+const $=id=>document.getElementById(id),fmt=n=>Number(n).toLocaleString('en-US');
+async function j(u){const r=await fetch(u);return r.json()}
+async function tick(){
+ try{
+  const [bc,st,fg,pe,bl]=await Promise.all([j('/api/blockchain'),j('/api/node/syncing'),j('/api/node/forging'),j('/api/node/peers?limit=40'),j('/api/blocks?limit=12')]);
+  $('height').textContent=fmt(bc.data.block.height);
+  $('sync').textContent=st.data.syncing?`syncing, ${fmt(st.data.blocks)} behind`:'100% in sync';$('sync').className=st.data.syncing?'warn':'ok';
+  $('clock').textContent=new Date().toISOString().slice(11,19)+' UTC';
+  const f=fg.data;
+  if(f.enabled){
+   let h=`<table><tr><th>delegate</th><th>rank</th><th>active</th></tr>${f.delegates.map(d=>`<tr><td>${d.username}</td><td>${d.rank??'-'}</td><td class="${d.active?'ok':'bad'}">${d.active?'yes':'no'}</td></tr>`).join('')}</table>`;
+   h+=`<p>next slot: ${f.nextSlot?`${f.nextSlot.slot} · ${f.nextSlot.delegate} · ${new Date(f.nextSlot.startsAtUnix*1000).toISOString().slice(11,19)} UTC`:'<span class="dim">—</span>'}</p>`;
+   h+=`<p>forged: ${f.forgedCount}${f.lastForged?` · last ${fmt(f.lastForged.height)} (${f.lastForged.transactions} tx, accepted by ${f.lastForged.acceptedBy} peers)`:''}</p>`;
+   if(f.skipped.length)h+=`<table><tr><th>slot</th><th>delegate</th><th>skipped because</th></tr>${f.skipped.slice(-8).reverse().map(s=>`<tr><td>${s.slot}</td><td>${s.delegate}</td><td class="warn">${s.reason}</td></tr>`).join('')}</table>`;
+   $('forging').innerHTML=h;$('forging').className='';
+  }
+  const m=pe.meta;$('peersmeta').textContent=`legacy alive ${m.alive??0}/${m.known??0} · best ${fmt(m.bestHeight??0)}`+(m.irohEndpointId?` · iroh ${m.irohPeers} peers · id ${m.irohEndpointId.slice(0,10)}…`:'')+(m.gateways&&m.gateways.length?` · gateways ${m.gateways.join(', ')}`:'');
+  $('peers').innerHTML=`<tr><th>peer</th><th>src</th><th>height</th><th>latency</th><th>state</th></tr>`+pe.data.map(p=>`<tr><td>${p.ip||p.id.slice(0,12)+'…'}</td><td>${p.source}</td><td>${fmt(p.height)}</td><td>${p.latency??'-'} ms</td><td class="${p.state==='ok'||p.state==='neighbor'?'ok':p.state==='banned'?'bad':'dim'}">${p.state}</td></tr>`).join('');
+  $('blocks').innerHTML=`<tr><th>height</th><th>time</th><th>tx</th><th>forger</th><th>fees</th><th>id</th></tr>`+bl.data.map(b=>`<tr><td>${fmt(b.height)}</td><td>${b.timestamp.human.slice(11,19)}</td><td>${b.transactions}</td><td>${b.generator.username||b.generator.address}</td><td>${(Number(b.forged.fee)/1e8).toFixed(2)}</td><td class="dim">${b.id.slice(0,16)}…</td></tr>`).join('');
+ }catch(e){$('sync').textContent='api unreachable';$('sync').className='bad'}
+}
+tick();setInterval(tick,5000);
+</script></body></html>

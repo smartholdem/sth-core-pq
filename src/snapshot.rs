@@ -240,7 +240,7 @@ pub fn import_snapshot(
     let started = Instant::now();
     let network: &Network = storage.network();
     let meta = SnapshotMeta::read(dir)?;
-    if meta.network != network.name {
+    if meta.network != network.name.as_str() {
         return Err(Error::Sync(format!("snapshot is for network '{}', node runs '{}'", meta.network, network.name)));
     }
     if meta.codec != "default" {

@@ -1,6 +1,6 @@
 [package]
 name = "sth-core"
-version = "0.1.0"
+version = "0.8.1"
 edition = "2021"
 authors = ["TechnoL0g"]
 description = "SmartHoldem relay node core (Rust rewrite of @smartholdem/core)"
@@ -39,11 +39,20 @@ rmpv = "1"
 axum = "0.7"
 tokio-tungstenite = "0.24"
 prost = "0.13"
+serde_yaml = "0.9"
+iroh = "1.1.0"
+iroh-gossip = "0.101.0"
+n0-future = "0.3"
 
 [dev-dependencies]
+iroh = "1.1.0"
 tempfile = "3"
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"

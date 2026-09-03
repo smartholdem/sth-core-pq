@@ -42,3 +42,20 @@ pub fn address_to_bytes(address: &str) -> Result<[u8; 21]> {
 pub fn validate_address(address: &str, network_byte: u8) -> bool {
     matches!(address_to_bytes(address), Ok(b) if b[0] == network_byte)
 }
+
+/// Address of a multi-signature wallet: the combined point of `PublicKey(sha256(hex(min)))` and all
+/// participant keys (legacy `PublicKey.fromMultiSignatureAsset`), hashed like a regular public key.
+pub fn address_from_multi_signature(asset: &crate::models::MultiSignatureAsset, network_byte: u8) -> Result<String> {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use k256::{AffinePoint, ProjectivePoint, PublicKey};
+    let min_key = super::keys::KeyPair::from_passphrase(&format!("{:02x}", asset.min))?;
+    let mut sum = ProjectivePoint::IDENTITY;
+    for hex_key in std::iter::once(min_key.public_key_hex()).chain(asset.public_keys.iter().cloned()) {
+        let bytes = hex::decode(&hex_key)?;
+        let pk = PublicKey::from_sec1_bytes(&bytes).map_err(|e| Error::PublicKey(format!("{hex_key}: {e}")))?;
+        sum += ProjectivePoint::from(*pk.as_affine());
+    }
+    let affine: AffinePoint = sum.into();
+    let combined = PublicKey::from_affine(affine).map_err(|e| Error::PublicKey(format!("multisig point: {e}")))?;
+    address_from_public_key(&hex::encode(combined.to_encoded_point(true).as_bytes()), network_byte)
+}

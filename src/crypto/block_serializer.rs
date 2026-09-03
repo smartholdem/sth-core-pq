@@ -40,6 +40,23 @@ pub fn serialize_block(block: &Block, include_signature: bool) -> Result<Vec<u8>
 }
 
 /// Block id = sha256(header || signature), hex.
+/// Legacy `Serializer.serializeWithTransactions`: signed header, then a `u32 LE` length per
+/// transaction, then all transaction bytes (the payload of `p2p.blocks.postBlock`).
+pub fn serialize_block_with_transactions(block: &Block, network: &Network) -> Result<Vec<u8>> {
+    let mut out = serialize_block(block, true)?;
+    let mut bodies = Vec::with_capacity(block.transactions.len());
+    for tx in &block.transactions {
+        bodies.push(super::tx_serializer::serialize_transaction(tx, super::tx_serializer::SerializeOptions::default(), network)?);
+    }
+    for b in &bodies {
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    }
+    for b in bodies {
+        out.extend_from_slice(&b);
+    }
+    Ok(out)
+}
+
 pub fn block_id(block: &Block) -> Result<String> {
     Ok(hex::encode(sha256(&serialize_block(block, true)?)))
 }
@@ -99,7 +116,7 @@ pub fn verify_block(block: &Block, network: &Network) -> BlockVerification {
         Ok(false) => errors.push("Failed to verify block signature".into()),
         Err(e) => errors.push(format!("Failed to verify block signature: {e}")),
     }
-    if block.version != milestone.block_version {
+    if block.version != milestone.block_version() {
         errors.push("Invalid block version".into());
     }
     if block.timestamp > network.now_epoch() + milestone.blocktime {
@@ -108,7 +125,7 @@ pub fn verify_block(block: &Block, network: &Network) -> BlockVerification {
     if block.transactions.len() as u32 != block.number_of_transactions {
         errors.push("Invalid number of transactions".into());
     }
-    if block.height > 1 && block.transactions.len() as u32 > milestone.max_transactions {
+    if block.height > 1 && block.transactions.len() as u32 > milestone.max_transactions() {
         errors.push("Transactions length is too high".into());
     }
     if let Some(id) = &block.id {

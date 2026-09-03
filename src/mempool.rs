@@ -6,6 +6,7 @@
 use crate::config::Network;
 use crate::crypto::{address_from_public_key, transaction_id, validate_address, verify_transaction_signature};
 use crate::models::{tx_type, Transaction, TYPE_GROUP_CORE};
+use crate::p2p_legacy::PeerTable;
 use crate::storage::Storage;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -34,19 +35,42 @@ pub struct Mempool {
     storage: Arc<Storage>,
     network: Network,
     relay_nodes: Vec<String>,
+    peers: Option<Arc<PeerTable>>,
+    relay_fanout: usize,
     client: reqwest::Client,
     max_size: usize,
+    /// Accepted transactions, for other transports (iroh gossip) to re-publish.
+    events: tokio::sync::broadcast::Sender<Vec<Transaction>>,
 }
 
 impl Mempool {
     pub fn new(storage: Arc<Storage>, relay_nodes: Vec<String>, max_size: usize) -> Self {
+        Self::build(storage, relay_nodes, None, 0, max_size)
+    }
+
+    /// Mempool that relays over the legacy P2P peer table before falling back to REST nodes.
+    pub fn with_p2p(storage: Arc<Storage>, relay_nodes: Vec<String>, peers: Arc<PeerTable>, relay_fanout: usize, max_size: usize) -> Self {
+        Self::build(storage, relay_nodes, Some(peers), relay_fanout, max_size)
+    }
+
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
+    /// Stream of transaction batches accepted into the pool.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Vec<Transaction>> {
+        self.events.subscribe()
+    }
+
+    fn build(storage: Arc<Storage>, relay_nodes: Vec<String>, peers: Option<Arc<PeerTable>>, relay_fanout: usize, max_size: usize) -> Self {
         let network = storage.network().clone();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .user_agent(concat!("sth-core/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
-        Self { txs: RwLock::new(HashMap::new()), storage, network, relay_nodes, client, max_size }
+        let (events, _) = tokio::sync::broadcast::channel(64);
+        Self { txs: RwLock::new(HashMap::new()), storage, network, relay_nodes, peers, relay_fanout, client, max_size, events }
     }
 
     pub async fn len(&self) -> usize {
@@ -96,6 +120,10 @@ impl Mempool {
             }
         }
         if !resp.broadcast.is_empty() {
+            let pool = self.txs.read().await;
+            let accepted: Vec<Transaction> = resp.broadcast.iter().filter_map(|id| pool.get(id).cloned()).collect();
+            drop(pool);
+            let _ = self.events.send(accepted);
             self.relay(&resp.broadcast).await;
         }
         (resp, errors)
@@ -180,15 +208,26 @@ impl Mempool {
         }
     }
 
-    /// Best-effort forward to one legacy node so the transaction reaches the forging network.
+    /// Best-effort forward so the transaction reaches the forging network: legacy P2P
+    /// `postTransactions` (port 4001, IP peers) first, REST `POST /api/transactions` as fallback.
     async fn relay(&self, ids: &[String]) {
-        if self.relay_nodes.is_empty() {
-            return;
-        }
         let txs: Vec<Transaction> = {
             let pool = self.txs.read().await;
             ids.iter().filter_map(|id| pool.get(id).cloned()).collect()
         };
+        let serialized: Vec<Vec<u8>> = txs
+            .iter()
+            .filter_map(|t| crate::crypto::serialize_transaction(t, crate::crypto::SerializeOptions::default(), &self.network).ok())
+            .collect();
+        if let Some(table) = &self.peers {
+            let delivered = crate::p2p_legacy::broadcast(table, serialized, self.relay_fanout, std::time::Duration::from_secs(10)).await;
+            if delivered > 0 {
+                return;
+            }
+        }
+        if self.relay_nodes.is_empty() {
+            return;
+        }
         let body = serde_json::json!({ "transactions": txs });
         for node in &self.relay_nodes {
             let url = format!("{node}/api/transactions");

@@ -1,23 +1,21 @@
 //! Author: TechnoL0g
 //!
-//! `sth-core` CLI: local state inspection, block verify / import and legacy HTTP sync.
-//! `run` (API + P2P) arrives in later phases.
+//! `sth-core` CLI: `init` (node.yaml), `run` (relay node), snapshot tools, legacy sync and
+//! peer diagnostics. Node assembly lives in `sth_core::node`.
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
-use sth_core::api::{self, AppState};
 use sth_core::config::Network;
-use sth_core::mempool::Mempool;
 use sth_core::crypto::{verify_block, ChainObject};
 use sth_core::models::Block;
-use indicatif::{ProgressBar, ProgressStyle};
+use sth_core::node::{download_bar, resolve_snapshot, run_import, NodeContext, RunFlags};
+use sth_core::node_config::{NodeConfig, DEFAULT_CONFIG_FILE};
 use sth_core::node_pool::RateLimitConfig;
-use sth_core::snapshot::{self, ImportOptions, ImportReport, SnapshotMeta, DEFAULT_SNAPSHOT_BASE_URL};
+use sth_core::p2p_legacy::PeerTable;
+use sth_core::snapshot::{self, SnapshotMeta, DEFAULT_SNAPSHOT_BASE_URL};
 use sth_core::storage::Storage;
-use sth_core::sync::{progress_style, SyncConfig, Syncer};
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use sth_core::sync::{SyncConfig, Syncer};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -25,9 +23,9 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "sth-core", version, about = "SmartHoldem relay node (Rust)")]
 struct Cli {
-    /// Sled database directory.
-    #[arg(long, global = true, default_value = "./data")]
-    db_path: PathBuf,
+    /// Sled database directory (default: node.yaml `db_path`, else ./data).
+    #[arg(long, global = true)]
+    db_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -87,41 +85,77 @@ enum Command {
         #[command(subcommand)]
         cmd: SnapshotCmd,
     },
-    /// Run the relay node: optional snapshot bootstrap → catch up → follow the chain + local REST API.
+    /// Initialise a commented `node.yaml` configuration file.
+    Init {
+        /// Where to write the configuration.
+        #[arg(long, default_value = DEFAULT_CONFIG_FILE)]
+        config: PathBuf,
+        /// Overwrite an existing file.
+        #[arg(long)]
+        force: bool,
+        /// Also export the embedded network files (crypto-networks layout) into ./network.
+        #[arg(long)]
+        network_files: bool,
+    },
+    /// Run the relay node from `node.yaml` (CLI flags override the file): optional snapshot bootstrap →
+    /// catch up → follow the chain + local REST API.
     Run {
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-        /// Bind address of the local API (env CORE_API_HOST, default 127.0.0.1 — local bridge only).
-        #[arg(long, env = "CORE_API_HOST", default_value = "127.0.0.1")]
-        api_host: String,
-        #[arg(long, env = "CORE_API_PORT", default_value_t = 4003)]
-        api_port: u16,
+        /// Configuration file (default: ./node.yaml when present, else built-in defaults).
+        #[arg(long, value_name = "node.yaml")]
+        config: Option<PathBuf>,
+        /// Bind address of the local API (env CORE_API_HOST — keep 127.0.0.1, local bridge only).
+        #[arg(long, env = "CORE_API_HOST")]
+        api_host: Option<String>,
+        #[arg(long, env = "CORE_API_PORT")]
+        api_port: Option<u16>,
         /// Disable the REST API.
         #[arg(long)]
         no_api: bool,
+        /// Legacy REST nodes (bootstrap / relay fallback).
         #[arg(long, value_delimiter = ',')]
         nodes: Option<Vec<String>>,
-        #[arg(long, default_value_t = 8)]
-        concurrency: usize,
+        #[arg(long)]
+        concurrency: Option<usize>,
         #[arg(long)]
         skip_verify: bool,
         #[arg(long)]
         quiet: bool,
+        /// Import a snapshot before syncing (a dump folder / .tgz / `latest`), even if the DB is not empty.
         #[arg(long, value_name = "PATH|latest")]
         from_dump: Option<String>,
         #[arg(long)]
         fast_import: bool,
-        #[arg(long, default_value = "./snapshots")]
-        snapshot_dir: PathBuf,
-        /// Max transactions kept in the mempool.
-        #[arg(long, default_value_t = 5_000)]
-        mempool_size: usize,
-        /// After catching up, follow the chain through the legacy P2P port instead of polling the REST API.
         #[arg(long)]
+        snapshot_dir: Option<PathBuf>,
+        /// Max transactions kept in the mempool.
+        #[arg(long)]
+        mempool_size: Option<usize>,
+        /// Follow the chain through the legacy P2P port (default from config; `--no-p2p` for REST polling).
+        #[arg(long, conflicts_with = "no_p2p")]
         p2p: bool,
+        #[arg(long)]
+        no_p2p: bool,
+        #[arg(long, env = "CORE_P2P_PORT")]
+        p2p_port: Option<u16>,
+        /// Legacy P2P peers as IPs; replaces peers.json + built-in seeds.
+        #[arg(long, value_delimiter = ',')]
+        peers: Option<Vec<String>>,
+        /// Peers pulled from concurrently during catch-up.
+        #[arg(long)]
+        parallel_peers: Option<usize>,
+        /// Reward address for future seeding / delegate rewards.
+        #[arg(long)]
+        reward_address: Option<String>,
+    },
+    /// Print (creating if needed) the iroh EndpointId of this node — share it as `p2p.iroh.bootstrap` on other nodes.
+    IrohId {
+        #[arg(long, default_value = "./iroh.key")]
+        key_file: PathBuf,
+    },
+    /// Probe the legacy peer list and print the health table (latency, height, version).
+    Peers {
         #[arg(long, env = "CORE_P2P_PORT", default_value_t = 4001)]
-        p2p_port: u16,
-        /// Legacy P2P seed peers as IPs (default: built-in seed list; hostnames answer 403 on 4001).
+        port: u16,
         #[arg(long, value_delimiter = ',')]
         peers: Option<Vec<String>>,
     },
@@ -160,77 +194,6 @@ enum SnapshotCmd {
     Info { path: PathBuf },
 }
 
-fn import_bar(quiet: bool) -> anyhow::Result<ProgressBar> {
-    let pb = if quiet { ProgressBar::hidden() } else { ProgressBar::new(0) };
-    pb.set_style(progress_style("Importing")?);
-    Ok(pb)
-}
-
-fn download_bar() -> anyhow::Result<ProgressBar> {
-    let pb = ProgressBar::new(0);
-    pb.set_style(
-        ProgressStyle::with_template("Downloading: [{bar:40}] {bytes} / {total_bytes} ({bytes_per_sec}, ETA: {eta})")?
-            .progress_chars("=> "),
-    );
-    Ok(pb)
-}
-
-/// Resolve `latest` / .tgz / folder into an extracted snapshot directory.
-async fn resolve_snapshot(source: &str, snapshot_dir: &Path) -> anyhow::Result<PathBuf> {
-    let archive_or_dir = if source == "latest" {
-        let pb = download_bar()?;
-        let archive = snapshot::download_latest(DEFAULT_SNAPSHOT_BASE_URL, snapshot_dir, &pb).await?;
-        pb.finish_and_clear();
-        archive
-    } else {
-        PathBuf::from(source)
-    };
-    let dir = tokio::task::spawn_blocking(move || snapshot::locate_snapshot_dir(&archive_or_dir)).await??;
-    Ok(dir)
-}
-
-/// Run the blocking import on the blocking pool with Ctrl+C support.
-async fn run_import(storage: Arc<Storage>, dir: PathBuf, fast: bool, quiet: bool) -> anyhow::Result<ImportReport> {
-    let meta = SnapshotMeta::read(&dir)?;
-    tracing::info!(
-        folder = meta.folder,
-        blocks = meta.blocks.count,
-        transactions = meta.transactions.count,
-        end_height = meta.blocks.end,
-        compressed = !meta.skip_compression,
-        fast,
-        "importing snapshot"
-    );
-    let pb = import_bar(quiet)?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_flag = cancel.clone();
-    let ctrl_c = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            cancel_flag.store(true, Ordering::Relaxed);
-        }
-    });
-    let pb_worker = pb.clone();
-    let report = tokio::task::spawn_blocking(move || {
-        snapshot::import_snapshot(&storage, &dir, ImportOptions { fast }, &pb_worker, &cancel)
-    })
-    .await??;
-    ctrl_c.abort();
-    pb.finish_and_clear();
-    let secs = report.elapsed.as_secs_f64().max(0.001);
-    tracing::info!(
-        from = report.start_height,
-        to = report.end_height,
-        imported = report.imported,
-        skipped = report.skipped,
-        snapshot_end = report.snapshot_end,
-        elapsed = format!("{:.1}s", secs),
-        rate = format!("{:.0} blocks/sec", report.imported as f64 / secs),
-        "snapshot import {}",
-        if report.interrupted { "interrupted — rerun to resume" } else { "complete" }
-    );
-    Ok(report)
-}
-
 fn read_block(file: &PathBuf) -> anyhow::Result<Block> {
     let raw = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let value: serde_json::Value = serde_json::from_slice(&raw)?;
@@ -247,13 +210,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let network = Network::mainnet();
+    let db_path: PathBuf = cli.db_path.clone().unwrap_or_else(|| PathBuf::from("./data"));
 
     match cli.command {
         Command::Info => {
-            let storage = Storage::open(&cli.db_path, network.clone())?;
+            let storage = Storage::open(&db_path, network.clone())?;
             let last = storage.get_last_block()?;
             println!("network:      {} (pubKeyHash {})", network.name, network.pubkey_hash);
-            println!("db path:      {}", cli.db_path.display());
+            println!("db path:      {}", db_path.display());
             match last {
                 Some(b) => {
                     println!("height:       {}", b.height);
@@ -285,71 +249,109 @@ async fn main() -> anyhow::Result<()> {
             if !v.verified {
                 return Err(anyhow!("block verification failed: {:?}", v.errors));
             }
-            let storage = Storage::open(&cli.db_path, network)?;
+            let storage = Storage::open(&db_path, network)?;
             storage.apply_block(&block)?;
             storage.flush()?;
             tracing::info!(height = block.height, "block imported");
         }
         Command::Wallet { address } => {
-            let storage = Storage::open(&cli.db_path, network)?;
+            let storage = Storage::open(&db_path, network)?;
             match storage.get_wallet(&address)? {
                 Some(w) => println!("{}", serde_json::to_string_pretty(&w)?),
                 None => println!("wallet {address} not found"),
             }
         }
-        Command::Run { network: net_name, api_host, api_port, no_api, nodes, concurrency, skip_verify, quiet, from_dump, fast_import, snapshot_dir, mempool_size, p2p, p2p_port, peers } => {
-            if net_name != "mainnet" {
-                return Err(anyhow!("only mainnet is supported (got {net_name})"));
+        Command::Init { config, force, network_files } => {
+            if force && config.exists() {
+                std::fs::remove_file(&config).with_context(|| format!("removing {}", config.display()))?;
             }
-            let mut cfg = SyncConfig { concurrency, verify: !skip_verify, follow: !p2p, quiet, ..SyncConfig::default() };
-            if let Some(nodes) = nodes {
-                cfg.nodes = nodes.into_iter().map(|n| n.trim_end_matches('/').to_string()).collect();
+            NodeConfig::write_default(&config)?;
+            println!("configuration written to {}", config.display());
+            if network_files {
+                let dir = PathBuf::from("network");
+                NodeConfig::export_network_files(&dir)?;
+                println!("network files written to {} (set network_dir: ./network in {} to use them)", dir.display(), config.display());
             }
-            let storage = Arc::new(Storage::open(&cli.db_path, network)?);
-            if let Some(source) = from_dump {
-                let dir = resolve_snapshot(&source, &snapshot_dir).await?;
-                let report = run_import(storage.clone(), dir, fast_import, quiet).await?;
-                if report.interrupted {
-                    return Err(anyhow!("import interrupted"));
-                }
+            println!("edit rewards.reward_address / reward_passphrase, then start with: sth-core run --config {}", config.display());
+        }
+        Command::Run {
+            config, api_host, api_port, no_api, nodes, concurrency, skip_verify, quiet, from_dump, fast_import, snapshot_dir,
+            mempool_size, p2p, no_p2p, p2p_port, peers, parallel_peers, reward_address,
+        } => {
+            let mut cfg = NodeConfig::load_or_default(config.as_deref())?;
+            if let Some(p) = &cli.db_path {
+                cfg.db_path = p.display().to_string();
             }
-            let mempool = Arc::new(Mempool::new(storage.clone(), cfg.nodes.clone(), mempool_size));
-            if !no_api {
-                let addr: SocketAddr = format!("{api_host}:{api_port}").parse().context("invalid api bind address")?;
-                let state = Arc::new(AppState::new(storage.clone(), mempool.clone(), cfg.nodes.clone()));
-                tokio::spawn(async move {
-                    if let Err(e) = api::serve(state, addr).await {
-                        tracing::error!(error = %e, "REST API stopped");
-                    }
-                });
+            if let Some(h) = api_host {
+                cfg.api.host = h;
             }
-            let pool_for_prune = mempool.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(8));
-                loop {
-                    tick.tick().await;
-                    pool_for_prune.prune_confirmed().await;
-                }
-            });
-            let hosts: Vec<String> = match peers {
-                Some(p) => p,
-                None => sth_core::p2p_legacy::fetch_peer_list(p2p_port).await,
-            };
+            if let Some(p) = api_port {
+                cfg.api.port = p;
+            }
+            if no_api {
+                cfg.api.enabled = false;
+            }
+            if let Some(n) = nodes {
+                cfg.sync.rest_nodes = n.into_iter().map(|n| n.trim_end_matches('/').to_string()).collect();
+            }
+            if let Some(c) = concurrency {
+                cfg.sync.concurrency = c;
+            }
+            if skip_verify {
+                cfg.sync.verify_blocks = false;
+            }
+            if let Some(d) = &from_dump {
+                cfg.sync.bootstrap_snapshot = d.clone();
+            }
+            if fast_import {
+                cfg.sync.fast_import = true;
+            }
+            if let Some(d) = snapshot_dir {
+                cfg.sync.snapshot_dir = d.display().to_string();
+            }
+            if let Some(m) = mempool_size {
+                cfg.mempool.max_size = m;
+            }
             if p2p {
-                // Legacy P2P: 400 blocks per call, no REST rate limit — used for catch-up and live follow.
-                tracing::info!(port = p2p_port, "relay node running over legacy P2P (Ctrl+C to stop)");
-                tokio::select! {
-                    r = sth_core::p2p_legacy::follow(storage.clone(), hosts, p2p_port, !skip_verify) => { r?; }
-                    _ = tokio::signal::ctrl_c() => { tracing::info!("SIGINT received, stopping"); }
-                }
-                storage.flush()?;
-                tracing::info!(height = storage.get_last_height()?, "relay node stopped");
-            } else {
-                let syncer = Arc::new(Syncer::new(storage, cfg)?);
-                tracing::info!("relay node running: catching up over REST, then following the chain (Ctrl+C to stop)");
-                let report = syncer.run().await?;
-                tracing::info!(height = report.end_height, applied = report.blocks_applied, "relay node stopped");
+                cfg.p2p.legacy_enabled = true;
             }
+            if no_p2p {
+                cfg.p2p.legacy_enabled = false;
+            }
+            if let Some(p) = p2p_port {
+                cfg.p2p.legacy_port = p;
+            }
+            if let Some(list) = peers {
+                cfg.p2p.legacy_peers = list;
+                cfg.p2p.use_peer_list = false;
+            }
+            if let Some(n) = parallel_peers {
+                cfg.p2p.parallel_peers = n;
+            }
+            if let Some(a) = reward_address {
+                cfg.rewards.reward_address = a;
+            }
+            let node = NodeContext::open(cfg).await?;
+            node.run(RunFlags { quiet, force_bootstrap: from_dump.is_some() }).await?;
+        }
+        Command::IrohId { key_file } => {
+            let secret = sth_core::p2p_iroh::load_or_create_secret(&key_file)?;
+            println!("{}", secret.public());
+        }
+        Command::Peers { port, peers } => {
+            let seeds = match peers {
+                Some(p) => p,
+                None => sth_core::p2p_legacy::fetch_peer_list(port).await,
+            };
+            let table = PeerTable::new(port, seeds);
+            let alive = table.refresh(16, Duration::from_secs(10)).await;
+            println!("{:<18} {:>9} {:>8} {:<8} {}", "peer", "height", "latency", "version", "state");
+            for p in table.snapshot() {
+                let state = if p.successes == 0 { "unreachable" } else { "ok" };
+                let latency = if p.successes == 0 { "-".to_string() } else { format!("{} ms", p.latency_ms) };
+                println!("{:<18} {:>9} {:>8} {:<8} {}", p.ip, p.height, latency, p.version, state);
+            }
+            println!("alive: {alive} / {}  best height: {}", table.len(), table.best_height());
         }
         Command::PeerStatus { host, port, blocks, from } => {
             let mut peer = sth_core::p2p_legacy::LegacyPeer::connect(&host, port, Duration::from_secs(15)).await?;
@@ -387,7 +389,7 @@ async fn main() -> anyhow::Result<()> {
             }
             SnapshotCmd::Import { path, fast_import, quiet } => {
                 let dir = tokio::task::spawn_blocking(move || snapshot::locate_snapshot_dir(&path)).await??;
-                let storage = Arc::new(Storage::open(&cli.db_path, network)?);
+                let storage = Arc::new(Storage::open(&db_path, network)?);
                 let report = run_import(storage, dir, fast_import, quiet).await?;
                 if report.interrupted {
                     return Err(anyhow!("import interrupted"));
@@ -435,7 +437,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(nodes) = nodes {
                 cfg.nodes = nodes.into_iter().map(|n| n.trim_end_matches('/').to_string()).collect();
             }
-            let storage = Arc::new(Storage::open(&cli.db_path, network)?);
+            let storage = Arc::new(Storage::open(&db_path, network)?);
             if let Some(source) = from_dump {
                 let dir = resolve_snapshot(&source, &snapshot_dir).await?;
                 let report = run_import(storage.clone(), dir, fast_import, quiet).await?;

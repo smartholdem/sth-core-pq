@@ -6,10 +6,16 @@
 pub mod api;
 pub mod config;
 pub mod crypto;
+pub mod delegate;
 pub mod error;
+pub mod genesis;
 pub mod mempool;
 pub mod models;
+pub mod node;
+pub mod node_config;
 pub mod node_pool;
+pub mod ntp;
+pub mod p2p_iroh;
 pub mod p2p_legacy;
 pub mod snapshot;
 pub mod storage;

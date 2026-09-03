@@ -185,13 +185,13 @@ pub fn serialize_transaction(tx: &Transaction, opts: SerializeOptions, network: 
 
 /// Transaction id = sha256(full serialised bytes), hex.
 pub fn transaction_id(tx: &Transaction) -> Result<String> {
-    let bytes = serialize_transaction(tx, SerializeOptions::default(), &Network::mainnet())?;
+    let bytes = serialize_transaction(tx, SerializeOptions::default(), Network::mainnet_ref())?;
     Ok(hex::encode(sha256(&bytes)))
 }
 
 /// Hash that the sender signs (bytes without signature / secondSignature).
 pub fn transaction_signing_hash(tx: &Transaction) -> Result<[u8; 32]> {
-    let bytes = serialize_transaction(tx, SerializeOptions::for_signing(), &Network::mainnet())?;
+    let bytes = serialize_transaction(tx, SerializeOptions::for_signing(), Network::mainnet_ref())?;
     Ok(sha256(&bytes))
 }
 
@@ -212,6 +212,6 @@ pub fn verify_transaction_second_signature(tx: &Transaction, second_public_key_h
         None => return Ok(false),
     };
     let opts = SerializeOptions { exclude_signature: false, exclude_second_signature: true, exclude_multi_signature: false };
-    let bytes = serialize_transaction(tx, opts, &Network::mainnet())?;
+    let bytes = serialize_transaction(tx, opts, Network::mainnet_ref())?;
     verify_signature(&sha256(&bytes), sig, second_public_key_hex)
 }
