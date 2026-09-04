@@ -7,8 +7,10 @@
 
 mod blocks;
 mod delegates;
+mod entities;
 mod locks;
 mod node;
+mod ntfry;
 mod render;
 mod status_page;
 mod transactions;
@@ -39,13 +41,20 @@ pub struct AppState {
     pub iroh: Option<Arc<crate::p2p_iroh::IrohNode>>,
     pub forging: Option<Arc<Mutex<crate::delegate::ForgingStatus>>>,
     pub started: Instant,
+    /// Serve the metrics page at `/` of the main API (api.page_metrics without metrics_listen).
+    pub page_metrics: bool,
     delegates_cache: Mutex<Option<(u64, Vec<Value>)>>,
 }
 
 impl AppState {
     pub fn new(storage: Arc<Storage>, mempool: Arc<Mempool>, peers: Vec<String>) -> Self {
         let network = storage.network().clone();
-        Self { storage, mempool, network, peers, peer_table: None, iroh: None, forging: None, started: Instant::now(), delegates_cache: Mutex::new(None) }
+        Self { storage, mempool, network, peers, peer_table: None, iroh: None, forging: None, started: Instant::now(), page_metrics: false, delegates_cache: Mutex::new(None) }
+    }
+
+    pub fn with_metrics_page(mut self, on: bool) -> Self {
+        self.page_metrics = on;
+        self
     }
 
     pub fn with_forging(mut self, status: Arc<Mutex<crate::delegate::ForgingStatus>>) -> Self {
@@ -75,6 +84,10 @@ pub struct Params(Vec<(String, String)>);
 impl Params {
     pub fn get(&self, key: &str) -> Option<&String> {
         self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(String, String)> {
+        self.0.iter()
     }
 
     pub fn parse<T: std::str::FromStr>(&self, key: &str) -> Option<T> {
@@ -136,8 +149,10 @@ pub fn router(state: Shared) -> Router {
     // unknown routes answer with the legacy error envelope instead of an empty 404
 
     Router::new()
-        .route("/", get(node::hello))
+        .route("/", get(ntfry::root))
         .route("/status", get(status_page::page))
+        .route("/api/ntfry/peers", get(ntfry::peers))
+        .route("/api/ntfry/metrics", get(ntfry::metrics))
         .route("/api/blockchain", get(node::blockchain))
         .route("/api/node/status", get(node::status))
         .route("/api/node/syncing", get(node::syncing))
@@ -163,11 +178,12 @@ pub fn router(state: Shared) -> Router {
         .route("/api/transactions/:id", get(transactions::by_id))
         .route("/api/votes", get(transactions::votes))
         .route("/api/votes/:id", get(transactions::vote_by_id))
+        .route("/api/entities", get(entities::list))
+        .route("/api/entities/search", post(entities::search))
+        .route("/api/entities/:id", get(entities::by_id))
         .route("/api/locks", get(locks::list))
         .route("/api/locks/unlocked", post(locks::unlocked))
         .route("/api/locks/:id", get(locks::by_id))
-        .route("/api/entities", get(node::entities))
-        .route("/api/entities/:id", get(node::entity_by_id))
         .route("/api/wallets", get(wallets::list))
         .route("/api/wallets/top", get(wallets::top))
         .route("/api/wallets/:id", get(wallets::by_id))
@@ -197,6 +213,13 @@ pub async fn serve(state: Shared, addr: SocketAddr) -> std::io::Result<()> {
 
 pub async fn serve_listener(state: Shared, listener: tokio::net::TcpListener) -> std::io::Result<()> {
     axum::serve(listener, router(state)).await
+}
+
+/// Dedicated metrics port (`api.metrics_listen`): the page at `/` plus `/api/ntfry/*` only.
+pub async fn serve_metrics(state: Shared, addr: SocketAddr) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(url = format!("http://{addr}/"), "metrics page listening");
+    axum::serve(listener, ntfry::metrics_router(state)).await
 }
 
 // ------------------------------------------------------------------ pagination

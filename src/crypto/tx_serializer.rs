@@ -38,6 +38,20 @@ fn write_address(w: &mut ByteWriter, address: &str) -> Result<()> {
 }
 
 fn serialize_type_payload(tx: &Transaction, w: &mut ByteWriter) -> Result<()> {
+    if tx.is_entity() {
+        let e = tx.entity_asset().ok_or_else(|| Error::Serialization("missing entity asset".into()))?;
+        let reg = e.registration_id.as_deref().map(hex::decode).transpose().map_err(|e| Error::Serialization(format!("bad registrationId: {e}")))?.unwrap_or_default();
+        let name = e.data.name.as_deref().unwrap_or("").as_bytes();
+        let ipfs = e.data.ipfs_data.as_deref().unwrap_or("").as_bytes();
+        if reg.len() > 255 || name.len() > 255 || ipfs.len() > 255 {
+            return Err(Error::Serialization("entity field longer than 255 bytes".into()));
+        }
+        w.u8(e.type_).u8(e.sub_type).u8(e.action);
+        w.u8(reg.len() as u8).bytes(&reg);
+        w.u8(name.len() as u8).bytes(name);
+        w.u8(ipfs.len() as u8).bytes(ipfs);
+        return Ok(());
+    }
     if tx.type_group != TYPE_GROUP_CORE {
         return Err(Error::Serialization(format!("unsupported typeGroup {}", tx.type_group)));
     }

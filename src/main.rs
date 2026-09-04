@@ -209,6 +209,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // blue (ANSI 34) when stdout is a terminal, plain otherwise (pm2 / files)
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        println!("\x1b[1;34mcore version {}\x1b[0m", env!("CARGO_PKG_VERSION"));
+    } else {
+        println!("core version {}", env!("CARGO_PKG_VERSION"));
+    }
     let network = Network::mainnet();
     let db_path: PathBuf = cli.db_path.clone().unwrap_or_else(|| PathBuf::from("./data"));
 
@@ -272,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
                 NodeConfig::export_network_files(&dir)?;
                 println!("network files written to {} (set network_dir: ./network in {} to use them)", dir.display(), config.display());
             }
-            println!("edit rewards.reward_address / reward_passphrase, then start with: sth-core run --config {}", config.display());
+            println!("edit node.yaml (delegate.secrets to forge), then start with: sth-core run --config {}", config.display());
         }
         Command::Run {
             config, api_host, api_port, no_api, nodes, concurrency, skip_verify, quiet, from_dump, fast_import, snapshot_dir,

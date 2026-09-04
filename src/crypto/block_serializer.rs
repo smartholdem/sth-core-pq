@@ -10,6 +10,7 @@ use super::tx_serializer::{transaction_id, verify_transaction_signature};
 use crate::config::Network;
 use crate::error::{Error, Result};
 use crate::models::Block;
+use rayon::prelude::*;
 
 /// Serialise the block header (`Serializer.serialize`), optionally appending the signature.
 pub fn serialize_block(block: &Block, include_signature: bool) -> Result<Vec<u8>> {
@@ -99,6 +100,21 @@ pub struct BlockVerification {
     pub errors: Vec<String>,
 }
 
+/// Per-transaction cryptographic check: stored id matches the serialised bytes, signature is valid.
+fn check_transaction(tx: &crate::models::Transaction) -> Option<String> {
+    let id = tx.id.as_deref()?;
+    match transaction_id(tx) {
+        Ok(computed) if computed != id => return Some(format!("Invalid transaction id: {id} expected: {computed}")),
+        Err(e) => return Some(format!("Cannot serialise transaction {id}: {e}")),
+        _ => {}
+    }
+    match verify_transaction_signature(tx) {
+        Ok(true) => None,
+        Ok(false) => Some(format!("Invalid transaction signature: {id}")),
+        Err(e) => Some(format!("Cannot verify transaction {id}: {e}")),
+    }
+}
+
 /// Structural + cryptographic verification of a block (`Block.verify()` in core).
 /// Does not check chain linkage (previousBlock vs. stored chain) — that is the sync layer's job.
 pub fn verify_block(block: &Block, network: &Network) -> BlockVerification {
@@ -142,14 +158,11 @@ pub fn verify_block(block: &Block, network: &Network) -> BlockVerification {
     let mut total_fee: u128 = 0;
     let mut seen = std::collections::HashSet::new();
     for tx in &block.transactions {
-        let id = match &tx.id {
-            Some(id) => id.clone(),
-            None => {
-                errors.push("Transaction without id".into());
-                continue;
-            }
+        let Some(id) = &tx.id else {
+            errors.push("Transaction without id".into());
+            continue;
         };
-        if !seen.insert(id.clone()) {
+        if !seen.insert(id.as_str()) {
             errors.push(format!("Encountered duplicate transaction: {id}"));
         }
         if let Some(exp) = tx.expiration {
@@ -157,20 +170,23 @@ pub fn verify_block(block: &Block, network: &Network) -> BlockVerification {
                 errors.push(format!("Encountered expired transaction: {id}"));
             }
         }
-        match transaction_id(tx) {
-            Ok(computed) if computed != id => {
-                errors.push(format!("Invalid transaction id: {id} expected: {computed}"));
-            }
-            Err(e) => errors.push(format!("Cannot serialise transaction {id}: {e}")),
-            _ => {}
-        }
-        match verify_transaction_signature(tx) {
-            Ok(true) => {}
-            Ok(false) => errors.push(format!("Invalid transaction signature: {id}")),
-            Err(e) => errors.push(format!("Cannot verify transaction {id}: {e}")),
-        }
         total_amount += tx.amount as u128;
         total_fee += tx.fee as u128;
+    }
+    // id recomputation + signature verification dominate the cost → all cores
+    errors.extend(block.transactions.par_iter().filter_map(check_transaction).collect::<Vec<_>>());
+    for tx in &block.transactions {
+        if tx.type_group == crate::models::TYPE_GROUP_CORE {
+            continue;
+        }
+        let id = tx.id.as_deref().unwrap_or("?");
+        if !tx.is_entity() {
+            errors.push(format!("Unsupported transaction typeGroup {} type {}: {id}", tx.type_group, tx.type_));
+        } else if !milestone.aip36 {
+            errors.push(format!("Entity transaction before aip36 activation: {id}"));
+        } else if let Err(e) = crate::rules::check_entity_format(tx) {
+            errors.push(format!("{e}: {id}"));
+        }
     }
     if total_amount != block.total_amount as u128 {
         errors.push("Invalid total amount".into());

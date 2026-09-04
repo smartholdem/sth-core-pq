@@ -13,8 +13,9 @@ use indicatif::ProgressBar;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Per-peer request spacing enforced by legacy nodes (`p2p.blocks.getBlocks` rate limit).
-const MIN_ROUND: Duration = Duration::from_millis(1_100);
+/// Gap between two `getBlocks` to the same legacy peer, measured from the previous reply: legacy nodes
+/// rate-limit `p2p.blocks.getBlocks` per IP and reset connections that arrive too soon after a reply.
+const MIN_ROUND: Duration = Duration::from_millis(1_500);
 /// Health probes are short: an unreachable peer must not stall the table refresh.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_CONCURRENCY: usize = 16;
@@ -93,14 +94,20 @@ async fn fetch_range(table: &PeerTable, ip: &str, from: u64, limit: u32, timeout
     }
     .await;
     match result {
-        Ok(blocks) => {
+        Ok(blocks) if !blocks.is_empty() => {
             let reached = blocks.last().map(|b| b.height);
-            table.record_success(ip, started.elapsed(), reached);
+            tracing::debug!(peer = ip, from, asked = limit, got = blocks.len(), ms = started.elapsed().as_millis() as u64, "getBlocks ok");
+            table.record_blocks_success(ip, started.elapsed(), blocks.len(), reached);
             Some(blocks)
+        }
+        Ok(_) => {
+            tracing::debug!(peer = ip, from, "getBlocks returned nothing");
+            table.record_blocks_failure(ip);
+            None
         }
         Err(e) => {
             tracing::debug!(peer = ip, from, error = %e, "getBlocks failed");
-            table.record_failure(ip);
+            table.record_blocks_failure(ip);
             None
         }
     }
@@ -121,7 +128,8 @@ struct Scheduler {
     next_from: u64,
     target: u64,
     window_end: u64,
-    retry: std::collections::BTreeSet<u64>,
+    /// `(from, to)` ranges to re-fetch (partial replies leave their tail here).
+    retry: std::collections::BTreeSet<(u64, u64)>,
     busy: std::collections::HashSet<Source>,
     last_request: std::collections::HashMap<Source, Instant>,
     done: bool,
@@ -129,12 +137,13 @@ struct Scheduler {
 
 struct Fetched {
     from: u64,
+    to: u64,
     source: Source,
     blocks: Option<Vec<Block>>,
 }
 
 /// Candidate sources for a range ending at `need_height`: iroh peers that have it (fastest first),
-/// then the best legacy peers.
+/// then the legacy peers with the best measured `getBlocks` speed.
 fn candidates(table: &PeerTable, iroh: Option<&crate::p2p_iroh::IrohNode>, need_height: u64) -> Vec<Source> {
     let mut out: Vec<Source> = Vec::new();
     if let Some(node) = iroh {
@@ -142,7 +151,7 @@ fn candidates(table: &PeerTable, iroh: Option<&crate::p2p_iroh::IrohNode>, need_
         peers.sort_by_key(|p| p.latency_ms.unwrap_or(u64::MAX));
         out.extend(peers.into_iter().map(|p| Source::Iroh(p.id)));
     }
-    out.extend(table.best(8).into_iter().map(Source::Legacy));
+    out.extend(table.best_for_blocks(8).into_iter().map(Source::Legacy));
     out
 }
 
@@ -160,39 +169,45 @@ async fn worker(
             if s.done {
                 return;
             }
-            let from = s.retry.pop_first().or_else(|| {
+            let range = s.retry.pop_first().or_else(|| {
                 (s.next_from < s.target && s.next_from < s.window_end).then(|| {
                     let f = s.next_from;
-                    s.next_from += MAX_BLOCKS_PER_REQUEST as u64;
-                    f
+                    let to = (f + MAX_BLOCKS_PER_REQUEST as u64).min(s.target);
+                    s.next_from = to;
+                    (f, to)
                 })
             });
-            match from {
+            match range {
                 None => None,
-                Some(from) => {
+                Some((from, to)) => {
                     let now = Instant::now();
-                    let limit = (s.target - from).min(MAX_BLOCKS_PER_REQUEST as u64) as u32;
-                    let source = candidates(&table, iroh.as_deref(), from + limit as u64).into_iter().find(|src| {
+                    let source = candidates(&table, iroh.as_deref(), to).into_iter().find(|src| {
                         // legacy peers allow one getBlocks per second; iroh peers have no such limit
                         !s.busy.contains(src)
                             && (matches!(src, Source::Iroh(_)) || s.last_request.get(src).map_or(true, |t| now.duration_since(*t) >= MIN_ROUND))
                     });
                     match source {
                         Some(src) => {
+                            // unknown legacy peers get a small probe request; proven ones as much as fits the time budget
+                            let cap = match &src {
+                                Source::Legacy(ip) => table.blocks_limit(ip),
+                                Source::Iroh(_) => MAX_BLOCKS_PER_REQUEST,
+                            };
+                            let limit = (to - from).min(cap as u64) as u32;
                             s.busy.insert(src.clone());
                             s.last_request.insert(src.clone(), now);
-                            Some((from, limit, src))
+                            Some((from, to, limit, src))
                         }
                         None => {
                             // no idle peer right now: put the range back and wait a little
-                            s.retry.insert(from);
+                            s.retry.insert((from, to));
                             None
                         }
                     }
                 }
             }
         };
-        let Some((from, limit, source)) = job else {
+        let Some((from, to, limit, source)) = job else {
             tokio::time::sleep(Duration::from_millis(150)).await;
             continue;
         };
@@ -204,8 +219,10 @@ async fn worker(
         {
             let mut s = sched.lock().unwrap_or_else(|e| e.into_inner());
             s.busy.remove(&source);
+            // legacy nodes drop the socket after a getBlocks reply and refuse the same IP for a moment: space from the reply
+            s.last_request.insert(source.clone(), Instant::now());
         }
-        if out.send(Fetched { from, source, blocks }).await.is_err() {
+        if out.send(Fetched { from, to, source, blocks }).await.is_err() {
             return;
         }
     }
@@ -251,7 +268,7 @@ pub async fn catch_up(storage: Arc<Storage>, table: Arc<PeerTable>, opts: &P2pOp
 
     let mut pending: std::collections::BTreeMap<u64, (Source, Vec<Block>)> = Default::default();
     let punish = |src: &Source| match src {
-        Source::Legacy(ip) => table.record_failure(ip),
+        Source::Legacy(ip) => table.record_blocks_failure(ip),
         Source::Iroh(id) => {
             if let Some(n) = &opts.iroh {
                 n.peers.record_rpc(*id, None, None);
@@ -301,14 +318,19 @@ pub async fn catch_up(storage: Arc<Storage>, table: Arc<PeerTable>, opts: &P2pOp
             match f.blocks {
                 Some(b) if !b.is_empty() && b[0].height == f.from + 1 => {
                     failures_in_row = 0;
+                    let last = b[b.len() - 1].height;
                     if f.from >= tip.height {
                         pending.insert(f.from, (f.source, b));
+                    }
+                    if last < f.to && last >= tip.height {
+                        // probe-sized / short reply: the tail of the range goes back to the queue
+                        sched.lock().unwrap_or_else(|e| e.into_inner()).retry.insert((last, f.to));
                     }
                 }
                 _ => {
                     failures_in_row += 1;
                     if f.from >= tip.height {
-                        sched.lock().unwrap_or_else(|e| e.into_inner()).retry.insert(f.from);
+                        sched.lock().unwrap_or_else(|e| e.into_inner()).retry.insert((f.from, f.to));
                     }
                     if failures_in_row >= parallel as u32 * 3 {
                         tracing::warn!("legacy peers keep failing, re-probing the peer table");
@@ -341,7 +363,7 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
     let mut fork_depth = 1u64;
     let mut last_ip = String::new();
     loop {
-        let Some(ip) = table.best(1).into_iter().next() else {
+        let Some(ip) = table.best_for_blocks(1).into_iter().next() else {
             tracing::warn!("no healthy legacy peers, re-probing in 5s");
             tokio::time::sleep(Duration::from_secs(5)).await;
             table.refresh(PROBE_CONCURRENCY, PROBE_TIMEOUT).await;
@@ -366,8 +388,10 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
             let tip = tip_of(storage)?;
             let status = match peer.get_status().await {
                 Ok(s) => s,
-                Err(e) if just_fetched => {
+                Err(e) if just_fetched || e.to_string().contains("Connection reset") => {
+                    // legacy nodes reset the socket after a getBlocks reply and refuse the same IP for ~1 s
                     tracing::debug!(peer = ip, error = %e, "socket reset after getBlocks (expected), reconnecting");
+                    tokio::time::sleep(MIN_ROUND).await;
                     break;
                 }
                 Err(e) => {
@@ -381,7 +405,6 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
             table.record_success(&ip, started.elapsed(), Some(peer_height));
             if peer_height <= tip.height {
                 // poll fast: a forging node must see the previous slot's block within a second or two
-                let _ = network;
                 tokio::time::sleep(Duration::from_millis(1_200)).await;
                 continue;
             }
@@ -415,9 +438,13 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
                 break;
             }
             let tx_count: usize = blocks.iter().map(|b| b.transactions.len()).sum();
+            let newest = blocks.last().map(|b| (b.height, b.timestamp));
             match apply(storage, blocks, tip, opts.verify).await {
                 Ok(new_tip) => {
                     fork_depth = 1;
+                    if let Some((h, ts)) = newest {
+                        crate::intake::record(crate::intake::Source::PullLegacy, &ip, h, ts, &network);
+                    }
                     if from == to {
                         tracing::info!("Received new block at height {} with {} transactions from {}", group(to), tx_count, ip);
                     } else {
@@ -429,7 +456,7 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
                 }
                 Err(e) => {
                     tracing::error!(peer = ip, error = %e, "peer blocks rejected, switching peer");
-                    table.record_failure(&ip);
+                    table.record_blocks_failure(&ip);
                     break;
                 }
             }

@@ -141,8 +141,8 @@ impl Mempool {
         if self.storage.get_transaction(&id).map_err(storage_err)?.is_some() {
             return Err(("ERR_FORGED".into(), format!("Transaction {id} is already forged")));
         }
-        if tx.version != 2 || tx.type_group != TYPE_GROUP_CORE {
-            return Err(("ERR_UNKNOWN".into(), "Only version 2 core transactions are supported".into()));
+        if tx.version != 2 || !(tx.type_group == TYPE_GROUP_CORE || tx.is_entity()) {
+            return Err(("ERR_UNKNOWN".into(), "Only version 2 core and entity transactions are supported".into()));
         }
         if let Some(n) = tx.network {
             if n != self.network.pubkey_hash {
@@ -163,8 +163,40 @@ impl Mempool {
         }
 
         let wallet = self.storage.get_wallet(&sender).map_err(storage_err)?;
-        let (balance, nonce) = wallet.map(|w| (w.balance, w.nonce)).unwrap_or((0, 0));
+        let (balance, nonce, second_pk) = wallet.map(|w| (w.balance, w.nonce, w.second_public_key)).unwrap_or((0, 0, None));
         let pending: Vec<&Transaction> = pool.values().filter(|p| p.sender_public_key == tx.sender_public_key).collect();
+        // a registration still waiting in the pool already binds the sender's next transactions
+        let pending_second_pk = pending
+            .iter()
+            .filter_map(|p| crate::rules::registered_second_key(p).ok().flatten())
+            .next()
+            .map(str::to_string);
+        crate::rules::check_second_signature(tx, second_pk.as_deref().or(pending_second_pk.as_deref()))
+            .map_err(|e| ("ERR_BAD_DATA".into(), e))?;
+        crate::rules::registered_second_key(tx).map_err(|e| ("ERR_BAD_DATA".into(), e))?;
+        if tx.type_group != crate::models::TYPE_GROUP_CORE {
+            if !tx.is_entity() {
+                return Err(("ERR_UNKNOWN".into(), format!("unsupported typeGroup {} type {}", tx.type_group, tx.type_)));
+            }
+            let height = self.storage.get_last_height().map_err(storage_err)?;
+            if !self.storage.network().milestone(height + 1).aip36 {
+                return Err(("ERR_UNKNOWN".into(), "Entity transactions are not activated yet (aip36)".into()));
+            }
+            let wallet = self.storage.get_wallet(&sender).map_err(storage_err)?;
+            let no_pending = Default::default();
+            let taken = |name: &str, t: u8| self.storage.entity_by_name(name, t).ok().flatten().is_some();
+            crate::rules::check_entity(tx, wallet.as_ref(), &no_pending, taken).map_err(|e| ("ERR_APPLY".into(), e))?;
+            if let Some(e) = tx.entity_asset().filter(|e| e.action == crate::models::entity::ACTION_REGISTER) {
+                let name = e.data.name.unwrap_or_default().to_lowercase();
+                let clash = pool.values().any(|p| {
+                    p.entity_asset().is_some_and(|q| q.action == crate::models::entity::ACTION_REGISTER && q.type_ == e.type_
+                        && q.data.name.as_deref().map(str::to_lowercase) == Some(name.clone()))
+                });
+                if clash {
+                    return Err(("ERR_PENDING".into(), format!("Entity registration for \"{name}\" already in the pool")));
+                }
+            }
+        }
         let pending_spent: i128 = pending.iter().map(|p| spent(p)).sum();
         let expected_nonce = nonce + 1 + pending.len() as u64;
         match tx.nonce {

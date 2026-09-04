@@ -1,8 +1,8 @@
 //! Author: TechnoL0g
 //!
 //! Node configuration file (`node.yaml`, same style as the netfory headless seeder).
-//! Every module (api, sync, p2p, rewards, mempool) has its own section so new modules - e.g. the
-//! future delegate/forger module - plug in by adding a section without touching the others.
+//! Every module (api, sync, p2p, rewards, mempool) has its own section so new modules — e.g. the
+//! future delegate/forger module — plug in by adding a section without touching the others.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -52,9 +52,13 @@ impl Default for DelegateConfig {
 #[serde(default)]
 pub struct ApiConfig {
     pub enabled: bool,
-    /// Keep 127.0.0.1 - the API is a local bridge for netfory-provider, never public.
+    /// Keep 127.0.0.1 — the API is a local bridge for netfory-provider, never public.
     pub host: String,
     pub port: u16,
+    /// Operator metrics page (HTML): at `http://host:port/` or on `metrics_listen` when set.
+    pub page_metrics: bool,
+    /// Separate bind address for the metrics page, e.g. "0.0.0.0:4888" (serves `/` + `/api/ntfry/*` only). Empty = main API.
+    pub metrics_listen: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -118,10 +122,9 @@ impl Default for IrohConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RewardsConfig {
-    /// Where future rewards (relay / delegate module) should go. Provide EITHER an address ...
+    /// Reserved for future relay / gateway rewards (block distribution, snapshots) — NOT used yet and NOT the
+    /// delegate's reward: block rewards always go to the forging delegate's own wallet (`delegate.secrets`).
     pub reward_address: String,
-    /// ... OR a passphrase to derive the address from (SmartNet wallet scheme).
-    pub reward_passphrase: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -148,7 +151,7 @@ impl Default for NodeConfig {
 
 impl Default for ApiConfig {
     fn default() -> Self {
-        Self { enabled: true, host: "127.0.0.1".into(), port: 4003 }
+        Self { enabled: true, host: "127.0.0.1".into(), port: 4003, page_metrics: false, metrics_listen: String::new() }
     }
 }
 
@@ -184,7 +187,7 @@ impl Default for P2pConfig {
 
 impl Default for RewardsConfig {
     fn default() -> Self {
-        Self { reward_address: String::new(), reward_passphrase: String::new() }
+        Self { reward_address: String::new() }
     }
 }
 
@@ -282,29 +285,25 @@ impl NodeConfig {
              # network_dir: optional folder with network.json / milestones.json / exceptions.json / genesisBlock.json[.gz]\n\
              #          (crypto-networks layout, `sth-core init --network-files` exports the embedded ones).\n\
              # api:     local REST bridge for wallets / explorers / netfory-provider (keep host 127.0.0.1).\n\
+             #          page_metrics: true serves the operator dashboard at http://host:port/ — or on its own address\n\
+             #          with metrics_listen: \"0.0.0.0:4888\" (page + /api/ntfry/* only, safe to expose).\n\
              # sync:    legacy REST bootstrap nodes; bootstrap_snapshot is used only while the database is empty\n\
              #          (`latest` downloads from https://snapshots.smartholdem.io/, a path imports a local dump, empty skips).\n\
              # p2p:     legacy_enabled follows the chain through port 4001 (IP peers) with parallel_peers ranges in flight;\n\
              #          relay_fanout peers receive every accepted transaction. legacy_listen: 0.0.0.0:4001 turns on the inbound\n\
-             #          legacy server (gateway node) - old nodes and netfory-provider ws:// clients can pull blocks from us.\n\
+             #          legacy server (gateway node) — old nodes and netfory-provider ws:// clients can pull blocks from us.\n\
              #          p2p.iroh enables the Web 4.0 layer\n\
              #          (iroh endpoint + gossip topics for blocks / transactions, GetBlocks RPC); bootstrap = EndpointIds of peers.\n\
-             # rewards: where future seeding / delegate rewards go. Provide EITHER reward_address ...\n\
-             #          OR reward_passphrase (the address is derived from it; the passphrase never leaves this machine).\n\
+             # rewards: RESERVED, not used yet — future relay/gateway rewards (block & snapshot distribution).\n\
+             #          Not the delegate's reward: block rewards always go to the forging delegate's wallet.\n\
              # delegate: forging module. enabled: true + secrets: [passphrase] (or secrets_file: ./delegates.json, legacy format).\n\
              #          Forging happens only when this delegate is in the active top-21 of the round; fees go to its wallet.\n\
              {body}"
         )
     }
 
-    /// Reward address: explicit address wins, otherwise derived from the passphrase.
+    /// Reserved reward address (relay / gateway rewards, not implemented yet).
     pub fn reward_address(&self) -> Result<Option<String>> {
-        if !self.rewards.reward_address.is_empty() {
-            return Ok(Some(self.rewards.reward_address.clone()));
-        }
-        if !self.rewards.reward_passphrase.is_empty() {
-            return crate::crypto::KeyPair::from_passphrase(&self.rewards.reward_passphrase)?.address(self.network_byte()).map(Some);
-        }
-        Ok(None)
+        Ok((!self.rewards.reward_address.is_empty()).then(|| self.rewards.reward_address.clone()))
     }
 }

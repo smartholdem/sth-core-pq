@@ -72,7 +72,7 @@ pub async fn configuration(State(st): State<Shared>) -> ApiResult {
             "epoch": human_time(st.network.epoch_unix),
             "fees": { "staticFees": Value::Object(fees) },
             "vendorFieldLength": m.vendor_field_length, "multiPaymentLimit": m.multi_payment_limit, "htlcEnabled": m.htlc_enabled,
-            "blockBurnAddress": m.block_burn_address, "aip11": m.aip11, "aip37": m.aip37,
+            "blockBurnAddress": m.block_burn_address, "aip11": m.aip11, "aip36": m.aip36, "aip37": m.aip37,
         },
         "transactionPool": {
             "dynamicFees": { "enabled": false },
@@ -99,7 +99,12 @@ fn static_fee_map(st: &Shared) -> Result<Map<String, Value>, Error> {
 }
 
 pub async fn transaction_fees(State(st): State<Shared>) -> ApiResult {
-    Ok(Json(json!({ "data": { "1": Value::Object(static_fee_map(&st)?) } })))
+    use crate::models::entity;
+    let mut data = json!({ "1": Value::Object(static_fee_map(&st)?) });
+    if st.network.milestone(last_height(&st)? + 1).aip36 {
+        data["2"] = json!({ "entityRegistration": entity::FEE_REGISTER.to_string(), "entityUpdate": entity::FEE_UPDATE.to_string(), "entityResignation": entity::FEE_RESIGN.to_string() });
+    }
+    Ok(Json(json!({ "data": data })))
 }
 
 /// Fee statistics over the last `days` (1–30, default 7) from the chain (`avg/max/min/sum` per type).
@@ -131,7 +136,7 @@ pub async fn fees(State(st): State<Shared>, Query(q): Query<Params>) -> ApiResul
     Ok(Json(json!({ "meta": { "days": days }, "data": Value::Object(data) })))
 }
 
-pub async fn transaction_types() -> ApiResult {
+pub async fn transaction_types(State(st): State<Shared>) -> ApiResult {
     let core: Map<String, Value> = [
         ("Transfer", 0), ("SecondSignature", 1), ("DelegateRegistration", 2), ("Vote", 3), ("MultiSignature", 4), ("Ipfs", 5),
         ("MultiPayment", 6), ("DelegateResignation", 7), ("HtlcLock", 8), ("HtlcClaim", 9), ("HtlcRefund", 10),
@@ -139,13 +144,19 @@ pub async fn transaction_types() -> ApiResult {
     .into_iter()
     .map(|(k, v)| (k.to_string(), json!(v)))
     .collect();
-    let magistrate: Map<String, Value> = [
-        ("BusinessRegistration", 0), ("BusinessResignation", 1), ("BusinessUpdate", 2),
-        ("BridgechainRegistration", 3), ("BridgechainResignation", 4), ("BridgechainUpdate", 5),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), json!(v)))
-    .collect();
+    // like legacy: business/bridgechain until aip36, Entity after it
+    let aip36 = st.network.milestone(last_height(&st)? + 1).aip36;
+    let magistrate: Map<String, Value> = if aip36 {
+        [("Entity", json!(6))].into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    } else {
+        [
+            ("BusinessRegistration", 0), ("BusinessResignation", 1), ("BusinessUpdate", 2),
+            ("BridgechainRegistration", 3), ("BridgechainResignation", 4), ("BridgechainUpdate", 5),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), json!(v)))
+        .collect()
+    };
     Ok(Json(json!({ "data": { "1": Value::Object(core), "2": Value::Object(magistrate) } })))
 }
 
@@ -238,6 +249,8 @@ pub async fn peer_dashboard(State(st): State<Shared>, Query(q): Query<Params>) -
                 "height": p.height, "lag": best.saturating_sub(p.height),
                 "latency": p.latency_ms, "latencyHistory": p.latency_history,
                 "score": p.score(best),
+                "blocksLatency": p.blocks_latency_ms, "blocksLimit": p.blocks_limit(), "blocksFailures": p.blocks_failures,
+                "blocksParkedFor": p.blocks_parked_until.filter(|t| *t > now).map(|t| t.saturating_duration_since(now).as_secs()),
                 "successes": p.successes, "failures": p.failures, "totalFailures": p.total_failures,
                 "lastSeen": p.last_ok.map(|t| now.saturating_duration_since(t).as_secs()),
                 "state": if banned { "banned" } else if p.successes == 0 { "unknown" } else { "ok" },
@@ -270,10 +283,3 @@ pub async fn forging(State(st): State<Shared>) -> ApiResult {
     Ok(Json(json!({ "data": data })))
 }
 
-pub async fn entities(Query(q): Query<Params>) -> ApiResult {
-    Ok(Json(paginate("/entities", &q, 0, vec![])))
-}
-
-pub async fn entity_by_id() -> ApiResult {
-    Err(not_found("Entity"))
-}

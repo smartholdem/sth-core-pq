@@ -21,6 +21,18 @@ fn asset_mut(tx: &mut Transaction) -> &mut TransactionAsset {
 }
 
 fn deserialize_type_payload(tx: &mut Transaction, r: &mut ByteReader) -> Result<()> {
+    if tx.is_entity() {
+        let (type_, sub_type, action) = (r.u8()?, r.u8()?, r.u8()?);
+        let reg_len = r.u8()? as usize;
+        let registration_id = (reg_len > 0).then(|| r.hex(reg_len)).transpose()?;
+        let name_len = r.u8()? as usize;
+        let name = (name_len > 0).then(|| r.bytes(name_len).map(|b| String::from_utf8_lossy(b).into_owned())).transpose()?;
+        let ipfs_len = r.u8()? as usize;
+        let ipfs_data = (ipfs_len > 0).then(|| r.bytes(ipfs_len).map(|b| String::from_utf8_lossy(b).into_owned())).transpose()?;
+        let e = crate::models::EntityAsset { type_, sub_type, action, registration_id, data: crate::models::EntityData { name, ipfs_data } };
+        asset_mut(tx).extra = e.into_map();
+        return Ok(());
+    }
     if tx.type_group != TYPE_GROUP_CORE {
         return Err(Error::Serialization(format!("unsupported typeGroup {}", tx.type_group)));
     }

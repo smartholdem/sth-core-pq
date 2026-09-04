@@ -153,6 +153,9 @@ pub fn wallet_json(st: &AppState, w: &WalletState, rank: Option<usize>, votes: O
     if let Some(m) = &w.multi_signature {
         attrs.insert("multiSignature".into(), json!({ "min": m.min, "publicKeys": m.public_keys }));
     }
+    if !w.entities.is_empty() {
+        attrs.insert("entities".into(), json!(w.entities));
+    }
     if !w.locks.is_empty() {
         let locks: Map<String, Value> = w
             .locks

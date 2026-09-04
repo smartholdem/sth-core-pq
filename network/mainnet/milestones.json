@@ -1,0 +1,51 @@
+[
+    {
+        "height": 1,
+        "reward": "0",
+        "activeDelegates": 21,
+        "blocktime": 8,
+        "block": {
+            "version": 0,
+            "idFullSha256": true,
+            "maxTransactions": 500,
+            "maxPayload": 84000000
+        },
+        "epoch": "2023-08-29T00:00:00.000Z",
+        "fees": {
+            "staticFees": {
+                "transfer": 100000000,
+                "secondSignature": 500000000,
+                "delegateRegistration": 100000000000,
+                "vote": 100000000,
+                "multiSignature": 500000000,
+                "ipfs": 500000000,
+                "multiPayment": 10000000,
+                "delegateResignation": 2500000000,
+                "htlcLock": 10000000,
+                "htlcClaim": 0,
+                "htlcRefund": 0
+            }
+        },
+        "vendorFieldLength": 255,
+        "multiPaymentLimit": 256,
+        "htlcEnabled": true,
+	    "blockBurnAddress": true,
+        "aip11": true
+    },
+    {
+        "height": 151200,
+        "fees": {
+            "staticFees": {
+                "delegateRegistration": 1000000000000
+            }
+        }
+    },
+    {
+        "height": 564000,
+        "aip37": true
+    },
+    {
+        "height": 11800000,
+        "aip36": true
+    }
+]

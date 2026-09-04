@@ -8,31 +8,26 @@
 //!   s  = k + e*a mod n ; sig = x(R)(32) || s(32)
 //!
 //! Verification: R' = s*G - e*A ; valid iff R' != O, y(R') is a QR and x(R') == r.
+//! All field work is done with k256's native `FieldElement` (QR test = `sqrt()`), the two scalar
+//! multiplications are fused into one Shamir/Straus linear combination.
 
 use super::hash::sha256_multi;
 use crate::error::{Error, Result};
 use k256::elliptic_curve::group::Group;
-use k256::elliptic_curve::ops::Reduce;
+use k256::elliptic_curve::ops::{LinearCombinationExt, Reduce};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::elliptic_curve::PrimeField;
-use k256::{ProjectivePoint, PublicKey, Scalar, SecretKey, U256};
-use num_bigint::BigUint;
+use k256::{FieldBytes, FieldElement, ProjectivePoint, PublicKey, Scalar, SecretKey, U256};
 
-/// secp256k1 field prime p = 2^256 - 2^32 - 977.
-fn field_prime() -> BigUint {
-    BigUint::parse_bytes(
-        b"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F",
-        16,
-    )
-    .unwrap_or_default()
+/// Euler criterion via the field's square root (p ≡ 3 mod 4 → one exponentiation).
+fn is_quadratic_residue(y_be: &[u8]) -> bool {
+    field_element(y_be).is_some_and(|y| bool::from(y.sqrt().is_some()))
 }
 
-/// Euler criterion: y^((p-1)/2) == 1 (mod p).
-fn is_quadratic_residue(y_be: &[u8]) -> bool {
-    let p = field_prime();
-    let y = BigUint::from_bytes_be(y_be);
-    let exp = (&p - BigUint::from(1u8)) >> 1;
-    y.modpow(&exp, &p) == BigUint::from(1u8)
+/// Canonical field element from 32 big-endian bytes (None when ≥ p or wrong length).
+fn field_element(be: &[u8]) -> Option<FieldElement> {
+    let bytes: [u8; 32] = be.try_into().ok()?;
+    Option::<FieldElement>::from(FieldElement::from_bytes(&FieldBytes::from(bytes)))
 }
 
 fn scalar_from_hash(h: &[u8; 32]) -> Scalar {
@@ -74,7 +69,8 @@ pub fn verify_schnorr_legacy(hash: &[u8; 32], signature: &[u8], public_key_hex: 
     let r_x = &signature[..32];
     let s_bytes = &signature[32..];
 
-    if BigUint::from_bytes_be(r_x) >= field_prime() {
+    // r must be a canonical field element (< p)
+    if field_element(r_x).is_none() {
         return Ok(false);
     }
     let s_arr: [u8; 32] = match s_bytes.try_into() {
@@ -92,8 +88,8 @@ pub fn verify_schnorr_legacy(hash: &[u8; 32], signature: &[u8], public_key_hex: 
 
     let e = scalar_from_hash(&sha256_multi([r_x, &a_comp[..], &hash[..]]));
 
-    // R' = s*G - e*A
-    let r_point = ProjectivePoint::GENERATOR * s - a.to_projective() * e;
+    // R' = s*G - e*A as one linear combination
+    let r_point = ProjectivePoint::lincomb_ext(&[(ProjectivePoint::GENERATOR, s), (-a.to_projective(), e)]);
     if bool::from(r_point.is_identity()) {
         return Ok(false);
     }

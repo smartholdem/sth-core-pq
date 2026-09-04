@@ -212,9 +212,11 @@ impl LegacyServer {
         let net = self.storage.network().clone();
         let verify = self.verify;
         let txs = block.transactions.len();
+        let block_ts = block.timestamp;
         tokio::task::spawn_blocking(move || apply_blocks(&st, &net, &[block], tip, verify))
             .await
             .map_err(|e| Error::Sync(format!("apply task failed: {e}")))??;
+        crate::intake::record(crate::intake::Source::PushLegacy, remote.ip().to_string(), height, block_ts, self.storage.network());
         tracing::info!("Received new block at height {} with {} transactions from {}", crate::delegate::forger::group(height), txs, remote.ip());
         let _ = self.received.send(height);
         self.mempool.prune_confirmed().await;

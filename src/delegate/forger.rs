@@ -325,6 +325,7 @@ impl Forger {
         tokio::task::spawn_blocking(move || apply_blocks(&st, &net, &[b], chain_tip, true))
             .await
             .map_err(|e| crate::error::Error::Sync(format!("apply task failed: {e}")))??;
+        crate::intake::record(crate::intake::Source::Forged, name.clone(), block.height, block.timestamp, network);
         tracing::info!(
             "Forged new block {} by delegate {} ({}) at height {} with {} transactions (fees {})",
             block.id.as_deref().unwrap_or(""),

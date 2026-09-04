@@ -1,0 +1,99 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>sth-core node</title>
+<style>
+:root{--bg:#0b0d10;--card:#12151a;--line:#1f242c;--ink:#d7dbe0;--dim:#6b7380;--acc:#f59e0b;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--cyan:#22d3ee}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+::selection{background:var(--acc);color:#000}
+.wrap{max-width:860px;margin:0 auto;padding:44px 20px 60px}
+h1{font-size:18px;font-weight:600;letter-spacing:.14em;margin:0;color:var(--ink)}h1 b{color:var(--acc);font-weight:600}h1 i{font-style:normal;animation:blink 1.1s steps(2) infinite}
+@keyframes blink{to{opacity:0}}
+.sub{color:var(--dim);margin:8px 0 22px;font-size:12px}
+.pill{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--ok);color:var(--ok);border-radius:999px;padding:4px 14px;font-size:11px;letter-spacing:.14em;text-transform:uppercase}
+.pill.warn{border-color:var(--warn);color:var(--warn)}.pill.bad{border-color:var(--bad);color:var(--bad)}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:22px}
+@media(max-width:720px){.grid{grid-template-columns:repeat(2,1fr)}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px 18px;min-height:92px;opacity:0;transform:translateY(6px);animation:in .45s ease forwards}
+.card:nth-child(2){animation-delay:.05s}.card:nth-child(3){animation-delay:.1s}.card:nth-child(4){animation-delay:.15s}
+@keyframes in{to{opacity:1;transform:none}}
+.card .l{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+.card .v{font-size:24px;font-weight:700;color:var(--acc);margin-top:8px;transition:color .3s}.card .v.ok{color:var(--ok)}.card .v.bad{color:var(--bad)}.card .v.cyan{color:var(--cyan)}
+.card .s{font-size:11px;color:var(--dim);margin-top:4px;min-height:16px}
+hr{border:0;border-top:1px solid var(--line);margin:30px 0 22px}
+h2{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);font-weight:normal;margin:0 0 10px}
+table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;color:var(--dim);font-weight:normal;font-size:10px;letter-spacing:.14em;text-transform:uppercase;padding:8px 8px;border-bottom:1px solid var(--line)}
+td{padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px}
+tr:hover td{background:#151a21}
+.r{text-align:right}.id{color:var(--acc)}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.dim{color:var(--dim)}.cyan{color:var(--cyan)}
+.foot{margin-top:26px;color:var(--dim);font-size:11px}.foot a{color:var(--acc);text-decoration:none;border-bottom:1px dashed var(--acc)}
+.bar{height:3px;background:var(--line);border-radius:2px;margin-top:10px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc);transition:width .6s ease}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:22px}@media(max-width:720px){.two{grid-template-columns:1fr}}
+.empty{color:var(--dim);padding:10px 8px}
+</style></head><body><div class="wrap">
+<h1>// <b>STH-CORE</b> NODE<i>_</i></h1>
+<div class="sub" id="sub">SmartHoldem relay / delegate node · Rust · sled · legacy 4001 + iroh</div>
+<span class="pill" id="pill">connecting</span>
+
+<div class="grid">
+ <div class="card"><div class="l">height</div><div class="v" id="height">…</div><div class="s" id="heights"></div></div>
+ <div class="card"><div class="l">network</div><div class="v" id="net">…</div><div class="s" id="nets"></div></div>
+ <div class="card"><div class="l">last block</div><div class="v" id="age">…</div><div class="s" id="ages"></div></div>
+ <div class="card"><div class="l">uptime</div><div class="v" id="up">…</div><div class="s" id="ups"></div></div>
+</div>
+<div class="grid">
+ <div class="card"><div class="l">block source</div><div class="v" id="src">…</div><div class="s" id="srcs"></div></div>
+ <div class="card"><div class="l">slot delay</div><div class="v" id="dly">…</div><div class="s" id="dlys"></div></div>
+ <div class="card"><div class="l">legacy peers</div><div class="v" id="lp">…</div><div class="s" id="lps"></div></div>
+ <div class="card"><div class="l">ntfry peers</div><div class="v cyan" id="ip">…</div><div class="s" id="ips"></div></div>
+</div>
+<div class="grid">
+ <div class="card"><div class="l">mempool</div><div class="v" id="mp">…</div><div class="s" id="mps"></div></div>
+ <div class="card"><div class="l">forging</div><div class="v" id="fg">…</div><div class="s" id="fgs"></div></div>
+ <div class="card" id="slot" style="grid-column:span 2"><div class="l">next slot</div><div class="v" id="slotv">—</div><div class="s" id="slots"></div><div class="bar"><i id="slotbar" style="width:0"></i></div></div>
+</div>
+
+<hr><h2>last blocks</h2>
+<table><thead><tr><th>height</th><th>time</th><th class="r">tx</th><th>forger</th><th class="r">fees</th><th>id</th></tr></thead><tbody id="blocks"></tbody></table>
+
+<hr><div class="two">
+<div><h2>ntfry peers <span class="dim" id="myid"></span></h2><table><thead><tr><th>node id</th><th class="r">height</th><th class="r">lat</th><th>state</th></tr></thead><tbody id="ipeers"></tbody></table></div>
+<div><h2>legacy peers</h2><table><thead><tr><th>peer</th><th>ver</th><th class="r">height</th><th class="r">blocks</th><th>state</th></tr></thead><tbody id="lpeers"></tbody></table></div>
+</div>
+
+<div class="foot">auto-refresh 3s · updated <span id="upd">—</span> · raw: <a href="/api/ntfry/metrics">/api/ntfry/metrics</a> · <a href="/api/ntfry/peers">/api/ntfry/peers</a></div>
+</div>
+<script>
+const $=i=>document.getElementById(i),fmt=n=>Number(n).toLocaleString('en-US'),sh=s=>s?s.slice(0,10)+'…'+s.slice(-4):'-';
+const dur=s=>s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m ${s%60}s`:s<86400?`${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`:`${Math.floor(s/86400)}d`;
+let slot=null,bt=8;
+function setv(id,txt,cls){const e=$(id);e.textContent=txt;e.className='v'+(cls?' '+cls:'')}
+async function tick(){
+ try{
+  const d=(await (await fetch('/api/ntfry/metrics')).json()).data;const c=d.chain;bt=c.blockTime||8;
+  $('sub').textContent=`sth-core v${d.node.version} · ${d.node.nethash.slice(0,12)}… · legacy ${d.legacy.enabled?'on':'off'} · ntfry ${d.ntfry.enabled?'on':'off'}`;
+  const p=$('pill');if(c.syncing){p.textContent=`syncing · ${fmt(c.behind)} behind`;p.className='pill warn'}else{p.textContent='in sync';p.className='pill'}
+  setv('height',fmt(c.height));$('heights').textContent=c.id?sh(c.id):'';
+  setv('net',fmt(c.networkHeight),c.behind>1?'bad':'ok');$('nets').textContent=c.behind>1?`${fmt(c.behind)} blocks behind`:'tip reached';
+  const age=c.lastBlockAge??0;setv('age',dur(age)+' ago',age>3*bt?(age>10*bt?'bad':'warn'):'ok');$('ages').textContent=c.blocksPerMin?`${c.blocksPerMin.toFixed(1)} blocks/min · slot ${bt}s`:`slot ${bt}s`;
+  setv('up',dur(d.node.uptime));$('ups').textContent=new Date(d.node.now*1000).toISOString().slice(11,19)+' UTC';
+  const L=d.legacy;if(L.enabled){setv('lp',`${L.alive}/${L.known}`,L.alive?'':'bad');$('lps').textContent=`best ${fmt(L.bestHeight)} · ${L.banned} banned · ${L.parked} parked`}else{setv('lp','off','bad');$('lps').textContent=''}
+  const I=d.ntfry;if(I.enabled){setv('ip',`${I.neighbors}/${I.known}`,'cyan');$('ips').textContent=`${I.gateways} gateways · best ${fmt(I.bestHeight)}`;$('myid').textContent='· me '+sh(I.nodeId)}else{setv('ip','off','bad');$('ips').textContent='p2p.iroh.enabled: false';$('myid').textContent=''}
+  const K=d.intake,lb=K.last;
+  if(lb){const sc=lb.source==='gossip-iroh'?'cyan':lb.source==='forged'?'ok':'';setv('src',lb.label,sc);$('srcs').textContent=`${fmt(lb.height)} from ${lb.peer}`}else{setv('src','—','');$('srcs').textContent='no live block yet'}
+  if(K.avgDelayMs!=null){const a=K.avgDelayMs/1000;setv('dly',`${a.toFixed(2)}s`,a<2?'ok':a<4?'warn':'bad');$('dlys').textContent=`last ${(lb.delayMs/1000).toFixed(2)}s · ${K.samples} blocks · `+Object.entries(K.bySource).map(([k,v])=>`${k} ${(v.avgDelayMs/1000).toFixed(1)}s×${v.count}`).join(' · ')}else{setv('dly','—','');$('dlys').textContent='after slot start, avg of last 100'}
+  setv('mp',fmt(d.mempool.count));$('mps').textContent=`max ${fmt(d.mempool.max)}`;
+  const F=d.forging;
+  if(F.enabled){const act=F.delegates.filter(x=>x.active).length;setv('fg',`${F.forgedCount}`,act?'ok':'warn');$('fgs').textContent=F.delegates.map(x=>`${x.username}${x.rank?' #'+x.rank:''}`).join(', ')||'no delegates';slot=F.nextSlot;
+   if(F.lastForged)$('fgs').textContent+=` · last ${fmt(F.lastForged.height)} (${F.lastForged.acceptedBy} peers)`}
+  else{setv('fg','relay','');$('fgs').textContent='delegate module disabled';slot=null}
+  $('blocks').innerHTML=d.blocks.map(b=>`<tr><td>${fmt(b.height)}</td><td class="dim">${b.timestamp.human.slice(11,19)}</td><td class="r">${b.transactions}</td><td class="cyan">${b.generator.username||b.generator.address}</td><td class="r">${(Number(b.forged.fee)/1e8).toFixed(2)}</td><td class="id">${b.id.slice(0,20)}…</td></tr>`).join('')||'<tr><td colspan=6 class="empty">no blocks yet</td></tr>';
+  $('ipeers').innerHTML=(I.peers||[]).map(p=>`<tr><td class="id" title="${p.nodeId}">${sh(p.nodeId)}${p.gateway?' <span class="dim">gw</span>':''}</td><td class="r">${fmt(p.height)}</td><td class="r dim">${p.latency??'-'}</td><td class="${p.neighbor?'ok':'dim'}">${p.state}</td></tr>`).join('')||`<tr><td colspan=4 class="empty">${I.enabled?'no peers yet':'ntfry layer off'}</td></tr>`;
+  $('lpeers').innerHTML=(L.peers||[]).map(p=>`<tr><td>${p.ip}</td><td class="dim">${p.version||'-'}</td><td class="r">${fmt(p.height)}</td><td class="r dim">${p.blocksLatency?(p.blocksLatency/1000).toFixed(1)+'s/'+p.blocksLimit:'-'}</td><td class="${p.state==='ok'?'ok':p.state==='banned'?'bad':p.state==='parked'?'warn':'dim'}">${p.state}</td></tr>`).join('')||`<tr><td colspan=5 class="empty">${L.enabled?'no peers yet':'legacy layer off'}</td></tr>`;
+  $('upd').textContent=new Date().toISOString().slice(11,19);
+ }catch(e){const p=$('pill');p.textContent='api unreachable';p.className='pill bad'}
+}
+function countdown(){const left=slot?slot.startsAtUnix-Date.now()/1000:null;
+ if(left==null){$('slotv').textContent='—';$('slots').textContent='no slot scheduled';$('slotbar').style.width='0';return}
+ if(left>0){$('slotv').textContent=dur(Math.ceil(left));$('slots').textContent=`slot ${slot.slot} · ${slot.delegate} · ${new Date(slot.startsAtUnix*1000).toISOString().slice(11,19)} UTC`;const total=Math.max(bt*21,1);$('slotbar').style.width=`${Math.max(0,100-left/total*100)}%`}
+ else{$('slotv').textContent='forging…';$('slotbar').style.width='100%'}}
+tick();setInterval(tick,3000);setInterval(countdown,500);
+</script></body></html>

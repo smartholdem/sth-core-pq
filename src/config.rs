@@ -38,6 +38,8 @@ pub struct Milestone {
     pub htlc_enabled: bool,
     pub block_burn_address: bool,
     pub aip11: bool,
+    /// AIP-36 entity transactions (typeGroup 2 / type 6) accepted from this height.
+    pub aip36: bool,
     pub aip37: bool,
 }
 
@@ -77,6 +79,7 @@ impl Default for Milestone {
             htlc_enabled: true,
             block_burn_address: true,
             aip11: true,
+            aip36: false,
             aip37: false,
         }
     }

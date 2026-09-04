@@ -161,8 +161,9 @@ async fn on_block(node: &IrohNode, storage: &Arc<Storage>, seen: &Mutex<Seen>, f
         return Ok(());
     }
     if block.height == tip.height + 1 {
-        let h = block.height;
+        let (h, ts) = (block.height, block.timestamp);
         tip = apply(storage, vec![block], tip, verify).await?;
+        crate::intake::record(crate::intake::Source::GossipIroh, from.fmt_short().to_string(), h, ts, storage.network());
         let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
         s.heights.insert(h);
         s.trim();

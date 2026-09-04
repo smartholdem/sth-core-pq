@@ -23,6 +23,7 @@ use crate::node_pool::{Lease, NodePool, RateLimitConfig, API_WINDOW_LIMIT};
 use crate::storage::Storage;
 use futures::stream::{self, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
+use rayon::prelude::*;
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -528,6 +529,26 @@ pub fn progress_style(prefix: &str) -> Result<ProgressStyle> {
 /// Link-check and verify `blocks` on top of `tip`, then apply them in one sled transaction.
 /// Pure blocking function so it can run on the blocking pool and be unit-tested.
 pub fn apply_blocks(storage: &Storage, network: &Network, blocks: &[Block], mut tip: ChainTip, verify: bool) -> Result<ChainTip> {
+    // cryptographic checks are independent per block → verify the whole batch across all cores first
+    let crypto: Vec<Result<()>> = blocks
+        .par_iter()
+        .map(|block| {
+            let height = block.height;
+            let id = block.id.as_deref().ok_or_else(|| Error::Sync(format!("block {height} has no id")))?;
+            if verify {
+                let v = verify_block(block, network);
+                if !v.verified {
+                    return Err(Error::BlockValidation(format!("block {height} ({id}): {}", v.errors.join("; "))));
+                }
+            } else if height > 1 {
+                let computed = block_id(block)?;
+                if computed != id {
+                    return Err(Error::BlockValidation(format!("block {height}: id {id} != computed {computed}")));
+                }
+            }
+            Ok(())
+        })
+        .collect();
     for block in blocks {
         let height = block.height;
         if height != tip.height + 1 {
@@ -545,19 +566,74 @@ pub fn apply_blocks(storage: &Storage, network: &Network, blocks: &[Block], mut 
                 )));
             }
         }
-        if verify {
-            let v = verify_block(block, network);
-            if !v.verified {
-                return Err(Error::BlockValidation(format!("block {height} ({id}): {}", v.errors.join("; "))));
-            }
-        } else if height > 1 {
-            let computed = block_id(block)?;
-            if computed != id {
-                return Err(Error::BlockValidation(format!("block {height}: id {id} != computed {computed}")));
-            }
-        }
         tip = ChainTip { height, id: Some(id) };
+    }
+    for r in crypto {
+        r?;
+    }
+    if verify {
+        check_stateful_rules(storage, network, blocks)?;
     }
     storage.apply_blocks(blocks)?;
     Ok(tip)
+}
+
+/// Sequential, wallet-aware rules over a batch (legacy `throwIfCannotBeApplied`): second signatures and
+/// AIP-36 entities. Effects of earlier transactions in the batch count for later ones.
+fn check_stateful_rules(storage: &Storage, network: &Network, blocks: &[Block]) -> Result<()> {
+    use crate::crypto::address_from_public_key;
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    let mut keys: HashMap<String, Option<String>> = HashMap::new();
+    let mut entities: HashMap<String, BTreeMap<String, crate::storage::EntityRecord>> = HashMap::new();
+    let mut names: HashSet<String> = HashSet::new();
+    for block in blocks {
+        for tx in &block.transactions {
+            let sender = address_from_public_key(&tx.sender_public_key, network.pubkey_hash)?;
+            let wallet = storage.get_wallet(&sender)?;
+            if !keys.contains_key(&sender) {
+                keys.insert(sender.clone(), wallet.as_ref().and_then(|w| w.second_public_key.clone()));
+            }
+            let fail = |e: String| {
+                Error::BlockValidation(format!("block {} tx {}: {e}", block.height, tx.id.as_deref().unwrap_or("?")))
+            };
+            crate::rules::check_second_signature(tx, keys[&sender].as_deref()).map_err(fail)?;
+            if let Some(pk) = crate::rules::registered_second_key(tx).map_err(fail)? {
+                keys.insert(sender.clone(), Some(pk.to_string()));
+            }
+            if tx.is_entity() {
+                let pending = entities.entry(sender.clone()).or_default();
+                let taken = |name: &str, t: u8| {
+                    names.contains(&format!("{}-{t}", name.to_lowercase()))
+                        || storage.entity_by_name(name, t).ok().flatten().is_some()
+                };
+                crate::rules::check_entity(tx, wallet.as_ref(), pending, taken).map_err(fail)?;
+                let e = tx.entity_asset().unwrap_or_default();
+                match e.action {
+                    crate::models::entity::ACTION_REGISTER => {
+                        let name = e.data.name.clone().unwrap_or_default();
+                        names.insert(format!("{}-{}", name.to_lowercase(), e.type_));
+                        pending.insert(
+                            tx.id.clone().unwrap_or_default(),
+                            crate::storage::EntityRecord { type_: e.type_, sub_type: e.sub_type, data: e.data, resigned: false },
+                        );
+                    }
+                    action => {
+                        let reg = e.registration_id.unwrap_or_default();
+                        let mut rec = pending
+                            .get(&reg)
+                            .cloned()
+                            .or_else(|| wallet.as_ref().and_then(|w| w.entities.get(&reg).cloned()))
+                            .ok_or_else(|| fail("EntityNotRegisteredError".into()))?;
+                        if action == crate::models::entity::ACTION_UPDATE {
+                            rec.data.ipfs_data = e.data.ipfs_data;
+                        } else {
+                            rec.resigned = true;
+                        }
+                        pending.insert(reg, rec);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }

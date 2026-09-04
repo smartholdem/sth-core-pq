@@ -1,6 +1,6 @@
 [package]
 name = "sth-core"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 authors = ["TechnoL0g"]
 description = "SmartHoldem relay node core (Rust rewrite of @smartholdem/core)"
@@ -19,12 +19,11 @@ tokio = { version = "1", features = ["full"] }
 sled = { version = "0.34", features = ["compression"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-k256 = { version = "0.13", features = ["ecdsa", "sha256", "std"] }
+k256 = { version = "0.13", features = ["ecdsa", "sha256", "std", "expose-field"] }
 sha2 = "0.10"
 ripemd = "0.1"
 bs58 = { version = "0.5", features = ["check"] }
 hex = "0.4"
-num-bigint = "0.4"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -43,6 +42,7 @@ serde_yaml = "0.9"
 iroh = "1.1.0"
 iroh-gossip = "0.101.0"
 n0-future = "0.3"
+rayon = "1"
 
 [dev-dependencies]
 iroh = "1.1.0"
@@ -56,3 +56,9 @@ strip = true
 [profile.dev]
 debug = 0
 strip = "debuginfo"
+
+# crypto + storage at full speed in dev/test builds (only sth-core depends on these, so no cascade rebuild)
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.sled]
+opt-level = 3

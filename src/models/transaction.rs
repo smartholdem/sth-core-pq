@@ -22,6 +22,30 @@ pub mod tx_type {
 }
 
 pub const TYPE_GROUP_CORE: u32 = 1;
+/// Magistrate group (AIP-36 entities; legacy business/bridgechain types 0–5 are never accepted).
+pub const TYPE_GROUP_MAGISTRATE: u32 = 2;
+
+/// AIP-36 entity transaction (typeGroup 2).
+pub mod entity {
+    pub const TYPE: u16 = 6;
+    pub const ACTION_REGISTER: u8 = 0;
+    pub const ACTION_UPDATE: u8 = 1;
+    pub const ACTION_RESIGN: u8 = 2;
+    pub const TYPE_DELEGATE: u8 = 4;
+    pub const FEE_REGISTER: u64 = 5_000_000_000;
+    pub const FEE_UPDATE: u64 = 500_000_000;
+    pub const FEE_RESIGN: u64 = 500_000_000;
+
+    /// Exact static fee for an action (`StaticFeeMismatchError` otherwise).
+    pub fn static_fee(action: u8) -> Option<u64> {
+        match action {
+            ACTION_REGISTER => Some(FEE_REGISTER),
+            ACTION_UPDATE => Some(FEE_UPDATE),
+            ACTION_RESIGN => Some(FEE_RESIGN),
+            _ => None,
+        }
+    }
+}
 
 fn default_version() -> u8 {
     1
@@ -91,6 +115,51 @@ impl Transaction {
     /// Second signature under either legacy or current field name.
     pub fn second_signature_any(&self) -> Option<&String> {
         self.second_signature.as_ref().or(self.sign_signature.as_ref())
+    }
+
+    pub fn is_entity(&self) -> bool {
+        self.type_group == TYPE_GROUP_MAGISTRATE && self.type_ == entity::TYPE
+    }
+
+    /// Entity asset (`typeGroup 2 / type 6`), parsed from the verbatim `asset` map.
+    pub fn entity_asset(&self) -> Option<EntityAsset> {
+        if !self.is_entity() {
+            return None;
+        }
+        let a = self.asset.as_ref()?;
+        serde_json::from_value(Value::Object(a.extra.clone())).ok()
+    }
+}
+
+/// AIP-36 entity asset: `{ type, subType, action, registrationId?, data: { name?, ipfsData? } }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityAsset {
+    #[serde(rename = "type")]
+    pub type_: u8,
+    pub sub_type: u8,
+    pub action: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<String>,
+    #[serde(default)]
+    pub data: EntityData,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipfs_data: Option<String>,
+}
+
+impl EntityAsset {
+    pub fn into_map(self) -> Map<String, Value> {
+        match serde_json::to_value(self) {
+            Ok(Value::Object(m)) => m,
+            _ => Map::new(),
+        }
     }
 }
 

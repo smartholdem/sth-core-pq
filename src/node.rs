@@ -84,9 +84,8 @@ impl NodeContext {
         let storage = Arc::new(Storage::open(Path::new(&config.db_path), network.clone())?);
         storage.ensure_vote_index()?;
         let reward_address = config.reward_address()?;
-        match &reward_address {
-            Some(a) => tracing::info!(address = a, "reward address configured"),
-            None => tracing::info!("no reward address configured (rewards.reward_address / reward_passphrase)"),
+        if let Some(a) = &reward_address {
+            tracing::info!(address = a, "rewards.reward_address set (reserved for future relay rewards, unused for now)");
         }
         let delegate_secrets = resolve_delegate_secrets(&config);
         let mut seeds: Vec<String> = config.p2p.legacy_peers.clone();
@@ -161,7 +160,24 @@ impl NodeContext {
             if let Some(f) = &self.forging {
                 state = state.with_forging(f.clone());
             }
-            let state = Arc::new(state);
+            let metrics_addr: Option<SocketAddr> = match cfg.api.metrics_listen.trim() {
+                "" => None,
+                s => Some(s.parse().map_err(|e| Error::Config(format!("invalid api.metrics_listen: {e}")))?),
+            };
+            let state = Arc::new(state.with_metrics_page(cfg.api.page_metrics && metrics_addr.is_none()));
+            if cfg.api.page_metrics {
+                match metrics_addr {
+                    Some(maddr) => {
+                        let st = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = api::serve_metrics(st, maddr).await {
+                                tracing::error!(error = %e, "metrics page stopped");
+                            }
+                        });
+                    }
+                    None => tracing::info!(url = format!("http://{addr}/"), "metrics page enabled on the API port"),
+                }
+            }
             tokio::spawn(async move {
                 if let Err(e) = api::serve(state, addr).await {
                     tracing::error!(error = %e, "REST API stopped");

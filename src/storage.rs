@@ -41,6 +41,8 @@ const PREFIX_ROUND: &[u8] = b"rd:";
 const PREFIX_UNDO: &[u8] = b"undo:";
 /// `dv:<delegate public key>` → vote weight (BE u64), maintained incrementally on every wallet write.
 const PREFIX_VOTES: &[u8] = b"dv:";
+/// `en:<name lowercase>-<type>` → registration transaction id (network-wide entity name uniqueness).
+const PREFIX_ENTITY_NAME: &[u8] = b"en:";
 const KEY_VOTE_INDEX: &[u8] = b"meta:vote_index";
 /// Blocks that can be rolled back (undo records kept) once undo logging is on.
 pub const UNDO_DEPTH: u64 = 1_000;
@@ -78,6 +80,21 @@ pub struct WalletState {
     pub locks: BTreeMap<String, LockRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_signature: Option<MultiSignatureAsset>,
+    /// AIP-36 entities registered by this wallet, keyed by registration transaction id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entities: BTreeMap<String, EntityRecord>,
+}
+
+/// `attributes.entities[<registrationId>]` as legacy core stores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityRecord {
+    #[serde(rename = "type")]
+    pub type_: u8,
+    pub sub_type: u8,
+    pub data: crate::models::EntityData,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resigned: bool,
 }
 
 /// Open HTLC lock (`attributes.htlc.locks[id]` / `/api/locks`).
@@ -140,6 +157,7 @@ impl WalletState {
             resigned: false,
             locks: BTreeMap::new(),
             multi_signature: None,
+            entities: BTreeMap::new(),
         }
     }
 
@@ -181,6 +199,9 @@ impl WalletState {
         if let Some(m) = &d.multi_signature {
             self.multi_signature = Some(m.clone());
         }
+        for (id, rec) in &d.entities {
+            self.entities.insert(id.clone(), rec.clone());
+        }
         Ok(())
     }
 }
@@ -203,6 +224,12 @@ struct WalletDelta {
     locks_added: Vec<LockRecord>,
     locks_removed: Vec<String>,
     multi_signature: Option<MultiSignatureAsset>,
+    /// Entity records written by this block (register / update / resign), keyed by registration id.
+    entities: Vec<(String, EntityRecord)>,
+}
+
+fn entity_name_key(name: &str, type_: u8) -> String {
+    format!("{}-{}", name.to_lowercase(), type_)
 }
 
 fn height_key(height: u64) -> Vec<u8> {
@@ -642,7 +669,42 @@ impl Storage {
                 let json = serde_json::to_vec(l).map_err(Error::Json).or_else(abort)?;
                 t.insert(prefixed(PREFIX_LOCK, &l.lock_id), json)?;
             }
+            for (id, rec) in &delta.entities {
+                if let Some(name) = &rec.data.name {
+                    t.insert(prefixed(PREFIX_ENTITY_NAME, &entity_name_key(name, rec.type_)), id.as_bytes())?;
+                }
+            }
             out.push(state);
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------- entities (AIP-36)
+
+    /// Registration id holding `name` for entity `type_` (network-wide unique, case-insensitive).
+    pub fn entity_by_name(&self, name: &str, type_: u8) -> Result<Option<String>> {
+        Ok(self
+            .tree
+            .get(prefixed(PREFIX_ENTITY_NAME, &entity_name_key(name, type_)))?
+            .map(|v| String::from_utf8_lossy(&v).into_owned()))
+    }
+
+    /// Entity record + owner address by registration id.
+    pub fn get_entity(&self, registration_id: &str) -> Result<Option<(String, EntityRecord)>> {
+        let Some(tx) = self.get_transaction(registration_id)? else { return Ok(None) };
+        let owner = address_from_public_key(&tx.sender_public_key, self.network.pubkey_hash)?;
+        Ok(self.get_wallet(&owner)?.and_then(|w| w.entities.get(registration_id).map(|r| (owner.clone(), r.clone()))))
+    }
+
+    /// All entities (registration id, owner, record), registration order not guaranteed.
+    pub fn all_entities(&self) -> Result<Vec<(String, String, EntityRecord)>> {
+        let mut out = Vec::new();
+        for item in self.tree.scan_prefix(PREFIX_ENTITY_NAME) {
+            let (_, v) = item?;
+            let id = String::from_utf8_lossy(&v).into_owned();
+            if let Some((owner, rec)) = self.get_entity(&id)? {
+                out.push((id, owner, rec));
+            }
         }
         Ok(out)
     }
@@ -886,6 +948,11 @@ impl Storage {
                 }
                 for (seq, tx) in block.transactions.iter().enumerate() {
                     let Some(id) = &tx.id else { continue };
+                    if let Some(e) = tx.entity_asset().filter(|e| e.action == crate::models::entity::ACTION_REGISTER) {
+                        if let Some(name) = &e.data.name {
+                            t.remove(prefixed(PREFIX_ENTITY_NAME, &entity_name_key(name, e.type_)))?;
+                        }
+                    }
                     t.remove(prefixed(PREFIX_TX, id))?;
                     let seq = tx.sequence.unwrap_or(seq as u32);
                     t.remove(tx_order_key(PREFIX_TX_LIST, "", height, seq))?;
@@ -954,6 +1021,35 @@ impl Storage {
                 d.balance -= tx.amount as i128 + tx.fee as i128;
                 d.nonce += 1;
                 d.public_key = Some(tx.sender_public_key.clone());
+            }
+            if let Some(e) = tx.entity_asset() {
+                let (Some(id), Some(existing)) = (tx.id.as_ref(), Some(deltas.get(&sender).map(|d| d.entities.clone()).unwrap_or_default())) else { continue };
+                let record = match e.action {
+                    crate::models::entity::ACTION_REGISTER => {
+                        (id.clone(), EntityRecord { type_: e.type_, sub_type: e.sub_type, data: e.data.clone(), resigned: false })
+                    }
+                    _ => {
+                        let Some(reg_id) = e.registration_id.clone() else { continue };
+                        let current = existing
+                            .iter()
+                            .rev()
+                            .find(|(k, _)| *k == reg_id)
+                            .map(|(_, r)| r.clone())
+                            .or_else(|| self.get_wallet(&sender).ok().flatten().and_then(|w| w.entities.get(&reg_id).cloned()));
+                        let Some(mut rec) = current else { continue };
+                        if e.action == crate::models::entity::ACTION_UPDATE {
+                            rec.data.ipfs_data = e.data.ipfs_data.clone();
+                        } else {
+                            rec.resigned = true;
+                        }
+                        (reg_id, rec)
+                    }
+                };
+                deltas.entry(sender.clone()).or_default().entities.push(record);
+                continue;
+            }
+            if tx.type_group != crate::models::TYPE_GROUP_CORE {
+                continue;
             }
             match tx.type_ {
                 tx_type::TRANSFER => {
