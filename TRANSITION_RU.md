@@ -4,12 +4,12 @@
 
 | Направление | Транспорт | Нужен ли статический IP |
 |---|---|---|
-| Rust → legacy (блоки `postBlock`, транзакции `postTransactions`) | исходящее WS на `ip:4001` legacy-узла | **нет** - нода сама открывает соединение |
-| legacy → Rust (legacy тянет блоки/пиров) | legacy умеет только `ip:4001` | **да** - только gateway-узлы |
+| Rust -> legacy (блоки `postBlock`, транзакции `postTransactions`) | исходящее WS на `ip:4001` legacy-узла | **нет** - нода сама открывает соединение |
+| legacy -> Rust (legacy тянет блоки/пиров) | legacy умеет только `ip:4001` | **да** - только gateway-узлы |
 | Rust ↔ Rust (блоки, транзакции, репутация пиров, RPC GetBlocks) | iroh (QUIC, hole-punch, relay) | **нет** |
-| Кошельки / эксплореры / dApps → Rust REST 4003 | netfory-provider `api://<NodeId>/<name>` | **нет** |
+| Кошельки / эксплореры / dApps -> Rust REST 4003 | netfory-provider `api://<NodeId>/<name>` | **нет** |
 
-`netfory-provider` - это только мост «Web 4.0 → REST/WS нашей ноды». Он **не участвует в консенсусе** и на legacy-серверах для связи делегатов не нужен: legacy core не умеет ходить через iroh/`api://`.
+`netfory-provider` - это только мост "Web 4.0 -> REST/WS нашей ноды". Он **не участвует в консенсусе** и на legacy-серверах для связи делегатов не нужен: legacy core не умеет ходить через iroh/`api://`.
 
 ## 1. Rust-делегат на динамическом IP (домашний ПК, NAT)
 
