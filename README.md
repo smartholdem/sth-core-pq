@@ -3,7 +3,7 @@
 ![TPS](https://img.shields.io/badge/Performance-27,000+_TPS-brightgreen?style=for-the-badge)
 ![RAM](https://img.shields.io/badge/RAM_Usage-~800_MB-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
-
+![banner.jpg](banner.jpg)
 # SmartHoldem 2.0 Core (Rust)
 **The First Quantum-Ready, Serverless Web 4.0 DPoS Blockchain.**  
 A complete, ground-up rewrite of the SmartHoldem node in Rust. Featuring 12-minute sync times, Iroh P2P NAT traversal (no static IP required), native DAO infrastructure (active at block 11,800,000), and post-quantum cryptographic readiness.
