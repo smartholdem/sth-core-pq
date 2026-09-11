@@ -1,7 +1,7 @@
 //! Author: TechnoL0g
 //!
-//! Node runtime assembled from `NodeConfig`: storage → optional snapshot bootstrap → mempool →
-//! local REST API → block intake (legacy P2P with peer table, or REST fallback).
+//! Node runtime assembled from `NodeConfig`: storage > optional snapshot bootstrap > mempool >
+//! local REST API > block intake (legacy P2P with peer table, or REST fallback).
 //! `NodeContext` is the shared handle future modules (delegate/forger, iroh) attach to.
 
 use crate::api::{self, AppState};
@@ -81,7 +81,7 @@ impl NodeContext {
     pub async fn open(config: NodeConfig) -> Result<Self> {
         config.validate()?;
         let network = config.load_network()?;
-        let storage = Arc::new(Storage::open(Path::new(&config.db_path), network.clone())?);
+        let storage = Arc::new(Storage::open_with_cache(Path::new(&config.db_path), network.clone(), config.db_cache_mb)?);
         storage.ensure_vote_index()?;
         let reward_address = config.reward_address()?;
         if let Some(a) = &reward_address {
@@ -119,6 +119,7 @@ impl NodeContext {
     /// Full node lifecycle; returns when the intake loop stops or on Ctrl+C.
     pub async fn run(mut self, flags: RunFlags) -> Result<()> {
         tokio::spawn(crate::ntp::check_clock("pool.ntp.org"));
+        tokio::spawn(crate::mem::watchdog(std::time::Duration::from_secs(600)));
         self.start_iroh().await?;
         let cfg = self.config.clone();
         let source = cfg.sync.bootstrap_snapshot.trim();

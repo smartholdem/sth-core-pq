@@ -55,7 +55,7 @@ fn genesis_header_gets_configured_id() {
     let original: Block = serde_json::from_str(GENESIS_HEADER).unwrap();
     let bytes = serialize_block(&original, true).unwrap();
     let decoded = deserialize_block_header(&bytes, &net).unwrap();
-    assert_eq!(decoded.id.as_deref(), Some(net.genesis_block_id));
+    assert_eq!(decoded.id.as_deref(), Some(net.genesis_block_id.as_str()));
     assert_eq!(decoded.number_of_transactions, 1855);
 }
 

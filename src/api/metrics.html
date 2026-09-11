@@ -28,6 +28,11 @@ tr:hover td{background:#151a21}
 .bar{height:3px;background:var(--line);border-radius:2px;margin-top:10px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc);transition:width .6s ease}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:22px}@media(max-width:720px){.two{grid-template-columns:1fr}}
 .empty{color:var(--dim);padding:10px 8px}
+.calc{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:14px}@media(max-width:720px){.calc{grid-template-columns:repeat(2,1fr)}}
+.calc label{display:block;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+.calc input{display:block;width:100%;margin-top:6px;background:var(--card);border:1px solid var(--line);border-radius:4px;color:var(--acc);font:inherit;font-size:16px;font-weight:700;padding:8px 10px;outline:none;transition:border-color .2s}
+.calc input:focus{border-color:var(--acc)}
+.best td{color:var(--ok)}
 </style></head><body><div class="wrap">
 <h1>// <b>STH-CORE</b> NODE<i>_</i></h1>
 <div class="sub" id="sub">SmartHoldem relay / delegate node · Rust · sled · legacy 4001 + iroh</div>
@@ -59,6 +64,16 @@ tr:hover td{background:#151a21}
 <div><h2>legacy peers</h2><table><thead><tr><th>peer</th><th>ver</th><th class="r">height</th><th class="r">blocks</th><th>state</th></tr></thead><tbody id="lpeers"></tbody></table></div>
 </div>
 
+<hr><h2>payout calculator <span class="dim">· N payouts: STH multipayment vs BNB Chain vs Solana</span></h2>
+<div class="calc" id="calc">
+ <label>payouts<input id="cN" type="number" min="1" step="1" value="1000" data-testid="calc-payouts"></label>
+ <label>STH price, USDT<input id="cP" type="number" min="0" step="0.0001" value="0.0014" data-testid="calc-sth-price"></label>
+ <label>BNB fee / transfer, $<input id="cB" type="number" min="0" step="0.001" value="0.02" data-testid="calc-bnb-fee"></label>
+ <label>Solana fee / transfer, $<input id="cS" type="number" min="0" step="0.0001" value="0.0005" data-testid="calc-sol-fee"></label>
+</div>
+<table><thead><tr><th>network</th><th class="r">transactions</th><th class="r">signatures</th><th class="r">fee</th><th class="r">usd</th><th class="r">vs STH</th></tr></thead><tbody id="ctab" data-testid="calc-table"></tbody></table>
+<div class="s dim" id="cnote" data-testid="calc-note"></div>
+
 <div class="foot">auto-refresh 3s · updated <span id="upd">—</span> · raw: <a href="/api/ntfry/metrics">/api/ntfry/metrics</a> · <a href="/api/ntfry/peers">/api/ntfry/peers</a></div>
 </div>
 <script>
@@ -74,13 +89,14 @@ async function tick(){
   setv('height',fmt(c.height));$('heights').textContent=c.id?sh(c.id):'';
   setv('net',fmt(c.networkHeight),c.behind>1?'bad':'ok');$('nets').textContent=c.behind>1?`${fmt(c.behind)} blocks behind`:'tip reached';
   const age=c.lastBlockAge??0;setv('age',dur(age)+' ago',age>3*bt?(age>10*bt?'bad':'warn'):'ok');$('ages').textContent=c.blocksPerMin?`${c.blocksPerMin.toFixed(1)} blocks/min · slot ${bt}s`:`slot ${bt}s`;
-  setv('up',dur(d.node.uptime));$('ups').textContent=new Date(d.node.now*1000).toISOString().slice(11,19)+' UTC';
+  setv('up',dur(d.node.uptime));$('ups').textContent=new Date(d.node.now*1000).toISOString().slice(11,19)+' UTC'+(d.node.rssBytes?` · rss ${(d.node.rssBytes/1048576).toFixed(0)} MB`:'');
   const L=d.legacy;if(L.enabled){setv('lp',`${L.alive}/${L.known}`,L.alive?'':'bad');$('lps').textContent=`best ${fmt(L.bestHeight)} · ${L.banned} banned · ${L.parked} parked`}else{setv('lp','off','bad');$('lps').textContent=''}
-  const I=d.ntfry;if(I.enabled){setv('ip',`${I.neighbors}/${I.known}`,'cyan');$('ips').textContent=`${I.gateways} gateways · best ${fmt(I.bestHeight)}`;$('myid').textContent='· me '+sh(I.nodeId)}else{setv('ip','off','bad');$('ips').textContent='p2p.iroh.enabled: false';$('myid').textContent=''}
+  const I=d.ntfry;if(I.enabled){setv('ip',`${I.neighbors}/${I.known}`,'cyan');$('ips').textContent=`${I.gateways} gateways · best ${fmt(I.bestHeight)}`+(I.gateway?` · this node is a gateway (${I.gateway})`:'');$('myid').textContent='· me '+sh(I.nodeId)}else{setv('ip','off','bad');$('ips').textContent='p2p.iroh.enabled: false';$('myid').textContent=''}
   const K=d.intake,lb=K.last;
   if(lb){const sc=lb.source==='gossip-iroh'?'cyan':lb.source==='forged'?'ok':'';setv('src',lb.label,sc);$('srcs').textContent=`${fmt(lb.height)} from ${lb.peer}`}else{setv('src','—','');$('srcs').textContent='no live block yet'}
   if(K.avgDelayMs!=null){const a=K.avgDelayMs/1000;setv('dly',`${a.toFixed(2)}s`,a<2?'ok':a<4?'warn':'bad');$('dlys').textContent=`last ${(lb.delayMs/1000).toFixed(2)}s · ${K.samples} blocks · `+Object.entries(K.bySource).map(([k,v])=>`${k} ${(v.avgDelayMs/1000).toFixed(1)}s×${v.count}`).join(' · ')}else{setv('dly','—','');$('dlys').textContent='after slot start, avg of last 100'}
   setv('mp',fmt(d.mempool.count));$('mps').textContent=`max ${fmt(d.mempool.max)}`;
+  if(c.fees){fees={transfer:c.fees.transfer/1e8,multiPayment:c.fees.multiPayment/1e8,limit:c.multiPaymentLimit||256};calc()}
   const F=d.forging;
   if(F.enabled){const act=F.delegates.filter(x=>x.active).length;setv('fg',`${F.forgedCount}`,act?'ok':'warn');$('fgs').textContent=F.delegates.map(x=>`${x.username}${x.rank?' #'+x.rank:''}`).join(', ')||'no delegates';slot=F.nextSlot;
    if(F.lastForged)$('fgs').textContent+=` · last ${fmt(F.lastForged.height)} (${F.lastForged.acceptedBy} peers)`}
@@ -96,4 +112,19 @@ function countdown(){const left=slot?slot.startsAtUnix-Date.now()/1000:null;
  if(left>0){$('slotv').textContent=dur(Math.ceil(left));$('slots').textContent=`slot ${slot.slot} · ${slot.delegate} · ${new Date(slot.startsAtUnix*1000).toISOString().slice(11,19)} UTC`;const total=Math.max(bt*21,1);$('slotbar').style.width=`${Math.max(0,100-left/total*100)}%`}
  else{$('slotv').textContent='forging…';$('slotbar').style.width='100%'}}
 tick();setInterval(tick,3000);setInterval(countdown,500);
+let fees={transfer:1,multiPayment:0.1,limit:256};
+function calc(){
+ const N=Math.max(1,Math.floor(+$('cN').value||0)),P=+$('cP').value||0,B=+$('cB').value||0,S=+$('cS').value||0;
+ const txs=Math.ceil(N/fees.limit),sth=txs*fees.multiPayment,sthUsd=sth*P;
+ const usd=v=>v<0.01?'$'+v.toFixed(6):'$'+v.toLocaleString('en-US',{maximumFractionDigits:2});
+ const x=v=>sthUsd>0?(v/sthUsd>=100?'×'+fmt(Math.round(v/sthUsd)):'×'+(v/sthUsd).toFixed(1)):'—';
+ const rows=[
+  ['SmartHoldem · multipayment',txs,txs,`${sth.toLocaleString('en-US',{maximumFractionDigits:2})} STH`,usd(sthUsd),'—',true],
+  ['SmartHoldem · single transfers',N,N,`${fmt(N*fees.transfer)} STH`,usd(N*fees.transfer*P),x(N*fees.transfer*P),false],
+  ['BNB Chain',N,N,`${fmt(N)} × gas`,usd(N*B),x(N*B),false],
+  ['Solana',N,N,`${fmt(N)} × fee`,usd(N*S),x(N*S),false]];
+ $('ctab').innerHTML=rows.map(r=>`<tr class="${r[6]?'best':''}"><td>${r[0]}</td><td class="r">${fmt(r[1])}</td><td class="r">${fmt(r[2])}</td><td class="r">${r[3]}</td><td class="r">${r[4]}</td><td class="r dim">${r[5]}</td></tr>`).join('');
+ $('cnote').textContent=`mainnet static fees: multipayment ${fees.multiPayment} STH per tx (up to ${fees.limit} recipients), transfer ${fees.transfer} STH · 1 STH = ${P} USDT · BNB/Solana fees are editable estimates`;
+}
+['cN','cP','cB','cS'].forEach(i=>$(i).addEventListener('input',calc));calc();
 </script></body></html>

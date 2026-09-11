@@ -19,6 +19,8 @@ pub struct NodeConfig {
     /// parameters from block N) be rolled out by editing JSON only.
     pub network_dir: String,
     pub db_path: String,
+    /// sled page cache in MiB (default 64). Lower it (16–32) on VPS with ≤1 GB RAM; sled may use ~2× this value.
+    pub db_cache_mb: u32,
     pub api: ApiConfig,
     pub sync: SyncSection,
     pub p2p: P2pConfig,
@@ -139,6 +141,7 @@ impl Default for NodeConfig {
             network: "mainnet".into(),
             network_dir: String::new(),
             db_path: "./data".into(),
+            db_cache_mb: 64,
             api: ApiConfig::default(),
             sync: SyncSection::default(),
             p2p: P2pConfig::default(),
@@ -284,14 +287,17 @@ impl NodeConfig {
              #\n\
              # network_dir: optional folder with network.json / milestones.json / exceptions.json / genesisBlock.json[.gz]\n\
              #          (crypto-networks layout, `sth-core init --network-files` exports the embedded ones).\n\
+             # db_cache_mb: sled page cache (MiB). 64 is fine for 2 GB+ RAM; use 16–32 on a 1 GB VPS (process RSS ≈ 2–3× this).\n\
              # api:     local REST bridge for wallets / explorers / netfory-provider (keep host 127.0.0.1).\n\
              #          page_metrics: true serves the operator dashboard at http://host:port/ — or on its own address\n\
              #          with metrics_listen: \"0.0.0.0:4888\" (page + /api/ntfry/* only, safe to expose).\n\
              # sync:    legacy REST bootstrap nodes; bootstrap_snapshot is used only while the database is empty\n\
              #          (`latest` downloads from https://snapshots.smartholdem.io/, a path imports a local dump, empty skips).\n\
              # p2p:     legacy_enabled follows the chain through port 4001 (IP peers) with parallel_peers ranges in flight;\n\
-             #          relay_fanout peers receive every accepted transaction. legacy_listen: 0.0.0.0:4001 turns on the inbound\n\
-             #          legacy server (gateway node) — old nodes and netfory-provider ws:// clients can pull blocks from us.\n\
+             #          relay_fanout peers receive every accepted transaction.\n\
+             #          GATEWAY node = legacy_listen: \"0.0.0.0:4001\" (inbound legacy server: old nodes and netfory-provider\n\
+             #          ws:// clients pull blocks from us) + legacy_public_addr: \"<public IP of THIS server>:4001\" (announced to\n\
+             #          Rust peers over iroh; they show us with gateway: true in /api/ntfry/peers). Both must be set.\n\
              #          p2p.iroh enables the Web 4.0 layer\n\
              #          (iroh endpoint + gossip topics for blocks / transactions, GetBlocks RPC); bootstrap = EndpointIds of peers.\n\
              # rewards: RESERVED, not used yet — future relay/gateway rewards (block & snapshot distribution).\n\

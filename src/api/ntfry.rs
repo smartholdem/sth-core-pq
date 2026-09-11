@@ -44,6 +44,7 @@ fn iroh_meta(st: &Shared) -> Value {
             let peers = iroh.peers.snapshot();
             json!({
                 "enabled": true, "nodeId": iroh.id().to_string(),
+                "gateway": iroh.gateway,
                 "neighbors": peers.iter().filter(|p| p.neighbor).count(), "known": peers.len(),
                 "gateways": peers.iter().filter(|p| p.gateway.is_some()).count(),
                 "bestHeight": iroh.peers.best_height(),
@@ -71,6 +72,7 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
     let now = Instant::now();
     let tip = last_height(&st)?;
     let last = st.storage.get_last_block()?;
+    let ms = st.network.milestone(tip.max(1));
     let recent = st.storage.get_blocks(0, 12)?;
     let blocks: Vec<Value> = recent.iter().map(|b| block_json(&st, b, false, tip)).collect::<Result<_, _>>()?;
     let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
@@ -118,13 +120,16 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
         "node": {
             "version": env!("CARGO_PKG_VERSION"), "implementation": "sth-core-rust",
             "uptime": st.started.elapsed().as_secs(), "nethash": st.network.nethash, "now": now_unix,
+            "rssBytes": crate::mem::rss_bytes(),
         },
         "chain": {
             "height": tip, "id": last.as_ref().and_then(|b| b.id.clone()),
             "lastBlockAge": last_unix.map(|u| (now_unix - u).max(0)),
             "networkHeight": network_height, "behind": network_height.saturating_sub(tip),
             "syncing": network_height.saturating_sub(tip) > 1, "blocksPerMin": blocks_per_min,
-            "blockTime": st.network.milestone(tip.max(1)).blocktime,
+            "blockTime": ms.blocktime,
+            "multiPaymentLimit": ms.multi_payment_limit,
+            "fees": { "transfer": ms.static_fee("transfer"), "multiPayment": ms.static_fee("multiPayment") },
         },
         "mempool": { "count": st.mempool.len().await, "max": st.mempool.max_size() },
         "intake": crate::intake::snapshot(),

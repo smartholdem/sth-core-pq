@@ -107,13 +107,17 @@ impl Mempool {
                 }
             }
             tx.id = Some(id.clone());
+            let summary = describe(&tx, self.storage.network().pubkey_hash);
             match self.validate(&tx).await {
                 Ok(()) => {
+                    tracing::info!("Received transaction {summary}");
+                    tracing::debug!(tx = %serde_json::to_string(&tx).unwrap_or_default(), "transaction json");
                     self.txs.write().await.insert(id.clone(), tx);
                     resp.accept.push(id.clone());
                     resp.broadcast.push(id);
                 }
                 Err((type_, message)) => {
+                    tracing::warn!("Rejected transaction {summary}: {type_} {message}");
                     errors.insert(id.clone(), PoolError { type_, message });
                     resp.invalid.push(id);
                 }
@@ -296,4 +300,41 @@ fn spent(tx: &Transaction) -> i128 {
         .map(|p| p.iter().map(|x| x.amount as u128).sum())
         .unwrap_or(0);
     tx.amount as i128 + tx.fee as i128 + payments as i128
+}
+
+fn sth(amount: u64) -> String {
+    format!("{}.{:08} STH", amount / 100_000_000, amount % 100_000_000)
+}
+
+/// One-line, human-readable summary for the log: type, sender → recipient, amount, fee, id.
+fn describe(tx: &Transaction, pubkey_hash: u8) -> String {
+    use crate::models::tx_type;
+    let from = crate::crypto::address_from_public_key(&tx.sender_public_key, pubkey_hash).unwrap_or_else(|_| "?".into());
+    let id = tx.id.as_deref().unwrap_or("?");
+    let kind = if tx.is_entity() {
+        let a = tx.entity_asset().unwrap_or_default();
+        format!("Entity[{}] {}", ["register", "update", "resign"].get(a.action as usize).unwrap_or(&"?"), a.data.name.unwrap_or_default())
+    } else {
+        match tx.type_ {
+            tx_type::TRANSFER => "Transfer".to_string(),
+            tx_type::SECOND_SIGNATURE => "SecondSignature".into(),
+            tx_type::DELEGATE_REGISTRATION => format!("DelegateRegistration {}", tx.asset.as_ref().and_then(|a| a.delegate.as_ref()).map(|d| d.username.as_str()).unwrap_or("?")),
+            tx_type::VOTE => format!("Vote {}", tx.asset.as_ref().and_then(|a| a.votes.as_ref()).map(|v| v.join(",")).unwrap_or_default()),
+            tx_type::MULTI_SIGNATURE => "MultiSignature".into(),
+            tx_type::IPFS => "Ipfs".into(),
+            tx_type::MULTI_PAYMENT => format!("MultiPayment x{}", tx.asset.as_ref().and_then(|a| a.payments.as_ref()).map(|p| p.len()).unwrap_or(0)),
+            tx_type::DELEGATE_RESIGNATION => "DelegateResignation".into(),
+            tx_type::HTLC_LOCK => "HtlcLock".into(),
+            tx_type::HTLC_CLAIM => "HtlcClaim".into(),
+            tx_type::HTLC_REFUND => "HtlcRefund".into(),
+            t => format!("type {t}"),
+        }
+    };
+    let total: u64 = match tx.type_ {
+        tx_type::MULTI_PAYMENT => tx.asset.as_ref().and_then(|a| a.payments.as_ref()).map(|p| p.iter().map(|x| x.amount).sum()).unwrap_or(0),
+        _ => tx.amount,
+    };
+    let to = tx.recipient_id.as_deref().unwrap_or("-");
+    let memo = tx.vendor_field.as_deref().map(|v| format!(" memo=\"{v}\"")).unwrap_or_default();
+    format!("{kind} {from} -> {to} amount={} fee={} nonce={} id={id}{memo}", sth(total), sth(tx.fee), tx.nonce.unwrap_or(0))
 }

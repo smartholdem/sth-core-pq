@@ -59,6 +59,7 @@ pub async fn start(
     legacy_peers: Option<Arc<crate::p2p_legacy::PeerTable>>,
 ) -> Result<()> {
     let seen = Arc::new(Mutex::new(Seen::default()));
+    let bootstrap_for_watchdog = bootstrap.clone();
     let blocks_topic = node.gossip.subscribe(node.topics.blocks, bootstrap.clone()).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
     let txs_topic = node.gossip.subscribe(node.topics.transactions, bootstrap).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
     let (block_sender, mut block_receiver) = blocks_topic.split();
@@ -67,21 +68,32 @@ pub async fn start(
     // blocks intake
     {
         let (node, storage, seen) = (node.clone(), storage.clone(), seen.clone());
+        let legacy_table_blocks = legacy_peers.clone();
         tokio::spawn(async move {
             while let Some(event) = block_receiver.next().await {
                 match event {
                     Ok(Event::Received(msg)) => {
-                        let Some(GossipMessage::Block { block }) = GossipMessage::decode(&msg.content) else { continue };
+                        let block = match GossipMessage::decode(&msg.content) {
+                            Some(GossipMessage::Block { block }) => block,
+                            Some(GossipMessage::Peers { peers: hints, gateway }) => {
+                                on_peers(&node, legacy_table_blocks.as_deref(), msg.delivered_from, &hints, &gateway);
+                                continue;
+                            }
+                            _ => continue,
+                        };
                         node.peers.seen(msg.delivered_from, Some(block.height));
                         if let Err(e) = on_block(&node, &storage, &seen, msg.delivered_from, block, verify).await {
                             tracing::debug!(error = %e, "gossip block not applied");
                         }
                     }
                     Ok(Event::NeighborUp(id)) => {
-                        node.peers.set_neighbor(id, true);
-                        tracing::info!(peer = %id.fmt_short(), "iroh neighbor up");
+                        node.peers.set_neighbor(id, super::peers::TOPIC_BLOCKS, true);
+                        tracing::info!(peer = %id.fmt_short(), "iroh neighbor up (blocks)");
                     }
-                    Ok(Event::NeighborDown(id)) => node.peers.set_neighbor(id, false),
+                    Ok(Event::NeighborDown(id)) => {
+                        node.peers.set_neighbor(id, super::peers::TOPIC_BLOCKS, false);
+                        tracing::info!(peer = %id.fmt_short(), "iroh neighbor down (blocks)");
+                    }
                     Ok(Event::Lagged) => tracing::warn!("iroh block gossip lagged"),
                     Err(e) => {
                         tracing::warn!(error = %e, "iroh block gossip stream ended");
@@ -100,28 +112,7 @@ pub async fn start(
                     Ok(Event::Received(msg)) => {
                         let decoded = GossipMessage::decode(&msg.content);
                         if let Some(GossipMessage::Peers { peers: hints, gateway }) = &decoded {
-                            node.peers.seen(msg.delivered_from, None);
-                            node.peers.set_gateway(msg.delivered_from, gateway.clone());
-                            if let (Some(gw), Some(table)) = (gateway, &legacy_table) {
-                                if let Some((ip, port)) = gw.rsplit_once(':') {
-                                    if port.parse::<u16>().ok() == Some(table.port()) && table.add(ip) {
-                                        tracing::info!(gateway = %gw, from = %msg.delivered_from.fmt_short(), "gateway node announced over iroh");
-                                    }
-                                }
-                            }
-                            if let Some(table) = &legacy_table {
-                                let mut added = 0;
-                                for h in hints.iter().filter(|h| h.port == table.port()).take(64) {
-                                    if table.add(&h.ip) {
-                                        table.record_success(&h.ip, Duration::from_millis(h.latency_ms.max(1)), Some(h.height));
-                                        table.set_version(&h.ip, &h.version);
-                                        added += 1;
-                                    }
-                                }
-                                if added > 0 {
-                                    tracing::info!(added, from = %msg.delivered_from.fmt_short(), "legacy peers learned from iroh gossip");
-                                }
-                            }
+                            on_peers(&node, legacy_table.as_deref(), msg.delivered_from, hints, gateway);
                             continue;
                         }
                         let Some(GossipMessage::Transactions { transactions }) = decoded else { continue };
@@ -134,8 +125,14 @@ pub async fn start(
                         let (resp, _) = mempool.add_many(transactions).await;
                         tracing::debug!(accepted = resp.accept.len(), invalid = resp.invalid.len(), "gossip transactions processed");
                     }
-                    Ok(Event::NeighborUp(id)) => node.peers.set_neighbor(id, true),
-                    Ok(Event::NeighborDown(id)) => node.peers.set_neighbor(id, false),
+                    Ok(Event::NeighborUp(id)) => {
+                        node.peers.set_neighbor(id, super::peers::TOPIC_TXS, true);
+                        tracing::info!(peer = %id.fmt_short(), "iroh neighbor up (transactions)");
+                    }
+                    Ok(Event::NeighborDown(id)) => {
+                        node.peers.set_neighbor(id, super::peers::TOPIC_TXS, false);
+                        tracing::info!(peer = %id.fmt_short(), "iroh neighbor down (transactions)");
+                    }
                     Ok(Event::Lagged) => tracing::warn!("iroh transaction gossip lagged"),
                     Err(e) => {
                         tracing::warn!(error = %e, "iroh transaction gossip stream ended");
@@ -147,8 +144,9 @@ pub async fn start(
     }
     // publishers
     if let Some(table) = legacy_peers {
-        tokio::spawn(publish_peers(tx_sender.clone(), table, node.gateway.clone()));
+        tokio::spawn(publish_peers([block_sender.clone(), tx_sender.clone()], table, node.gateway.clone()));
     }
+    tokio::spawn(rejoin_watchdog(node.clone(), [block_sender.clone(), tx_sender.clone()], bootstrap_for_watchdog));
     tokio::spawn(publish_transactions(tx_sender, mempool.subscribe(), seen.clone()));
     tokio::spawn(publish_blocks(block_sender, storage, node.peers.clone(), seen));
     Ok(())
@@ -213,9 +211,68 @@ async fn publish_transactions(sender: GossipSender, mut events: tokio::sync::bro
 }
 
 /// Every 5 minutes share our healthiest legacy peers so freshly started Rust nodes skip the probing phase.
-async fn publish_peers(sender: GossipSender, table: Arc<crate::p2p_legacy::PeerTable>, gateway: Option<String>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(if gateway.is_some() { 120 } else { 300 }));
+/// `Peers` announcement: gateway address + legacy peer hints from a Rust peer.
+fn on_peers(
+    node: &super::IrohNode,
+    legacy_table: Option<&crate::p2p_legacy::PeerTable>,
+    from: EndpointId,
+    hints: &[super::proto::PeerHint],
+    gateway: &Option<String>,
+) {
+    node.peers.seen(from, None);
+    node.peers.set_gateway(from, gateway.clone());
+    let Some(table) = legacy_table else { return };
+    if let Some(gw) = gateway {
+        if let Some((ip, port)) = gw.rsplit_once(':') {
+            if port.parse::<u16>().ok() == Some(table.port()) && table.add(ip) {
+                tracing::info!(gateway = %gw, from = %from.fmt_short(), "gateway node announced over iroh");
+            }
+        }
+    }
+    let mut added = 0;
+    for h in hints.iter().filter(|h| h.port == table.port()).take(64) {
+        if table.add(&h.ip) {
+            table.record_success(&h.ip, Duration::from_millis(h.latency_ms.max(1)), Some(h.height));
+            table.set_version(&h.ip, &h.version);
+            added += 1;
+        }
+    }
+    if added > 0 {
+        tracing::info!(added, from = %from.fmt_short(), "legacy peers learned from iroh gossip");
+    }
+}
+
+/// A topic whose neighbours all dropped never re-bootstraps by itself: re-join the configured
+/// bootstrap peers (and any peer we still talk to over RPC) whenever a topic has no neighbour.
+async fn rejoin_watchdog(node: Arc<super::IrohNode>, senders: [GossipSender; 2], bootstrap: Vec<EndpointId>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.tick().await;
+    loop {
+        tick.tick().await;
+        for (topic, sender) in senders.iter().enumerate() {
+            if node.peers.neighbors_on(topic) > 0 {
+                continue;
+            }
+            let mut targets: Vec<EndpointId> = bootstrap.clone();
+            targets.extend(node.peers.snapshot().into_iter().filter(|p| p.failures < 3).map(|p| p.id));
+            targets.sort();
+            targets.dedup();
+            if targets.is_empty() {
+                continue;
+            }
+            let name = if topic == super::peers::TOPIC_BLOCKS { "blocks" } else { "transactions" };
+            match sender.join_peers(targets.clone()).await {
+                Ok(()) => tracing::info!(topic = name, peers = targets.len(), "no gossip neighbours, re-joining"),
+                Err(e) => tracing::warn!(topic = name, error = %e, "gossip re-join failed"),
+            }
+        }
+    }
+}
+
+/// Legacy peer hints + our gateway address, on both topics (a node may be joined on only one of them).
+async fn publish_peers(senders: [GossipSender; 2], table: Arc<crate::p2p_legacy::PeerTable>, gateway: Option<String>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(if gateway.is_some() { 120 } else { 300 }));
+    tokio::time::sleep(Duration::from_secs(15)).await; // let the gossip swarm form, then announce right away
     loop {
         tick.tick().await;
         let peers: Vec<super::proto::PeerHint> = table
@@ -229,9 +286,12 @@ async fn publish_peers(sender: GossipSender, table: Arc<crate::p2p_legacy::PeerT
             continue;
         }
         let count = peers.len();
-        match sender.broadcast(GossipMessage::Peers { peers, gateway: gateway.clone() }.encode().into()).await {
-            Ok(()) => tracing::info!(count, "legacy peer reputation shared over iroh gossip"),
-            Err(e) => tracing::debug!(error = %e, "peer hint broadcast failed"),
+        let payload = GossipMessage::Peers { peers, gateway: gateway.clone() }.encode();
+        for sender in &senders {
+            match sender.broadcast(payload.clone().into()).await {
+                Ok(()) => tracing::info!(count, gateway = gateway.as_deref().unwrap_or("-"), "legacy peer reputation shared over iroh gossip"),
+                Err(e) => tracing::debug!(error = %e, "peer hint broadcast failed"),
+            }
         }
     }
 }

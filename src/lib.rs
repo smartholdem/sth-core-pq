@@ -10,6 +10,7 @@ pub mod delegate;
 pub mod error;
 pub mod genesis;
 pub mod intake;
+pub mod mem;
 pub mod mempool;
 pub mod models;
 pub mod node;

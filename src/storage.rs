@@ -372,14 +372,19 @@ pub struct Storage {
 type UndoRecord = Vec<(String, Option<WalletState>)>;
 
 impl Storage {
-    /// Open (or create) the database at `path`.
+    /// Open (or create) the database at `path` with the default 64 MiB page cache.
     pub fn open<P: AsRef<Path>>(path: P, network: Network) -> Result<Self> {
-        // zstd page compression: block headers / wallet JSON compress ~2-3x; 64 MiB cache for API reads.
+        Self::open_with_cache(path, network, 64)
+    }
+
+    /// Open (or create) the database at `path` with a `cache_mb` MiB sled page cache.
+    pub fn open_with_cache<P: AsRef<Path>>(path: P, network: Network, cache_mb: u32) -> Result<Self> {
+        // zstd page compression: block headers / wallet JSON compress ~2-3x.
         let db = sled::Config::new()
             .path(path)
             .use_compression(true)
             .compression_factor(3)
-            .cache_capacity(64 * 1024 * 1024)
+            .cache_capacity(u64::from(cache_mb.max(8)) * 1024 * 1024)
             .open()?;
         let tree = db.open_tree("chain")?;
         Ok(Self { db, tree, network, undo_enabled: Default::default() })

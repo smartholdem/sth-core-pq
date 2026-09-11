@@ -134,7 +134,7 @@ fn fast_import_applies_chain_and_is_resumable() {
     assert_eq!((report.imported, report.skipped, report.end_height), (3, 0, 3));
     assert!(!report.interrupted);
     assert_eq!(storage.get_last_block().unwrap().unwrap().id, blocks[2].id);
-    assert_eq!(storage.get_block_by_height(1).unwrap().unwrap().id.as_deref(), Some(Network::mainnet().genesis_block_id));
+    assert_eq!(storage.get_block_by_height(1).unwrap().unwrap().id.as_deref(), Some(Network::mainnet().genesis_block_id.as_str()));
     assert_eq!(storage.get_wallet("SRhZmNqRwtRbFvaHHHAeZZWCBxaGVwg9dw").unwrap().unwrap().balance, 314159265);
     assert!(storage.get_transaction("596236ba37bc2d419f5825b2d771a74e151e7719923afefdef0b0baa9a8cfcb8").unwrap().is_some());
 

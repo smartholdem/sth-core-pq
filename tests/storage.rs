@@ -154,3 +154,82 @@ fn persistent_database_survives_reopen() {
     assert_eq!(s.get_last_height().unwrap(), 11704043);
     assert_eq!(s.get_wallet(RECIPIENT).unwrap().unwrap().balance, 314_159_265);
 }
+
+#[test]
+fn rollback_restores_wallets_and_indexes() {
+    let storage = Storage::temporary(Network::mainnet()).unwrap();
+    let block: Block = serde_json::from_str(BLOCK_11704043).unwrap();
+    let tx = &block.transactions[0];
+    let sender = sth_core::crypto::address_from_public_key(&tx.sender_public_key, 63).unwrap();
+    storage.update_wallet_state(&sender, 1_000_000_000, 10_102).unwrap();
+    storage.set_undo_enabled(true);
+    storage.apply_block(&block).unwrap();
+    assert_eq!(storage.get_last_height().unwrap(), 11704043);
+    let recipient = tx.recipient_id.clone().unwrap();
+    assert!(storage.get_wallet(&recipient).unwrap().is_some());
+    assert!(storage.get_transaction(tx.id.as_deref().unwrap()).unwrap().is_some());
+
+    let tip = storage.rollback_last_block().unwrap();
+    assert_eq!(tip, 11704042);
+    assert_eq!(storage.get_last_height().unwrap(), 11704042);
+    assert!(storage.get_block_by_height(11704043).unwrap().is_none());
+    assert!(storage.get_block_by_id(block.id.as_deref().unwrap()).unwrap().is_none());
+    assert!(storage.get_transaction(tx.id.as_deref().unwrap()).unwrap().is_none());
+    assert!(storage.get_wallet(&recipient).unwrap().is_none(), "recipient wallet created by the block must disappear");
+    let s = storage.get_wallet(&sender).unwrap().unwrap();
+    assert_eq!(s.balance, 1_000_000_000);
+    assert_eq!(s.nonce, 10_102);
+    assert!(storage.transaction_ids(None).unwrap().is_empty());
+    storage.set_undo_enabled(false);
+    storage.apply_block(&block).unwrap();
+    assert!(storage.rollback_last_block().is_err());
+}
+
+fn fake_tx(id: &str, type_: u8, sender_pk: &str, nonce: u64, amount: u64, recipient: Option<&str>, asset: &str) -> String {
+    let recipient = recipient.map(|r| format!(r#""recipientId":"{r}","#)).unwrap_or_default();
+    format!(
+        r#"{{"id":"{id}","version":2,"network":63,"typeGroup":1,"type":{type_},"nonce":"{nonce}","senderPublicKey":"{sender_pk}","fee":"100000000","amount":"{amount}",{recipient}"expiration":0,"signature":"{}","asset":{asset}}}"#, "1".repeat(128)
+    )
+}
+
+#[test]
+fn vote_index_follows_balances_and_rollback() {
+    let network = Network::mainnet();
+    let storage = Storage::temporary(network.clone()).unwrap();
+    let delegate = sth_core::crypto::KeyPair::from_passphrase("delegate one").unwrap();
+    let voter = sth_core::crypto::KeyPair::from_passphrase("voter one").unwrap();
+    let (dpk, vpk) = (delegate.public_key_hex(), voter.public_key_hex());
+    let (daddr, vaddr) = (delegate.address(63).unwrap(), voter.address(63).unwrap());
+    storage.update_wallet_state(&daddr, 2_000_000_000_000, 0).unwrap();
+    storage.update_wallet_state(&vaddr, 50_000_000_000, 0).unwrap();
+    let reg = fake_tx(&"a".repeat(64), 2, &dpk, 1, 0, None, r#"{"delegate":{"username":"delone"}}"#);
+    let vote = fake_tx(&"b".repeat(64), 3, &vpk, 1, 0, Some(&vaddr), &format!(r#"{{"votes":["+{dpk}"]}}"#));
+    let block1 = format!(
+        r#"{{"id":"{}","version":0,"timestamp":100,"previousBlock":"{}","height":11704043,"numberOfTransactions":2,"totalAmount":"0","totalFee":"200000000","reward":"0","payloadLength":0,"payloadHash":"{}","generatorPublicKey":"{dpk}","blockSignature":"{}","transactions":[{reg},{vote}]}}"#,
+        "c".repeat(64), "f".repeat(64), "9".repeat(64), "3045022100bfcfed36e8019c760490fd453cc28a2118241907d63c3ed0d3004687907107ff02200d300e64fdf5c5ca358e3266794b12b6b900004084b7fba838ceedcb1364e658"
+    );
+    let b1: Block = serde_json::from_str(&block1).unwrap();
+    storage.apply_block(&b1).unwrap();
+    // voter weight = balance after the vote fee
+    assert_eq!(storage.delegate_votes(&dpk).unwrap(), 50_000_000_000 - 100_000_000);
+    let ranking = storage.delegate_ranking().unwrap();
+    assert_eq!(ranking.len(), 1);
+    assert_eq!(ranking[0].0.username.as_deref(), Some("delone"));
+    assert_eq!(ranking[0].1, 49_900_000_000);
+
+    // voter spends 10 STH → weight drops by amount + fee; rollback restores it
+    storage.set_undo_enabled(true);
+    let transfer = fake_tx(&"d".repeat(64), 0, &vpk, 2, 1_000_000_000, Some(&daddr), "null");
+    let block2 = format!(
+        r#"{{"id":"{}","version":0,"timestamp":108,"previousBlock":"{}","height":11704044,"numberOfTransactions":1,"totalAmount":"1000000000","totalFee":"100000000","reward":"0","payloadLength":0,"payloadHash":"{}","generatorPublicKey":"{dpk}","blockSignature":"{}","transactions":[{transfer}]}}"#,
+        "e".repeat(64), "c".repeat(64), "9".repeat(64), "3045022100bfcfed36e8019c760490fd453cc28a2118241907d63c3ed0d3004687907107ff02200d300e64fdf5c5ca358e3266794b12b6b900004084b7fba838ceedcb1364e658"
+    );
+    let b2: Block = serde_json::from_str(&block2).unwrap();
+    storage.apply_block(&b2).unwrap();
+    assert_eq!(storage.delegate_votes(&dpk).unwrap(), 49_900_000_000 - 1_100_000_000);
+    storage.rollback_last_block().unwrap();
+    assert_eq!(storage.delegate_votes(&dpk).unwrap(), 49_900_000_000);
+    // rebuild from scratch gives the same number
+    storage.rebuild_vote_index().unwrap();
+    assert_eq!(storage.delegate_votes(&dpk).unwrap(), 49_900_000_000);
+}

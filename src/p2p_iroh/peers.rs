@@ -15,10 +15,16 @@ pub struct IrohPeerInfo {
     pub last_seen: Instant,
     pub messages: u64,
     pub failures: u64,
+    /// Gossip neighbour on at least one topic (blocks / transactions).
     pub neighbor: bool,
+    pub neighbor_topics: [bool; 2],
     /// Public `ip:4001` announced by a gateway node.
     pub gateway: Option<String>,
 }
+
+/// Gossip topic index for [`IrohPeers::set_neighbor`].
+pub const TOPIC_BLOCKS: usize = 0;
+pub const TOPIC_TXS: usize = 1;
 
 #[derive(Default)]
 pub struct IrohPeers {
@@ -39,6 +45,7 @@ impl IrohPeers {
             messages: 0,
             failures: 0,
             neighbor: false,
+            neighbor_topics: [false; 2],
             gateway: None,
         })
     }
@@ -53,9 +60,17 @@ impl IrohPeers {
         }
     }
 
-    pub fn set_neighbor(&self, id: EndpointId, up: bool) {
+    /// Neighbour state per topic; a peer stays a neighbour while any topic still has it.
+    pub fn set_neighbor(&self, id: EndpointId, topic: usize, up: bool) {
         let mut map = self.lock();
-        Self::entry(&mut map, id).neighbor = up;
+        let p = Self::entry(&mut map, id);
+        p.neighbor_topics[topic] = up;
+        p.neighbor = p.neighbor_topics.iter().any(|t| *t);
+    }
+
+    /// Number of gossip neighbours on `topic`.
+    pub fn neighbors_on(&self, topic: usize) -> usize {
+        self.lock().values().filter(|p| p.neighbor_topics[topic]).count()
     }
 
     pub fn record_rpc(&self, id: EndpointId, latency_ms: Option<u64>, height: Option<u64>) {

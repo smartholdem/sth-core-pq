@@ -70,7 +70,7 @@ async fn blockchain_blocks_and_transactions_have_legacy_shape() {
     let (_, list) = get(&base, "/api/blocks?limit=1").await;
     assert_eq!(list["meta"]["totalCount"], 11704043);
     assert_eq!(list["data"][0]["height"], 11704043);
-    assert_eq!(list["meta"]["self"], "/blocks?limit=1&page=1");
+    assert_eq!(list["meta"]["self"], "/blocks?limit=1&page=1&transform=true");
 
     let (_, t) = get(&base, &format!("/api/transactions/{TX_ID}")).await;
     let t = &t["data"];
@@ -108,8 +108,10 @@ async fn wallets_filters_and_delegates() {
     let (_, l) = get(&base, &format!("/api/wallets/{RECIPIENT}/transactions/received")).await;
     assert_eq!(l["data"][0]["id"], TX_ID);
 
-    let (_, l) = get(&base, &format!("/api/transactions?recipientId={RECIPIENT}&limit=100")).await;
+    let (_, l) = get(&base, &format!("/api/transactions?recipientId={RECIPIENT}&page=1&limit=100&orderBy=timestamp:desc")).await;
     assert_eq!(l["meta"]["count"], 1);
+    assert_eq!(l["meta"]["self"], format!("/transactions?recipientId={RECIPIENT}&page=1&limit=100&transform=true&orderBy=timestamp:desc"));
+    assert_eq!(l["meta"]["totalCountIsEstimate"], false);
     let (_, l) = get(&base, "/api/transactions?type=3&typeGroup=1").await;
     assert_eq!(l["meta"]["totalCount"], 0);
 
@@ -117,8 +119,11 @@ async fn wallets_filters_and_delegates() {
     assert_eq!(d["meta"]["totalCount"], 0);
     let (_, f) = get(&base, "/api/transactions/fees").await;
     assert_eq!(f["data"]["1"]["transfer"], "100000000");
-    let (_, f) = get(&base, "/api/node/fees").await;
-    assert_eq!(f["data"]["1"]["vote"]["avg"], "100000000");
+    let (_, f) = get(&base, "/api/node/fees?days=30").await;
+    assert_eq!(f["meta"]["days"], 30);
+    if let Some(t) = f["data"]["1"].get("transfer") {
+        assert_eq!(t["avg"], "100000000");
+    }
     let (_, s) = get(&base, "/api/node/status").await;
     assert_eq!(s["data"]["synced"], true);
     let (_, p) = get(&base, "/api/peers").await;
@@ -158,7 +163,7 @@ async fn mempool_admission_rules() {
     let id = r["data"]["invalid"][0].as_str().unwrap().to_string();
     assert_eq!(r["errors"][&id]["type"], "ERR_LOW_BALANCE");
 
-    // fund the wallet > accepted, visible as unconfirmed, duplicate rejected
+    // fund the wallet → accepted, visible as unconfirmed, duplicate rejected
     storage.update_wallet_state(&kp.address(63).unwrap(), 10_000_000_000, 0).unwrap();
     let r = post(serde_json::json!({ "transactions": [tx.clone()] })).await;
     assert_eq!(r["data"]["accept"][0], id);
@@ -182,4 +187,105 @@ async fn mempool_admission_rules() {
     let r = post(serde_json::json!({ "transactions": [tampered] })).await;
     let bad_id = r["data"]["invalid"][0].as_str().unwrap();
     assert_eq!(r["errors"][bad_id]["type"], "ERR_BAD_DATA");
+}
+
+#[tokio::test]
+async fn ascending_order_is_honoured() {
+    let (base, _s) = spawn_api().await;
+    let (_, desc) = get(&base, "/api/wallets?limit=10").await;
+    let (_, asc) = get(&base, "/api/wallets?limit=10&orderBy=balance:asc").await;
+    let d: Vec<&str> = desc["data"].as_array().unwrap().iter().map(|w| w["address"].as_str().unwrap()).collect();
+    let mut a: Vec<&str> = asc["data"].as_array().unwrap().iter().map(|w| w["address"].as_str().unwrap()).collect();
+    assert!(d.len() >= 2);
+    a.reverse();
+    assert_eq!(a, d);
+
+    let (_, b) = get(&base, "/api/blocks?orderBy=height:asc&height.from=11704043&limit=5").await;
+    assert_eq!(b["data"][0]["height"], 11704043);
+    assert_eq!(b["meta"]["totalCount"], 1);
+    let (_, t) = get(&base, "/api/transactions?orderBy=timestamp:asc").await;
+    assert_eq!(t["data"][0]["id"], TX_ID);
+    assert!(t["meta"]["self"].as_str().unwrap().contains("orderBy=timestamp:asc"));
+}
+
+#[tokio::test]
+async fn legacy_compat_endpoints() {
+    let (base, _s) = spawn_api().await;
+    let sender_pk = "03ee4b14a4aa3d7b41ebcbcc2f3c6a4f3f2dd0cb6a4a9c1f1f3c7c1c0b2e5a1d9f";
+    let (code, types) = get(&base, "/api/transactions/types").await;
+    assert_eq!(code, 200);
+    assert_eq!(types["data"]["1"]["HtlcRefund"], 10);
+    assert_eq!(types["data"]["2"]["BridgechainUpdate"], 5);
+    let (_, schemas) = get(&base, "/api/transactions/schemas").await;
+    assert!(schemas["data"]["1"]["0"].is_object());
+    let (_, crypto) = get(&base, "/api/node/configuration/crypto").await;
+    assert_eq!(crypto["data"]["network"]["pubKeyHash"], 63);
+    assert_eq!(crypto["data"]["milestones"][0]["height"], 1);
+    assert_eq!(crypto["data"]["genesisBlock"]["height"], 1);
+    assert_eq!(crypto["data"]["genesisBlock"]["transactions"].as_array().unwrap().len(), 1855);
+    let (_, cfg) = get(&base, "/api/node/configuration").await;
+    assert_eq!(cfg["data"]["constants"]["fees"]["staticFees"]["delegateRegistration"], 1_000_000_000_000u64);
+    assert_eq!(cfg["data"]["constants"]["blockBurnAddress"], true);
+    let (_, fees) = get(&base, "/api/transactions/fees").await;
+    assert_eq!(fees["data"]["1"]["transfer"], "100000000");
+
+    let (_, votes) = get(&base, "/api/votes").await;
+    assert_eq!(votes["meta"]["totalCount"], 0);
+    let (code, _) = get(&base, &format!("/api/votes/{TX_ID}")).await;
+    assert_eq!(code, 404);
+    let (_, top) = get(&base, "/api/wallets/top?limit=1").await;
+    assert_eq!(top["meta"]["count"], 1);
+    assert!(top["meta"]["self"].as_str().unwrap().starts_with("/wallets/top?"));
+    let (_, wv) = get(&base, &format!("/api/wallets/{SENDER}/votes")).await;
+    assert_eq!(wv["meta"]["totalCount"], 0);
+    let (_, wl) = get(&base, &format!("/api/wallets/{SENDER}/locks")).await;
+    assert_eq!(wl["meta"]["totalCount"], 0);
+    let (_, locks) = get(&base, "/api/locks").await;
+    assert_eq!(locks["meta"]["totalCount"], 0);
+    let (code, _) = get(&base, "/api/locks/deadbeef").await;
+    assert_eq!(code, 404);
+    let (_, ent) = get(&base, "/api/entities").await;
+    assert_eq!(ent["data"].as_array().unwrap().len(), 0);
+    let (code, _) = get(&base, "/api/entities/x").await;
+    assert_eq!(code, 404);
+    let (code, _) = get(&base, "/api/peers/10.0.0.1").await;
+    assert_eq!(code, 404);
+    let (_, dash) = get(&base, "/api/node/peers").await;
+    assert_eq!(dash["meta"]["totalCount"], 0);
+
+    // filters
+    let (_, f) = get(&base, &format!("/api/transactions?senderPublicKey={sender_pk}")).await;
+    assert_eq!(f["meta"]["totalCount"], 0);
+    let (_, f) = get(&base, "/api/transactions?amount.from=314159265&amount.to=314159265").await;
+    assert_eq!(f["meta"]["totalCount"], 1);
+    let (_, f) = get(&base, "/api/transactions?fee.to=1").await;
+    assert_eq!(f["meta"]["totalCount"], 0);
+    let (_, f) = get(&base, "/api/transactions?timestamp.from=95101456&timestamp.to=95101456").await;
+    assert_eq!(f["meta"]["totalCount"], 1);
+    let (_, f) = get(&base, "/api/transactions?version=1").await;
+    assert_eq!(f["meta"]["totalCount"], 0);
+    let (_, b) = get(&base, "/api/blocks?generatorPublicKey=03d67017411e92a8e93d7b0318e2748f013c130d6e4e01b1248da0ee0959ee9df8").await;
+    assert_eq!(b["meta"]["totalCount"], 1);
+    let (_, b) = get(&base, "/api/blocks?timestamp.from=95101456").await;
+    assert_eq!(b["data"][0]["height"], 11704043);
+    let (_, b) = get(&base, "/api/blocks?timestamp.to=95101455").await;
+    assert_eq!(b["meta"]["totalCount"], 0);
+    let (_, w) = get(&base, &format!("/api/wallets?address={SENDER}")).await;
+    assert_eq!(w["meta"]["totalCount"], 1);
+    let (_, w) = get(&base, "/api/wallets?balance.from=99999999999999999").await;
+    assert_eq!(w["meta"]["totalCount"], 0);
+    let (_, d) = get(&base, "/api/delegates?isResigned=true").await;
+    assert_eq!(d["meta"]["totalCount"], 0);
+    let (_, r) = get(&base, "/api/rounds/557336/delegates").await;
+    assert!(r["data"].is_array());
+    let (code, _) = get(&base, "/api/rounds/1/delegates").await;
+    assert_eq!(code, 404);
+}
+
+#[tokio::test]
+async fn status_page_is_served() {
+    let (base, _s) = spawn_api().await;
+    let body = reqwest::get(format!("{base}/status")).await.unwrap().text().await.unwrap();
+    assert!(body.contains("<title>sth-core status</title>"));
+    assert!(body.contains("/api/node/forging"));
 }
