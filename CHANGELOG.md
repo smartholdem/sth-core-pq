@@ -8,17 +8,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follo
 ### Fixed
 - **OOM on long-running nodes** (n0-computer/iroh#4509, still present in iroh 1.2.0): `pending_open_paths` in iroh's
   `RemoteStateActor` grew geometrically with several QUIC connections to the same remote (gossip + RPC) until the allocator
-  failed — the node was killed by the kernel after hours on small VPS. iroh 1.1.0 is now vendored in `vendor/iroh`
+  failed - the node was killed by the kernel after hours on small VPS. iroh 1.1.0 is now vendored in `vendor/iroh`
   (`[patch.crates-io]`) with the retry queue deduplicated and bounded to 64 entries.
 
 ### Added
 - `memory: rss N MB` INFO log every 10 min (Linux) and `node.rssBytes` in `/api/ntfry/metrics`; the metrics page shows RSS next to uptime.
-- `db_cache_mb` in node.yaml (default 64): sled page cache size — set 16–32 on a 1 GB VPS.
+- `db_cache_mb` in node.yaml (default 64): sled page cache size - set 16–32 on a 1 GB VPS.
 
 ## [0.9.2]
 
 ### Added
-- Metrics page: **payout calculator** — cost of N payouts as SmartHoldem multipayments vs single transfers vs BNB Chain vs Solana
+- Metrics page: **payout calculator** - cost of N payouts as SmartHoldem multipayments vs single transfers vs BNB Chain vs Solana
   (editable STH price in USDT, BNB/Solana per-transfer fee estimates); fees and `multiPaymentLimit` are read live from the node.
 - `/api/ntfry/metrics` → `data.chain.multiPaymentLimit` and `data.chain.fees {transfer, multiPayment}` (smartoshi, current milestone).
 - Docs (RU): `MULTIPAY-1024_RU.md` (blocktime × tx/block matrix for 1 024-recipient multipayments), `CONSENSUS_RU.md` §2a
@@ -34,7 +34,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follo
 
 ### Fixed
 - **Gateway not visible on other Rust nodes / `neighbors: 0`.** (1) The gossip neighbour flag was a single boolean shared by the
-  two topics, so a `NeighborDown` on the transactions topic hid a live blocks neighbour — now tracked per topic. (2) A topic whose
+  two topics, so a `NeighborDown` on the transactions topic hid a live blocks neighbour - now tracked per topic. (2) A topic whose
   neighbours all dropped never re-bootstrapped: a watchdog re-joins the configured bootstrap peers and known RPC peers every 60 s
   while a topic has no neighbour. (3) The `Peers { gateway }` announcement is now broadcast on both topics (and handled on both),
   first 15 s after start instead of after 120 s. (4) `/api/ntfry/peers` and `/api/ntfry/metrics` report the node's **own**
@@ -44,15 +44,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follo
 
 ## [0.9.0]
 
-### Added — AIP-36 Entity transactions (consensus, activates at mainnet height 11 800 000)
-- `network/mainnet/milestones.json`: `{ "height": 11800000, "aip36": true }` — same value the legacy `@smartholdem/crypto-networks`
+### Added - AIP-36 Entity transactions (consensus, activates at mainnet height 11 800 000)
+- `network/mainnet/milestones.json`: `{ "height": 11800000, "aip36": true }` - same value the legacy `@smartholdem/crypto-networks`
   release must carry. Before that height entity transactions are rejected (`Entity transaction before aip36 activation`),
   legacy business/bridgechain types (group 2, types 0–5) are never accepted (none exist in the chain; legacy disables them at aip36).
 - Wire format bit-compatible with `@smartholdem/core-magistrate-crypto` (`typeGroup 2`, `type 6`):
   `type u8 | subType u8 | action u8 | regIdLen u8 | registrationId | nameLen u8 | name | ipfsLen u8 | ipfsData`
   (`crypto/tx_serializer.rs`, `tx_deserializer.rs`; JSON asset `{ type, subType, action, registrationId?, data: { name?, ipfsData? } }`).
 - Rules exactly as `EntityTransactionHandler` (`rules.rs::check_entity_format / check_entity`): amount 0, exact static fee
-  (register 50 STH, update/resign 5 STH — verified identical in the SmartHoldem fork), name `^[a-zA-Z0-9_!@$&.-]{1,40}$`,
+  (register 50 STH, update/resign 5 STH - verified identical in the SmartHoldem fork), name `^[a-zA-Z0-9_!@$&.-]{1,40}$`,
   ipfsData base58 ≤ 128, network-wide unique `(name, type)` case-insensitive, Delegate entity requires the sender's username,
   update/resign only by the owner with matching type/subType, no update/resign after resign. Legacy error names are kept.
 - State: `WalletState.entities[<registrationId>] = { type, subType, data, resigned }` (`attributes.entities` in `/api/wallets`),
@@ -78,7 +78,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follo
 
 ### Performance
 - **Signature verification 8× faster** (`tests/bench_block.rs`, 4 vCPU): block of 500 transfers verify 411 → 52 ms,
-  10 000 transfers 8.2 s → 1.0 s (verify + apply 9.1 s → 1.95 s — a 10k-tx block now fits an 8 s slot).
+  10 000 transfers 8.2 s → 1.0 s (verify + apply 9.1 s → 1.95 s - a 10k-tx block now fits an 8 s slot).
   - `crypto/schnorr.rs`: the quadratic-residue test used `num-bigint` modpow on every signature (≈ 0.5 ms); now k256's
     native `FieldElement::sqrt()`. `s·G − e·A` is one Shamir/Straus `lincomb_ext` instead of two scalar multiplications.
     Single-thread cost 0.82 → 0.24 ms per signature. `num-bigint` dependency removed (`k256` feature `expose-field`).
@@ -88,23 +88,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follo
 
 
 ### Added
-- **Operator metrics page** (`api.page_metrics: true`, default off): terminal-style dashboard — height / network
+- **Operator metrics page** (`api.page_metrics: true`, default off): terminal-style dashboard - height / network
   height / last-block age / uptime, legacy + ntfry peer counts, mempool, forging with next-slot countdown, last blocks,
   peer tables. Served at `http://<api host>:<port>/` or on its own address with `api.metrics_listen: "0.0.0.0:4888"`
   (that listener exposes only the page and `/api/ntfry/*`, nothing else from the API). `/` keeps `Hello World!` when off.
-- `GET /api/ntfry/peers` — Web 4.0 (iroh) peers by EndpointId only (never IPs): height, latency, neighbor/known,
-  gateway flag; `meta.nodeId` is our own EndpointId. `GET /api/ntfry/metrics` — one JSON snapshot for dashboards.
+- `GET /api/ntfry/peers` - Web 4.0 (iroh) peers by EndpointId only (never IPs): height, latency, neighbor/known,
+  gateway flag; `meta.nodeId` is our own EndpointId. `GET /api/ntfry/metrics` - one JSON snapshot for dashboards.
 - **Block intake stats** (`intake.rs`, shown on the page as *block source* / *slot delay*): which channel delivered the
-  last live block — `pull/legacy` (follow loop), `push/legacy` (inbound `postBlock`), `gossip/iroh`, `forged` — from
+  last live block - `pull/legacy` (follow loop), `push/legacy` (inbound `postBlock`), `gossip/iroh`, `forged` - from
   which peer, and the delay between the block's slot start and its arrival (last, average of the last 100, per source).
   Exposed as `data.intake` in `/api/ntfry/metrics`.
-- `tests/bench_block.rs` (ignored): block throughput probe — sign / forge / serialize / verify / apply N transfers
+- `tests/bench_block.rs` (ignored): block throughput probe - sign / forge / serialize / verify / apply N transfers
   (`BLOCK_TXS=10000 cargo test --test bench_block -- --ignored --nocapture`). Dev profile now compiles k256 / sled with
   `opt-level = 3` so tests and probes measure real crypto speed.
 
 ### Changed
 - `rewards.reward_passphrase` removed (it only derived an address that nothing uses; no reason to keep a second secret
-  in the file — old configs with the key still load). `rewards.reward_address` stays as a reserved field for future
+  in the file - old configs with the key still load). `rewards.reward_address` stays as a reserved field for future
   relay/gateway rewards; comments now say so explicitly and that block rewards always go to the forging delegate's
   wallet. The "no reward address configured" startup line is gone.
 
@@ -113,12 +113,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follo
   `getStatus` latency (tens of ms) while `getBlocks` for 400 blocks takes 20 s+ on many legacy Node.js peers and hit the
   socket timeout; every failed attempt cost a worker 20 s, and the 60 s health refresh (`record_success` after a fast
   `getStatus`) reset the failure counter / ban, so the same slow peers were picked again.
-  `PeerStats` now keeps a separate `getBlocks` metric — measured speed (EMA per full range), consecutive failures and
+  `PeerStats` now keeps a separate `getBlocks` metric - measured speed (EMA per full range), consecutive failures and
   a parking timer (30 s → 60 s → … → 10 min) that status probes do not lift. `best_for_blocks()` ranks by that metric,
   skips parked peers, and the workers rather wait 150 ms for a fast idle peer than burn a timeout on a slow one.
 - First `getBlocks` to a peer of unknown speed asks for 100 blocks (probe); subsequent requests are sized so the reply
   fits a 12 s budget (`blocks_limit()`, 50…400). Ranges are scheduled as `(from, to)`, so short replies re-queue only
-  their tail — no gaps, no overlaps.
+  their tail - no gaps, no overlaps.
 - `GET /api/peers` legacy entries show `blocksLatency`, `blocksLimit`, `blocksFailures`, `blocksParkedFor`.
 - **Legacy peers reset the next connection from the same IP for ~1 s after a `getBlocks` reply** (`Connection reset
   without closing handshake`): the per-peer spacing is now measured from the previous reply (1.5 s) instead of the
@@ -149,12 +149,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follo
 ## [0.8.0]
 
 ### Added
-- `GET /status` — self-contained HTML status page on the local API (height, sync state, legacy + iroh peers with
+- `GET /status` - self-contained HTML status page on the local API (height, sync state, legacy + iroh peers with
   gateways, delegate slots / forging history, last blocks; refreshes every 5 s, no external assets).
 - Gateway autodiscovery: `p2p.legacy_public_addr` ("ip:4001") is announced in the iroh `Peers` gossip message
   (`gateway` field, every 2 min); receivers add the gateway to their legacy peer table and list it in
   `/api/node/peers` meta `gateways` and per-peer `gateway`.
-- `docs/TRANSITION_RU.md` — Russian operator guide: Rust delegates on dynamic IPs + legacy delegates on static IPs.
+- `docs/TRANSITION_RU.md` - Russian operator guide: Rust delegates on dynamic IPs + legacy delegates on static IPs.
 
 ## [0.7.0]
 
@@ -178,7 +178,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follo
 - `LegacyPeer::connect` accepts full `ws://` / `wss://` URLs, so `p2p.legacy_peers` may point at Rust nodes reached
   through a Web 4.0 proxy instead of `ip:4001`.
 - Console numbers grouped like the legacy core (`Received new block at height 11,708,910 …`, `Broadcasting block 11,708,910 …`).
-- `GET /api/node/forging` — delegate module state: configured delegates (username, rank, active), next own slot,
+- `GET /api/node/forging` - delegate module state: configured delegates (username, rank, active), next own slot,
   last forged block (height, id, tx count, peers that accepted it), last 20 skipped slots with reasons.
 
 ## [0.5.0]
@@ -216,7 +216,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follo
 - Full legacy filter set: transactions (`senderPublicKey`, `vendorField`, `version`, `sequence`, `timestamp/amount/fee/nonce`
   ranges), blocks (`generatorPublicKey`, `timestamp` ranges), wallets (`address`, `publicKey`, `balance`/`nonce` ranges,
   `orderBy`), delegates (`username`, `address`, `publicKey`, `isResigned`, numeric ranges, `orderBy`).
-- `GET /api/node/peers` — sth-core extension: live health table of legacy and iroh peers (latency history, height lag,
+- `GET /api/node/peers` - sth-core extension: live health table of legacy and iroh peers (latency history, height lag,
   score, failures, ban state, source).
 - **Iroh layer** (`p2p_iroh/`): endpoint + `Router`, gossip topics `sth/<nethash>/blocks` and `sth/<nethash>/transactions`,
   JSON RPC on ALPN `sth/rpc/1` (`GetStatus`, `GetBlocks`), gap-fill from the announcing peer, mempool bridge
@@ -237,14 +237,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follo
 ### Changed
 - `api.rs` split into `api/{mod,render,node,blocks,transactions,wallets,delegates,locks}.rs`.
 - Catch-up is now pipelined: every worker fetches its next 400-block range as soon as it is free (shared scheduler with
-  retry queue and per-peer 1.1 s spacing) instead of lock-step rounds — ~400 blocks/s with 4 peers in the sandbox.
+  retry queue and per-peer 1.1 s spacing) instead of lock-step rounds - ~400 blocks/s with 4 peers in the sandbox.
 - `Network` is data-driven (milestones deep-merged like the legacy `configManager`); `Network::mainnet()` is a cheap
   clone of a cached instance (`mainnet_ref()`).
 - `/api/node/fees` computes real avg/min/max/sum per type over the last `days`.
 - `/api/node/status` and `/api/node/syncing` use the peer table's best height.
 
 ### Fixed
-- Verifying a block re-parsed the embedded genesis for every transaction (`Network::mainnet()` in the serializer) —
+- Verifying a block re-parsed the embedded genesis for every transaction (`Network::mainnet()` in the serializer) -
   genesis verification took > 60 s; now ~4 s in debug.
 
 ## [0.3.0]
