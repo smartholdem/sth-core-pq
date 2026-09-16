@@ -9,52 +9,6 @@ second-signature enforcement, SmartObjects (sObject, active since 11 800 000), n
 `tokens` / `sobjV2`), Quantum Shield stages A (active) and B (milestone `pq`), standalone `sth-cli`, `init newnet`.
 Startup prints `core version X.Y.Z`. History: `CHANGELOG.md`.
 
-
-## Layout
-
-```
-src/
-  config.rs              mainnet constants (pubKeyHash 63, epoch 2023-08-29, milestones)
-  models/                Block / Transaction - JSON identical to core IBlockData / ITransactionData
-  crypto/
-    hash.rs              sha256 / ripemd160
-    address.rs           base58check addresses (network byte 63)
-    keys.rs              KeyPair (sha256(passphrase) -> secp256k1)
-    ecdsa.rs             DER ECDSA, strict encoding + low-S (block signatures)
-    schnorr.rs           legacy bip-schnorr ("is-square" R) - v2 transaction signatures (k256 field ops + lincomb, 0.24 ms/sig)
-    tx_serializer.rs     SHIP-11 wire format (+ SmartObject (sObject) payload), transaction id, signing hash
-    block_serializer.rs  header serialisation, block id, payload hash, verify_block() - tx checks on all cores (rayon)
-  rules.rs               wallet-aware rules like legacy throwIfCannotBeApplied: second signatures, smart objects (sObjects)
-  intake.rs              live block intake stats: source (pull/legacy, push/legacy, gossip/iroh, forged) + slot delay
-  storage.rs             Sled: b:<height>, bid:<id>, t:<txid>, w:<address>, en:<sObject name>; atomic apply_block(), undo log
-  node_pool.rs           per-node rate limiter (4 req/s, 250/60s window, 429 parking, failure backoff)
-  sync.rs                Phase 3: batched legacy HTTP sync pipeline (reqwest + indicatif), resumable
-  snapshot.rs            Phase 3.2: core-snapshots dump import (gzip records, msgpack), download latest .tgz
-  crypto/tx_deserializer.rs, crypto/block_deserializer.rs  wire -> struct (inverse of the serialisers)
-  api/                   axum REST API (legacy JSON): mod (router, pagination), render, node, blocks, transactions,
-                         wallets, delegates, locks, sobj, ntfry (metrics page + /api/ntfry/*)
-                         status.html (local status page), metrics.html (operator dashboard)   mempool.rs: tx pool + relay
-  p2p_iroh/              Web 4.0 layer: mod (endpoint/router), proto (JSON messages), rpc (sth/rpc/1 ALPN:
-                         GetStatus/GetBlocks), gossip (blocks + transactions topics), peers (table)
-  delegate/              forging module: round (rounds/slots/shuffle), block_builder (assemble + sign),
-                         forger (slot loop + postBlock broadcast), round tracker
-  network/mainnet/       network.json, milestones.json, exceptions.json, genesisBlock.json.gz (crypto-networks layout)
-  p2p_legacy/            legacy inter-node protocol (port 4001)
-    proto.rs             hand-written prost messages           client.rs  nes framing + LegacyPeer
-    health.rs            peer table (latency / height / bans / getBlocks speed + parking)   follow.rs  parallel catch-up + live follow
-    relay.rs             postTransactions fan-out from the mempool
-  genesis.rs             embedded mainnet genesis block (gzip JSON) - seeds an empty database
-  node_config.rs         node.yaml (sections api / sync / p2p / delegate / rewards / mempool)
-  node.rs                NodeContext: storage + mempool + peer table + API + intake, from NodeConfig
-  main.rs                CLI: init | run | tx | peers | peer-status | sync | snapshot | info | verify-block | import-block | wallet
-tests/
-  crypto_vectors.rs      real mainnet blocks / transactions (bit-exact ids + signatures)
-  storage.rs             storage + state transition tests
-  second_signature.rs    legacy second-signature rules on block apply and in the mempool
-  sobj.rs                SmartObject wire format, activation gate, lifecycle rules, transfer / market, rollback, mempool
-  bench_block.rs         (ignored) block throughput probe: sign / forge / verify / apply N transfers
-```
-
 ## Build & test
 
 ```bash
