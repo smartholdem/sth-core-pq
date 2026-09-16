@@ -53,11 +53,6 @@ tests/
   second_signature.rs    legacy second-signature rules on block apply and in the mempool
   sobj.rs                SmartObject wire format, activation gate, lifecycle rules, transfer / market, rollback, mempool
   bench_block.rs         (ignored) block throughput probe: sign / forge / verify / apply N transfers
-docs/
-  TRANSITION_RU.md       operator guide (RU): moving delegates to Rust, iroh peering, metrics page
-  IDEA-BOOST-CHAIN.md    throughput analysis: tx/block, block time 0.5–8 s, T0/T1/T2 tiers
-  SHIPs/                 SmartHoldem Improvement Proposals - README.md index + SHIP-1 … SHIP-40 (EN)
-  SPEC-SOBJECT_RU.md     SmartObject (sObject) specification; RELEASE-0.19_RU.md what/why/how of Quantum Shield B, resign guard, pool limits; PLAN-SOBJECT-LEGACY.md rollout history; PLAN-QUANTUM-SHIELD.md, SPEC-PQ-V3.md, MAINNET-ROLLOUT-PQ_RU.md
 ```
 
 ## Build & test
@@ -339,7 +334,7 @@ tx-status --wait`: `sth-cli --api https://node0.smartholdem.io status` - see `do
 
 - SHIP-13 activation at 11 800 000: legacy release with the `sobj` (SHIP-13) milestone, all delegates updated before the height.
 - Quorum check before forging ≤ 0.3 s (reuse the health table instead of polling); incremental vote-balance index.
-- **Native tokens** (`docs/SPEC-TOKENS-NATIVE.md`): registry = SmartObject (sObject) `type 5` (ticker, owner, metadata - live from 11 800 000),
+- **Native tokens**: registry = SmartObject (sObject) `type 5` (ticker, owner, metadata - live from 11 800 000),
   movement = `typeGroup 3` (`TokenInit / TokenTransfer / TokenMint / TokenBurn`) activated by milestone `tokens` at `H_TOKENS`
   (hard fork, all delegates on Rust); balances in `WalletState.tokens`, registry `tk:*` in the same sled transaction - no separate DB/VM.
 - T2 throughput: compact blocks over iroh, mempool-time signature verification, parallel apply.
