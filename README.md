@@ -1,4 +1,4 @@
-# sth-core-rust - SmartHoldem Core Node PQ (Post Quantum) v3
+# SmartHoldem Core Node PQ (Post Quantum Node)
 
 Author: TechnoL0g
 
