@@ -180,7 +180,7 @@ Responses use the legacy transformed JSON (`?transform=false` -> raw core object
   re-registration is rejected. Applied in order inside a catch-up batch and in the mempool (a pending registration already binds).
 * **smart objects (sObjects)** (`typeGroup 2 / type 6`, from height **11 800 000**, milestone `sobj` (SHIP-13)): amount 0, exact static fee (register 50 STH,
   update / resign 5 STH), name `^[a-zA-Z0-9_!@$&.-]{1,40}$` unique per `(name, type)` network-wide, Delegate sObject requires the sender's
-  username, update / resign only by the owner. Wire format matches legacy `@smartholdem/core`; transfer / sell / buy from milestone `sobjV2`. See `docs/SPEC-SOBJECT_RU.md`.
+  username, update / resign only by the owner. Wire format matches legacy `@smartholdem/core`; transfer / sell / buy from milestone `sobjV2`.
 
 `run` = optional snapshot import -> HTTP catch-up -> `--follow` loop (polls `/api/blockchain` every blocktime,
 verifies and applies new blocks) with the API and a mempool pruner (drops forged / stale-nonce txs) running concurrently.
@@ -303,7 +303,7 @@ sth-core init newnet --out ./testnet --delegates 3 --seed demo [--tokens-at 10] 
 cd testnet && sth-core run --config node.yaml            # genesis applied, 3 delegates forging, API on :4004, metrics on :4889
 ```
 Own nethash, address byte (`D…` by default), ports 4002/4004/4889, no mainnet peers or REST nodes, forging without quorum
-(`quorum_share: 0.0`). Passphrases in `delegates.json`. Details: `docs/NEWNET_RU.md`.
+(`quorum_share: 0.0`). Passphrases in `delegates.json`.
 
 ```bash
 export STH_PASSPHRASE="$(jq -r .treasury.passphrase delegates.json)"
@@ -314,7 +314,7 @@ sth-core tx token-transfer --ticker COFFEE --to D…:150.25 --to D…:20 --memo 
 ```
 `sth-core tx` signs locally and posts to the node's REST API (`--dry-run` prints the signed JSON). The standalone client
 **`sth-cli`** (`target/release/sth-cli`, HTTP only) does the same against any node plus `status | wallet | token | obj | market |
-tx-status --wait`: `sth-cli --api https://node0.smartholdem.io status` - see `docs/CLI_RU.md`. The metrics page (`:4889`) has a
+tx-status --wait`: `sth-cli --api https://node0.smartholdem.io status`. The metrics page (`:4889`) has a
 **tokens** tab: explorer with logos, supply bars and latest issues (`/api/ntfry/tokens`).
 
 ## Compatibility notes
