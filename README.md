@@ -1,4 +1,4 @@
-# sth-core-rust - SmartHoldem Relay Node (Rust)
+# sth-core-rust - SmartHoldem Core Node PQ (Post Quantum) v3
 
 Author: TechnoL0g
 
