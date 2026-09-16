@@ -1,6 +1,6 @@
 # SmartHoldem Core Node PQ (Post Quantum Node)
 
-Author: TechnoL0g
+![SmartHoldem-Core-PQ.jpg](docs/SmartHoldem-Core-PQ.jpg)
 
 Rust rewrite of the SmartHoldem (`@smartholdem/core` 3.8.2, network byte `63`) node: relay, gateway and delegate.
 Current status (**v0.19.0**): 100 % legacy REST API, legacy P2P (port 4001, in + out), Web 4.0 layer (iroh gossip / RPC),
