@@ -6,9 +6,9 @@ mod block;
 mod serde_utils;
 mod transaction;
 
-pub use block::Block;
+pub use block::{Block, BLOCK_VERSION_PQ};
 pub use transaction::{
-    entity, tx_type, DelegateAsset, EntityAsset, EntityData, HtlcClaimAsset, HtlcExpiration, HtlcLockAsset, HtlcRefundAsset,
-    MultiSignatureAsset, Payment, SecondSignatureAsset, Transaction, TransactionAsset, TYPE_GROUP_CORE, TYPE_GROUP_MAGISTRATE,
+    sobj, token, tx_type, PqSignatureBlock, VERSION_PQ, TokenAsset, TokenMeta, TokenTransferItem, TYPE_GROUP_TOKEN, DelegateAsset, SmartObjectAsset, SmartObjectData, HtlcClaimAsset, HtlcExpiration, HtlcLockAsset, HtlcRefundAsset,
+    MultiSignatureAsset, Payment, SecondSignatureAsset, Transaction, TransactionAsset, TYPE_GROUP_CORE, TYPE_GROUP_SOBJ,
 };
 pub use serde_utils::{opt_string_u64, string_i64, string_u64};

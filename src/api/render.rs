@@ -66,7 +66,9 @@ pub fn block_json(st: &AppState, block: &Block, raw: bool, tip: u64) -> Result<V
         "payload": { "hash": block.payload_hash, "length": block.payload_length },
         "generator": Value::Object(gen),
         "signature": block.block_signature,
+        "pqSignature": block.pq_signature.as_ref().map(|p| json!({ "algorithm": p.algorithm, "bytes": p.signature.len() / 2 })),
         "confirmations": tip.saturating_sub(block.height),
+        "finalized": st.storage.latest_finality_cert()?.is_some_and(|c| c.height >= block.height),
         "transactions": block.number_of_transactions,
         "timestamp": timestamp_json(&st.network, block.timestamp),
     }))
@@ -95,6 +97,9 @@ pub fn tx_json(st: &AppState, tx: &Transaction, block_ts: Option<u32>, raw: bool
     if let Some(s) = tx.second_signature_any() {
         v.insert("signSignature".into(), json!(s));
     }
+    if let Some(b) = &tx.second_signatures {
+        v.insert("secondSignatures".into(), json!(b));
+    }
     if let Some(s) = &tx.signatures {
         v.insert("signatures".into(), json!(s));
     }
@@ -107,10 +112,12 @@ pub fn tx_json(st: &AppState, tx: &Transaction, block_ts: Option<u32>, raw: bool
     match (tx.block_height, block_ts) {
         (Some(h), Some(ts)) => {
             v.insert("confirmations".into(), json!(tip.saturating_sub(h) + 1));
+            v.insert("finalized".into(), json!(st.storage.latest_finality_cert()?.is_some_and(|c| c.height >= h)));
             v.insert("timestamp".into(), timestamp_json(&st.network, ts));
         }
         _ => {
             v.insert("confirmations".into(), json!(0));
+            v.insert("finalized".into(), json!(false));
         }
     }
     v.insert("nonce".into(), json!(tx.nonce.unwrap_or(0).to_string()));
@@ -153,8 +160,8 @@ pub fn wallet_json(st: &AppState, w: &WalletState, rank: Option<usize>, votes: O
     if let Some(m) = &w.multi_signature {
         attrs.insert("multiSignature".into(), json!({ "min": m.min, "publicKeys": m.public_keys }));
     }
-    if !w.entities.is_empty() {
-        attrs.insert("entities".into(), json!(w.entities));
+    if !w.sobjects.is_empty() {
+        attrs.insert("sobjects".into(), json!(w.sobjects));
     }
     if !w.locks.is_empty() {
         let locks: Map<String, Value> = w
@@ -188,13 +195,44 @@ pub fn wallet_json(st: &AppState, w: &WalletState, rank: Option<usize>, votes: O
         }
         attrs.insert("delegate".into(), Value::Object(d));
     }
-    json!({
+    let mut out = json!({
         "address": w.address,
         "publicKey": w.public_key,
         "balance": w.balance.to_string(),
         "nonce": w.nonce.to_string(),
         "attributes": Value::Object(attrs),
-    })
+    });
+    if !w.tokens.is_empty() {
+        let tokens: serde_json::Map<String, Value> = w.tokens.iter().map(|(id, b)| (id.clone(), Value::String(b.to_string()))).collect();
+        out["attributes"]["tokens"] = Value::Object(tokens);
+    }
+    if !w.tokens_issued.is_empty() {
+        let issued: serde_json::Map<String, Value> = w
+            .tokens_issued
+            .iter()
+            .map(|(id, t)| {
+                let mut v = serde_json::to_value(t).unwrap_or_default();
+                v["meta"] = crate::api::tokens::meta_json(id, t);
+                (id.clone(), v)
+            })
+            .collect();
+        out["attributes"]["tokensIssued"] = Value::Object(issued);
+    }
+    // Quantum Shield: stage A commitment (`committed`), stage B registration comes later (`active`)
+    out["quantumShield"] = match &w.pq_commitment {
+        Some(c) => json!({ "committed": true, "algorithm": c.algorithm, "commitment": c.commitment, "height": c.height }),
+        None => json!({ "committed": false }),
+    };
+    match &w.pq_key {
+        Some(k) => {
+            out["quantumShield"]["active"] = json!(true);
+            out["quantumShield"]["algorithm"] = json!(k.algorithm);
+            out["quantumShield"]["publicKey"] = json!(k.public_key);
+            out["quantumShield"]["since"] = json!(k.since);
+        }
+        None => out["quantumShield"]["active"] = json!(false),
+    }
+    out
 }
 
 pub fn delegate_json(st: &AppState, w: &WalletState, votes: u64, rank: usize) -> Value {

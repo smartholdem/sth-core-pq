@@ -61,10 +61,17 @@ pub fn select_transactions(storage: &Storage, network: &Network, pool: Vec<Trans
     Ok(chosen)
 }
 
-/// Build and sign the block at `height` on top of `previous` for `slot_timestamp`.
+/// Build and sign the block at `height` on top of `previous` for `slot_timestamp` (version-0, classic signature).
 pub fn forge_block(network: &Network, keys: &KeyPair, previous: &Block, timestamp: u32, txs: Vec<Transaction>) -> Result<Block> {
+    forge_block_with(network, keys, None, previous, timestamp, txs)
+}
+
+/// Like [`forge_block`]; with a PQ key under milestone `pq.blocks` the block is version 1 and carries the hybrid
+/// `pqSignature` over `sha256(header || blockSignature)`.
+pub fn forge_block_with(network: &Network, keys: &KeyPair, pq: Option<&crate::crypto::pq::PqKeyPair>, previous: &Block, timestamp: u32, txs: Vec<Transaction>) -> Result<Block> {
     let height = previous.height + 1;
     let m = network.milestone(height);
+    let hybrid = m.pq.blocks && pq.is_some();
     let mut payload_length = 0u32;
     let mut total_amount = 0u64;
     let mut total_fee = 0u64;
@@ -75,7 +82,7 @@ pub fn forge_block(network: &Network, keys: &KeyPair, previous: &Block, timestam
     }
     let mut block = Block {
         id: None,
-        version: m.block_version(),
+        version: if hybrid { crate::models::BLOCK_VERSION_PQ } else { m.block_version() },
         timestamp,
         previous_block: previous.id.clone().unwrap_or_default(),
         height,
@@ -87,6 +94,7 @@ pub fn forge_block(network: &Network, keys: &KeyPair, previous: &Block, timestam
         payload_hash: String::new(),
         generator_public_key: keys.public_key_hex(),
         block_signature: None,
+        pq_signature: None,
         transactions: txs,
     };
     for (i, tx) in block.transactions.iter_mut().enumerate() {
@@ -96,6 +104,10 @@ pub fn forge_block(network: &Network, keys: &KeyPair, previous: &Block, timestam
     block.payload_hash = block_payload_hash(&block)?;
     let hash = block_signing_hash(&block)?;
     block.block_signature = Some(sign_ecdsa(&hash, keys.private_key())?);
+    if let Some(pq) = pq.filter(|_| hybrid) {
+        let m_b = crate::crypto::block_pq_message(&block)?;
+        block.pq_signature = Some(crate::models::PqSignatureBlock { algorithm: crate::crypto::pq::ALG_ML_DSA_44, signature: hex::encode(pq.sign_with_ctx(&m_b, crate::crypto::pq::BLOCK_CTX)?) });
+    }
     block.id = Some(block_id(&block)?);
     for tx in block.transactions.iter_mut() {
         tx.block_id = block.id.clone();

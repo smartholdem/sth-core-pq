@@ -61,9 +61,50 @@ pub async fn start(
     let seen = Arc::new(Mutex::new(Seen::default()));
     let bootstrap_for_watchdog = bootstrap.clone();
     let blocks_topic = node.gossip.subscribe(node.topics.blocks, bootstrap.clone()).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
-    let txs_topic = node.gossip.subscribe(node.topics.transactions, bootstrap).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
+    let txs_topic = node.gossip.subscribe(node.topics.transactions, bootstrap.clone()).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
+    let finality_topic = node.gossip.subscribe(node.topics.finality, bootstrap).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
     let (block_sender, mut block_receiver) = blocks_topic.split();
     let (tx_sender, mut tx_receiver) = txs_topic.split();
+    let (fin_sender, mut fin_receiver) = finality_topic.split();
+    // finality votes + equivocation proofs intake (SHIP-35)
+    {
+        let node = node.clone();
+        let sender = fin_sender.clone();
+        tokio::spawn(async move {
+            while let Some(event) = fin_receiver.next().await {
+                match event {
+                    Ok(Event::Received(msg)) => match GossipMessage::decode(&msg.content) {
+                        Some(GossipMessage::Finality { votes }) => {
+                            node.peers.seen(msg.delivered_from, None);
+                            let out = node.finality.record(&votes);
+                            tracing::debug!(peer = %msg.delivered_from.fmt_short(), votes = votes.len(), ok = out.accepted, "finality votes received");
+                            for proof in out.proofs {
+                                if let Err(e) = sender.broadcast(GossipMessage::Equivocation { proof }.encode().into()).await {
+                                    tracing::debug!(error = %e, "equivocation proof broadcast failed");
+                                }
+                            }
+                        }
+                        Some(GossipMessage::Equivocation { proof }) => match node.finality.adopt_proof(&proof) {
+                            Ok(true) => {
+                                // relay once so the whole network learns about the slashable delegate
+                                let _ = sender.broadcast(GossipMessage::Equivocation { proof }.encode().into()).await;
+                            }
+                            Ok(false) => {}
+                            Err(e) => tracing::debug!(peer = %msg.delivered_from.fmt_short(), error = %e, "equivocation proof rejected"),
+                        },
+                        _ => {}
+                    },
+                    Ok(Event::NeighborUp(id)) => node.peers.set_neighbor(id, super::peers::TOPIC_FINALITY, true),
+                    Ok(Event::NeighborDown(id)) => node.peers.set_neighbor(id, super::peers::TOPIC_FINALITY, false),
+                    Ok(Event::Lagged) => tracing::warn!("iroh finality gossip lagged"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "iroh finality gossip stream ended");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // blocks intake
     {
@@ -77,6 +118,10 @@ pub async fn start(
                             Some(GossipMessage::Block { block }) => block,
                             Some(GossipMessage::Peers { peers: hints, gateway }) => {
                                 on_peers(&node, legacy_table_blocks.as_deref(), msg.delivered_from, &hints, &gateway);
+                                continue;
+                            }
+                            Some(GossipMessage::Delegates { delegates }) => {
+                                on_delegates(&node, msg.delivered_from, &delegates);
                                 continue;
                             }
                             _ => continue,
@@ -115,6 +160,10 @@ pub async fn start(
                             on_peers(&node, legacy_table.as_deref(), msg.delivered_from, hints, gateway);
                             continue;
                         }
+                        if let Some(GossipMessage::Delegates { delegates }) = &decoded {
+                            on_delegates(&node, msg.delivered_from, delegates);
+                            continue;
+                        }
                         let Some(GossipMessage::Transactions { transactions }) = decoded else { continue };
                         node.peers.seen(msg.delivered_from, None);
                         {
@@ -146,7 +195,10 @@ pub async fn start(
     if let Some(table) = legacy_peers {
         tokio::spawn(publish_peers([block_sender.clone(), tx_sender.clone()], table, node.gateway.clone()));
     }
-    tokio::spawn(rejoin_watchdog(node.clone(), [block_sender.clone(), tx_sender.clone()], bootstrap_for_watchdog));
+    tokio::spawn(rejoin_watchdog(node.clone(), [block_sender.clone(), tx_sender.clone(), fin_sender.clone()], bootstrap_for_watchdog));
+    tokio::spawn(publish_finality(node.clone(), fin_sender, storage.clone()));
+    tokio::spawn(sync_finality(node.clone(), storage.clone()));
+    tokio::spawn(publish_delegates(node.clone(), [block_sender.clone(), tx_sender.clone()]));
     tokio::spawn(publish_transactions(tx_sender, mempool.subscribe(), seen.clone()));
     tokio::spawn(publish_blocks(block_sender, storage, node.peers.clone(), seen));
     Ok(())
@@ -159,9 +211,9 @@ async fn on_block(node: &IrohNode, storage: &Arc<Storage>, seen: &Mutex<Seen>, f
         return Ok(());
     }
     if block.height == tip.height + 1 {
-        let (h, ts) = (block.height, block.timestamp);
+        let (h, ts, gen) = (block.height, block.timestamp, block.generator_public_key.clone());
         tip = apply(storage, vec![block], tip, verify).await?;
-        crate::intake::record(crate::intake::Source::GossipIroh, from.fmt_short().to_string(), h, ts, storage.network());
+        crate::intake::record(crate::intake::Source::GossipIroh, from.fmt_short().to_string(), h, ts, &gen, storage.network());
         let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
         s.heights.insert(h);
         s.trim();
@@ -244,7 +296,7 @@ fn on_peers(
 
 /// A topic whose neighbours all dropped never re-bootstraps by itself: re-join the configured
 /// bootstrap peers (and any peer we still talk to over RPC) whenever a topic has no neighbour.
-async fn rejoin_watchdog(node: Arc<super::IrohNode>, senders: [GossipSender; 2], bootstrap: Vec<EndpointId>) {
+async fn rejoin_watchdog(node: Arc<super::IrohNode>, senders: [GossipSender; 3], bootstrap: Vec<EndpointId>) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.tick().await;
     loop {
@@ -260,12 +312,45 @@ async fn rejoin_watchdog(node: Arc<super::IrohNode>, senders: [GossipSender; 2],
             if targets.is_empty() {
                 continue;
             }
-            let name = if topic == super::peers::TOPIC_BLOCKS { "blocks" } else { "transactions" };
+            let name = ["blocks", "transactions", "finality"][topic];
             match sender.join_peers(targets.clone()).await {
                 Ok(()) => tracing::info!(topic = name, peers = targets.len(), "no gossip neighbours, re-joining"),
                 Err(e) => tracing::warn!(topic = name, error = %e, "gossip re-join failed"),
             }
         }
+    }
+}
+
+fn on_delegates(node: &super::IrohNode, from: EndpointId, announces: &[super::proto::DelegateAnnounce]) {
+    let ok = node.rust_delegates.record(from, announces);
+    if ok > 0 {
+        node.peers.seen(from, None);
+        tracing::debug!(peer = %from.fmt_short(), delegates = ok, "rust delegate announce received");
+    } else if !announces.is_empty() {
+        tracing::debug!(peer = %from.fmt_short(), "rust delegate announce rejected (bad signature or clock)");
+    }
+}
+
+/// Signed "these delegates forge on this Rust node" announces, every 2 min on both topics.
+async fn publish_delegates(node: Arc<super::IrohNode>, senders: [GossipSender; 2]) {
+    let mut tick = tokio::time::interval(Duration::from_secs(120));
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    loop {
+        tick.tick().await;
+        let keys = node.forging_keys.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if keys.is_empty() || !node.announce.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        let me = node.endpoint.id();
+        let delegates = super::delegates::sign_announces(&keys, &me);
+        node.rust_delegates.record(me, &delegates);
+        let payload = GossipMessage::Delegates { delegates }.encode();
+        for sender in &senders {
+            if let Err(e) = sender.broadcast(payload.clone().into()).await {
+                tracing::debug!(error = %e, "delegate announce broadcast failed");
+            }
+        }
+        tracing::debug!(count = keys.len(), "rust delegate announce sent");
     }
 }
 
@@ -291,6 +376,65 @@ async fn publish_peers(senders: [GossipSender; 2], table: Arc<crate::p2p_legacy:
             match sender.broadcast(payload.clone().into()).await {
                 Ok(()) => tracing::info!(count, gateway = gateway.as_deref().unwrap_or("-"), "legacy peer reputation shared over iroh gossip"),
                 Err(e) => tracing::debug!(error = %e, "peer hint broadcast failed"),
+            }
+        }
+    }
+}
+
+/// SHIP-35: vote for every new tip with our active delegate keys (any source: forged, gossip, legacy port); the vote is
+/// re-sent once a slot later while the block is not yet certified, so late neighbours still collect it.
+async fn publish_finality(node: Arc<super::IrohNode>, sender: GossipSender, storage: Arc<Storage>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    let mut voted: Option<(u64, String, std::time::Instant, bool)> = None;
+    loop {
+        tick.tick().await;
+        let Ok(Some(tip)) = storage.get_last_block() else { continue };
+        let Some(id) = tip.id.clone() else { continue };
+        let keys = node.forging_keys.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if keys.is_empty() {
+            continue;
+        }
+        let blocktime = storage.network().milestone(tip.height).blocktime as u64;
+        let resend = matches!(&voted, Some((h, i, at, false)) if *h == tip.height && *i == id && at.elapsed() >= Duration::from_secs(blocktime) && !node.finality.is_final(*h));
+        let fresh = !matches!(&voted, Some((h, i, _, _)) if *h == tip.height && *i == id);
+        if !fresh && !resend {
+            continue;
+        }
+        let votes = node.finality.own_votes(&keys, tip.height, &id);
+        if votes.is_empty() {
+            voted = Some((tip.height, id, std::time::Instant::now(), true));
+            continue;
+        }
+        match sender.broadcast(GossipMessage::Finality { votes: votes.clone() }.encode().into()).await {
+            Ok(()) => tracing::info!(height = tip.height, votes = votes.len(), resend, "finality votes published"),
+            Err(e) => tracing::debug!(error = %e, "finality vote broadcast failed"),
+        }
+        voted = Some((tip.height, id, std::time::Instant::now(), resend));
+    }
+}
+
+/// SHIP-35 catch-up: while our highest certificate lags the tip by more than two slots (fresh node, missed votes), ask a few
+/// healthy iroh peers `GetFinality` and adopt the best verified certificate. Once at start, then every minute.
+async fn sync_finality(node: Arc<super::IrohNode>, storage: Arc<Storage>) {
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        let tip = storage.get_last_height().unwrap_or(0);
+        let ours = node.finality.finalized().map(|(h, _)| h).unwrap_or(0);
+        if tip <= ours + 2 {
+            continue;
+        }
+        let peers: Vec<EndpointId> = node.peers.snapshot().into_iter().filter(|p| p.failures < 3 && p.id != node.id()).map(|p| p.id).take(3).collect();
+        for id in peers {
+            let Ok(Ok(Some(cert))) = tokio::time::timeout(Duration::from_secs(10), super::fetch_finality(&node.endpoint, &node.peers, id)).await else { continue };
+            if cert.height <= ours {
+                continue;
+            }
+            match node.finality.adopt_certificate(&cert) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(e) => tracing::debug!(peer = %id.fmt_short(), error = %e, "finality certificate from peer rejected"),
             }
         }
     }

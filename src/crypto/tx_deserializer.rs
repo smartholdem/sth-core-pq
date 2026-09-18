@@ -1,6 +1,6 @@
 //! Author: TechnoL0g
 //!
-//! AIP-11 (v2) transaction wire deserialisation — inverse of `tx_serializer.rs`, port of
+//! SHIP-11 (v2) transaction wire deserialisation — inverse of `tx_serializer.rs`, port of
 //! `Transactions.Deserializer` + per-type `deserialize()` (used for snapshot import and P2P).
 
 use super::address::address_from_bytes;
@@ -21,16 +21,73 @@ fn asset_mut(tx: &mut Transaction) -> &mut TransactionAsset {
 }
 
 fn deserialize_type_payload(tx: &mut Transaction, r: &mut ByteReader) -> Result<()> {
-    if tx.is_entity() {
+    if tx.is_sobj() {
         let (type_, sub_type, action) = (r.u8()?, r.u8()?, r.u8()?);
         let reg_len = r.u8()? as usize;
         let registration_id = (reg_len > 0).then(|| r.hex(reg_len)).transpose()?;
         let name_len = r.u8()? as usize;
         let name = (name_len > 0).then(|| r.bytes(name_len).map(|b| String::from_utf8_lossy(b).into_owned())).transpose()?;
         let ipfs_len = r.u8()? as usize;
-        let ipfs_data = (ipfs_len > 0).then(|| r.bytes(ipfs_len).map(|b| String::from_utf8_lossy(b).into_owned())).transpose()?;
-        let e = crate::models::EntityAsset { type_, sub_type, action, registration_id, data: crate::models::EntityData { name, ipfs_data } };
+        let slot = (ipfs_len > 0).then(|| r.bytes(ipfs_len).map(|b| String::from_utf8_lossy(b).into_owned())).transpose()?;
+        let transfer = action == crate::models::sobj::ACTION_TRANSFER;
+        let sell = action == crate::models::sobj::ACTION_SELL;
+        let e = crate::models::SmartObjectAsset {
+            type_, sub_type, action, registration_id,
+            recipient_id: if transfer { slot.clone() } else { None },
+            price: if sell { Some(slot.as_deref().unwrap_or("0").parse().map_err(|_| Error::Serialization("sObject price is not a number".into()))?) } else { None },
+            data: crate::models::SmartObjectData { name, ntfry_data: if transfer || sell { None } else { slot } },
+        };
         asset_mut(tx).extra = e.into_map();
+        return Ok(());
+    }
+    if tx.is_token() {
+        use crate::models::{token, TokenAsset, TokenTransferItem};
+        let mut a = TokenAsset { id: r.hex(32)?, ..Default::default() };
+        match tx.type_ {
+            token::INIT => {
+                a.decimals = Some(r.u8()?);
+                a.flags = Some(r.u8()?);
+                a.initial_supply = Some(r.u64_le()?);
+                a.supply_cap = Some(r.u64_le()?);
+            }
+            token::TRANSFER => {
+                let n = r.u16_le()? as usize;
+                let mut items = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    let amount = r.u64_le()?;
+                    items.push(TokenTransferItem { recipient_id: read_address(r)?, amount });
+                }
+                a.transfers = Some(items);
+                let ml = r.u8()? as usize;
+                let memo = String::from_utf8_lossy(r.bytes(ml)?).into_owned();
+                a.memo = (!memo.is_empty()).then_some(memo);
+            }
+            token::MINT => {
+                a.amount = Some(r.u64_le()?);
+                a.recipient_id = Some(read_address(r)?);
+            }
+            token::META => {
+                use base64::Engine;
+                let text = |r: &mut ByteReader, n: usize| -> Result<Option<String>> {
+                    let s = String::from_utf8_lossy(r.bytes(n)?).into_owned();
+                    Ok((!s.is_empty()).then_some(s))
+                };
+                let nl = r.u8()? as usize;
+                let name = text(r, nl)?.unwrap_or_default();
+                let dl = r.u16_le()? as usize;
+                let description = text(r, dl)?;
+                let sl = r.u8()? as usize;
+                let website = text(r, sl)?;
+                let lt = r.u8()?;
+                let ll = r.u16_le()? as usize;
+                let logo_raw = r.bytes(ll)?;
+                let logo_type = crate::models::TokenMeta::logo_type_name(lt).map(str::to_string);
+                let logo = (ll > 0).then(|| base64::engine::general_purpose::STANDARD.encode(logo_raw));
+                a.meta = Some(crate::models::TokenMeta { name, description, website, logo_type, logo });
+            }
+            _ => a.amount = Some(r.u64_le()?),
+        }
+        asset_mut(tx).extra.insert("token".into(), serde_json::to_value(a).unwrap_or_default());
         return Ok(());
     }
     if tx.type_group != TYPE_GROUP_CORE {
@@ -43,8 +100,15 @@ fn deserialize_type_payload(tx: &mut Transaction, r: &mut ByteReader) -> Result<
             tx.recipient_id = Some(read_address(r)?);
         }
         tx_type::SECOND_SIGNATURE => {
-            let public_key = r.hex(33)?;
-            asset_mut(tx).signature = Some(SecondSignatureAsset { public_key });
+            if tx.is_pq() {
+                let algorithm = r.u8()?;
+                let len = r.u16_le()? as usize;
+                let public_key = r.hex(len)?;
+                asset_mut(tx).signature = Some(SecondSignatureAsset { public_key, algorithm: Some(algorithm) });
+            } else {
+                let public_key = r.hex(33)?;
+                asset_mut(tx).signature = Some(SecondSignatureAsset { public_key, algorithm: None });
+            }
         }
         tx_type::DELEGATE_REGISTRATION => {
             let len = r.u8()? as usize;
@@ -121,7 +185,39 @@ fn detect_schnorr(remaining: usize) -> bool {
         || (remaining >= 128 && (remaining - 128) % 65 == 0)
 }
 
+/// v3: `sig1 (64) || (alg u8 || len u16 LE || sig)* || [0xff || multisig 65-byte parts]`.
+fn deserialize_signatures_v3(tx: &mut Transaction, r: &mut ByteReader) -> Result<()> {
+    if r.remaining() == 0 {
+        return Ok(());
+    }
+    tx.signature = Some(r.hex(64)?);
+    let mut blocks = Vec::new();
+    while r.remaining() > 0 && r.peek_u8(0) != Some(0xff) {
+        let algorithm = r.u8()?;
+        let len = r.u16_le()? as usize;
+        blocks.push(crate::models::PqSignatureBlock { algorithm, signature: r.hex(len)? });
+    }
+    if !blocks.is_empty() {
+        tx.second_signatures = Some(blocks);
+    }
+    if r.remaining() > 0 {
+        r.u8()?;
+        if r.remaining() % 65 != 0 {
+            return Err(Error::Serialization("v3 multisignature buffer not exhausted".into()));
+        }
+        let mut sigs = Vec::with_capacity(r.remaining() / 65);
+        while r.remaining() > 0 {
+            sigs.push(r.hex(65)?);
+        }
+        tx.signatures = Some(sigs);
+    }
+    Ok(())
+}
+
 fn deserialize_signatures(tx: &mut Transaction, r: &mut ByteReader) -> Result<()> {
+    if tx.is_pq() {
+        return deserialize_signatures_v3(tx, r);
+    }
     if detect_schnorr(r.remaining()) {
         let can_read_single = |r: &ByteReader| r.remaining() > 0 && (r.remaining() % 64 == 0 || r.remaining() % 65 != 0);
         if can_read_single(r) {
@@ -173,7 +269,7 @@ fn deserialize_signatures(tx: &mut Transaction, r: &mut ByteReader) -> Result<()
     Ok(())
 }
 
-/// Parse full AIP-11 bytes into a `Transaction` (id = sha256(bytes)).
+/// Parse full SHIP-11 (v2/v3) bytes into a `Transaction` (id = sha256(bytes)).
 pub fn deserialize_transaction(bytes: &[u8]) -> Result<Transaction> {
     let mut r = ByteReader::new(bytes);
     if r.u8()? != 0xff {
@@ -207,6 +303,7 @@ pub fn deserialize_transaction(bytes: &[u8]) -> Result<Transaction> {
         second_signature: None,
         sign_signature: None,
         signatures: None,
+        second_signatures: None,
         timestamp: None,
         id: None,
         block_id: None,

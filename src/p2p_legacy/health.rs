@@ -198,9 +198,14 @@ impl PeerTable {
     pub fn record_blocks_failure(&self, ip: &str) {
         self.record_failure(ip);
         let mut map = self.lock();
+        let few = map.len() <= 2;
         let Some(p) = map.get_mut(ip) else { return };
         p.blocks_failures += 1;
-        let park = BLOCKS_PARK_STEP.saturating_mul(1u32 << (p.blocks_failures - 1).min(5)).min(MAX_BAN);
+        let mut park = BLOCKS_PARK_STEP.saturating_mul(1u32 << (p.blocks_failures - 1).min(5)).min(MAX_BAN);
+        if few {
+            // private / tiny network: the only block source must come back quickly
+            park = park.min(Duration::from_secs(5));
+        }
         p.blocks_parked_until = Some(Instant::now() + park);
         tracing::debug!(peer = ip, failures = p.blocks_failures, park_secs = park.as_secs(), "peer parked as block source");
     }

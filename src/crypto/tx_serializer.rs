@@ -1,6 +1,6 @@
 //! Author: TechnoL0g
 //!
-//! AIP-11 (v2) transaction wire serialisation — byte-exact port of
+//! SHIP-11 (v2) transaction wire serialisation — byte-exact port of
 //! `Transactions.Serializer` + per-type `serialize()` from `@smartholdem/crypto`.
 
 use super::address::address_to_bytes;
@@ -38,18 +38,71 @@ fn write_address(w: &mut ByteWriter, address: &str) -> Result<()> {
 }
 
 fn serialize_type_payload(tx: &Transaction, w: &mut ByteWriter) -> Result<()> {
-    if tx.is_entity() {
-        let e = tx.entity_asset().ok_or_else(|| Error::Serialization("missing entity asset".into()))?;
+    if tx.is_sobj() {
+        let e = tx.sobj_asset().ok_or_else(|| Error::Serialization("missing sObject asset".into()))?;
         let reg = e.registration_id.as_deref().map(hex::decode).transpose().map_err(|e| Error::Serialization(format!("bad registrationId: {e}")))?.unwrap_or_default();
         let name = e.data.name.as_deref().unwrap_or("").as_bytes();
-        let ipfs = e.data.ipfs_data.as_deref().unwrap_or("").as_bytes();
+        let price = e.price.map(|p| p.to_string());
+        let slot = match e.action {
+            crate::models::sobj::ACTION_TRANSFER => e.recipient_id.as_deref(),
+            crate::models::sobj::ACTION_SELL => price.as_deref(),
+            _ => e.data.ntfry_data.as_deref(),
+        };
+        let ipfs = slot.unwrap_or("").as_bytes();
         if reg.len() > 255 || name.len() > 255 || ipfs.len() > 255 {
-            return Err(Error::Serialization("entity field longer than 255 bytes".into()));
+            return Err(Error::Serialization("sObject field longer than 255 bytes".into()));
         }
         w.u8(e.type_).u8(e.sub_type).u8(e.action);
         w.u8(reg.len() as u8).bytes(&reg);
         w.u8(name.len() as u8).bytes(name);
         w.u8(ipfs.len() as u8).bytes(ipfs);
+        return Ok(());
+    }
+    if tx.is_token() {
+        use crate::models::token;
+        let a = tx.token_asset().ok_or_else(|| Error::Serialization("missing token asset".into()))?;
+        let id = hex::decode(&a.id).map_err(|e| Error::Serialization(format!("bad token id: {e}")))?;
+        if id.len() != 32 {
+            return Err(Error::Serialization("token id must be 32 bytes".into()));
+        }
+        w.bytes(&id);
+        match tx.type_ {
+            token::INIT => {
+                w.u8(a.decimals.unwrap_or(0)).u8(a.flags.unwrap_or(0)).u64_le(a.initial_supply.unwrap_or(0)).u64_le(a.supply_cap.unwrap_or(0));
+            }
+            token::TRANSFER => {
+                let items = a.transfers.unwrap_or_default();
+                let memo = a.memo.as_deref().unwrap_or("").as_bytes();
+                if items.len() > u16::MAX as usize || memo.len() > 255 {
+                    return Err(Error::Serialization("token transfer too large".into()));
+                }
+                w.u16_le(items.len() as u16);
+                for it in &items {
+                    w.u64_le(it.amount);
+                    write_address(w, &it.recipient_id)?;
+                }
+                w.u8(memo.len() as u8).bytes(memo);
+            }
+            token::MINT => {
+                w.u64_le(a.amount.unwrap_or(0));
+                write_address(w, a.recipient_id.as_deref().ok_or_else(|| Error::Serialization("missing recipientId".into()))?)?;
+            }
+            token::META => {
+                let m = a.meta.as_ref().ok_or_else(|| Error::Serialization("missing token meta".into()))?;
+                let (name, desc, site) = (m.name.as_bytes(), m.description.as_deref().unwrap_or("").as_bytes(), m.website.as_deref().unwrap_or("").as_bytes());
+                let logo = if m.logo.is_some() { m.logo_bytes().ok_or_else(|| Error::Serialization("logo is not base64".into()))? } else { Vec::new() };
+                if name.len() > 255 || desc.len() > u16::MAX as usize || site.len() > 255 || logo.len() > u16::MAX as usize {
+                    return Err(Error::Serialization("token meta field too long".into()));
+                }
+                w.u8(name.len() as u8).bytes(name);
+                w.u16_le(desc.len() as u16).bytes(desc);
+                w.u8(site.len() as u8).bytes(site);
+                w.u8(m.logo_type_byte()).u16_le(logo.len() as u16).bytes(&logo);
+            }
+            _ => {
+                w.u64_le(a.amount.unwrap_or(0));
+            }
+        }
         return Ok(());
     }
     if tx.type_group != TYPE_GROUP_CORE {
@@ -67,7 +120,16 @@ fn serialize_type_payload(tx: &Transaction, w: &mut ByteWriter) -> Result<()> {
                 .signature
                 .as_ref()
                 .ok_or_else(|| Error::Serialization("missing asset.signature".into()))?;
-            w.hex(&sig.public_key)?;
+            if tx.is_pq() {
+                // v3: alg u8 || pk_len u16 LE || public key (PQ)
+                let pk = hex::decode(&sig.public_key).map_err(|e| Error::Serialization(format!("bad PQ public key: {e}")))?;
+                if pk.len() > u16::MAX as usize {
+                    return Err(Error::Serialization("PQ public key too long".into()));
+                }
+                w.u8(sig.algorithm.unwrap_or(0)).u16_le(pk.len() as u16).bytes(&pk);
+            } else {
+                w.hex(&sig.public_key)?;
+            }
         }
         tx_type::DELEGATE_REGISTRATION => {
             let d = asset(tx, "delegateRegistration")?
@@ -186,6 +248,27 @@ pub fn serialize_transaction(tx: &Transaction, opts: SerializeOptions, network: 
     if let (Some(sig), false) = (&tx.signature, opts.exclude_signature) {
         w.hex(sig)?;
     }
+    if tx.is_pq() {
+        // v3: blocks `alg u8 || sig_len u16 LE || signature`, then optional 0xff + multisignatures
+        if !opts.exclude_second_signature {
+            for b in tx.pq_blocks() {
+                let sig = hex::decode(&b.signature).map_err(|e| Error::Serialization(format!("bad PQ signature: {e}")))?;
+                if sig.len() > u16::MAX as usize {
+                    return Err(Error::Serialization("PQ signature too long".into()));
+                }
+                w.u8(b.algorithm).u16_le(sig.len() as u16).bytes(&sig);
+            }
+        }
+        if let (Some(sigs), false) = (&tx.signatures, opts.exclude_multi_signature) {
+            if !sigs.is_empty() {
+                w.u8(0xff);
+                for s in sigs {
+                    w.hex(s)?;
+                }
+            }
+        }
+        return Ok(w.into_inner());
+    }
     if let (Some(sig), false) = (tx.second_signature_any(), opts.exclude_second_signature) {
         w.hex(sig)?;
     }
@@ -217,6 +300,12 @@ pub fn verify_transaction_signature(tx: &Transaction) -> Result<bool> {
     };
     let hash = transaction_signing_hash(tx)?;
     verify_signature(&hash, sig, &tx.sender_public_key)
+}
+
+/// Message every v3 second-signature block signs: `M2 = sha256(BODY || SIG1)` (same bytes as the legacy second signature).
+pub fn transaction_pq_message(tx: &Transaction) -> Result<[u8; 32]> {
+    let opts = SerializeOptions { exclude_signature: false, exclude_second_signature: true, exclude_multi_signature: true };
+    Ok(sha256(&serialize_transaction(tx, opts, Network::mainnet_ref())?))
 }
 
 /// Verify the second signature against the wallet's registered second public key.

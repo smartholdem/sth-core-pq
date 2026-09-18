@@ -17,7 +17,7 @@ pub struct IrohPeerInfo {
     pub failures: u64,
     /// Gossip neighbour on at least one topic (blocks / transactions).
     pub neighbor: bool,
-    pub neighbor_topics: [bool; 2],
+    pub neighbor_topics: [bool; 3],
     /// Public `ip:4001` announced by a gateway node.
     pub gateway: Option<String>,
 }
@@ -25,6 +25,7 @@ pub struct IrohPeerInfo {
 /// Gossip topic index for [`IrohPeers::set_neighbor`].
 pub const TOPIC_BLOCKS: usize = 0;
 pub const TOPIC_TXS: usize = 1;
+pub const TOPIC_FINALITY: usize = 2;
 
 #[derive(Default)]
 pub struct IrohPeers {
@@ -45,7 +46,7 @@ impl IrohPeers {
             messages: 0,
             failures: 0,
             neighbor: false,
-            neighbor_topics: [false; 2],
+            neighbor_topics: [false; 3],
             gateway: None,
         })
     }

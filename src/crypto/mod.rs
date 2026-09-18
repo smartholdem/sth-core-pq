@@ -10,6 +10,8 @@ mod bytes;
 mod ecdsa;
 mod hash;
 mod keys;
+pub mod mnemonic;
+pub mod pq;
 mod schnorr;
 mod tx_deserializer;
 mod tx_serializer;
@@ -18,8 +20,8 @@ pub use address::{address_from_bytes, address_from_multi_signature, address_from
 pub use block_deserializer::deserialize_block_header;
 pub use block_serializer::{
     serialize_block_with_transactions,
-    block_id, block_payload_hash, block_signing_hash, serialize_block, verify_block,
-    verify_block_signature, BlockVerification,
+    block_id, block_payload_hash, block_pq_message, block_signing_hash, serialize_block, verify_block,
+    verify_block_pq_signature, verify_block_signature, BlockVerification,
 };
 pub use bytes::{ByteReader, ByteWriter};
 pub use ecdsa::{sign_ecdsa, verify_ecdsa};
@@ -27,7 +29,7 @@ pub use hash::{ripemd160, sha256};
 pub use keys::KeyPair;
 pub use schnorr::{sign_schnorr_legacy, verify_schnorr_legacy};
 pub use tx_deserializer::deserialize_transaction;
-pub use tx_serializer::{
+pub use tx_serializer::{transaction_pq_message, 
     serialize_transaction, transaction_id, transaction_signing_hash, verify_transaction_second_signature,
     verify_transaction_signature, SerializeOptions,
 };

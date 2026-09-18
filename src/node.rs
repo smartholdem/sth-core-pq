@@ -1,7 +1,7 @@
 //! Author: TechnoL0g
 //!
-//! Node runtime assembled from `NodeConfig`: storage > optional snapshot bootstrap > mempool >
-//! local REST API > block intake (legacy P2P with peer table, or REST fallback).
+//! Node runtime assembled from `NodeConfig`: storage → optional snapshot bootstrap → mempool →
+//! local REST API → block intake (legacy P2P with peer table, or REST fallback).
 //! `NodeContext` is the shared handle future modules (delegate/forger, iroh) attach to.
 
 use crate::api::{self, AppState};
@@ -91,7 +91,7 @@ impl NodeContext {
         let mut seeds: Vec<String> = config.p2p.legacy_peers.clone();
         if config.p2p.legacy_enabled && config.p2p.use_peer_list {
             seeds.extend(p2p_legacy::fetch_peer_list(config.p2p.legacy_port).await);
-        } else if seeds.is_empty() {
+        } else if seeds.is_empty() && network.name == "mainnet" {
             seeds.extend(p2p_legacy::P2P_SEEDS.iter().map(|s| s.to_string()));
         }
         let peers = Arc::new(PeerTable::new(config.p2p.legacy_port, seeds));
@@ -99,7 +99,9 @@ impl NodeContext {
             Mempool::with_p2p(storage.clone(), config.sync.rest_nodes.clone(), peers.clone(), config.p2p.relay_fanout, config.mempool.max_size)
         } else {
             Mempool::new(storage.clone(), config.sync.rest_nodes.clone(), config.mempool.max_size)
-        });
+        }
+        .with_max_bytes(config.mempool.max_bytes)
+        .with_dynamic_fees(config.mempool.dynamic_fees.clone()));
         Ok(Self { config, network, storage, mempool, peers, reward_address, iroh: None, forging: None, delegate_secrets })
     }
 
@@ -111,7 +113,8 @@ impl NodeContext {
         let secret = crate::p2p_iroh::load_or_create_secret(Path::new(&cfg.secret_key_file))?;
         let bootstrap = cfg.bootstrap.iter().map(|s| crate::p2p_iroh::parse_endpoint_id(s)).collect::<Result<Vec<_>>>()?;
         let gateway = Some(self.config.p2p.legacy_public_addr.trim().to_string()).filter(|g| !g.is_empty() && !self.config.p2p.legacy_listen.trim().is_empty());
-        let node = IrohNode::spawn(secret, bootstrap, cfg.serve_blocks, cfg.relay, self.storage.clone(), self.mempool.clone(), self.config.sync.verify_blocks, Some(self.peers.clone()), gateway).await?;
+        let relay = cfg.relay.then(|| crate::p2p_iroh::RelaySetup { n0: cfg.relay_n0, extra: cfg.relays.clone() });
+        let node = IrohNode::spawn(secret, bootstrap, cfg.serve_blocks, relay, self.storage.clone(), self.mempool.clone(), self.config.sync.verify_blocks, Some(self.peers.clone()), gateway).await?;
         self.iroh = Some(node);
         Ok(())
     }
@@ -125,25 +128,40 @@ impl NodeContext {
         let source = cfg.sync.bootstrap_snapshot.trim();
         if !source.is_empty() && (flags.force_bootstrap || self.storage.get_last_height()? == 0) {
             let dir = resolve_snapshot(source, Path::new(&cfg.sync.snapshot_dir)).await?;
-            let report = run_import(self.storage.clone(), dir, cfg.sync.fast_import, flags.quiet).await?;
+            let report = run_import(self.storage.clone(), dir, cfg.sync.fast_import, false, flags.quiet).await?;
             if report.interrupted {
                 return Err(Error::Sync("import interrupted".into()));
             }
         }
+        {
+            let st = self.storage.clone();
+            tokio::task::spawn_blocking(move || crate::genesis::ensure_genesis(&st, st.network()))
+                .await
+                .map_err(|e| Error::Sync(format!("genesis task failed: {e}")))??;
+        }
         if !self.delegate_secrets.is_empty() {
+            let mut pq_secrets = cfg.delegate.pq_secrets.clone();
+            if let Ok(v) = std::env::var("STH_DELEGATE_PQ_PASSPHRASE") {
+                pq_secrets.push(v);
+            }
             let forger = Arc::new(crate::delegate::Forger::new(
                 &self.delegate_secrets,
+                &pq_secrets,
                 self.storage.clone(),
                 self.mempool.clone(),
                 self.peers.clone(),
                 crate::delegate::ForgerOptions {
                     broadcast_fanout: cfg.delegate.broadcast_fanout,
                     quorum_share: cfg.delegate.quorum_share,
+                    min_quorum_peers: cfg.delegate.min_quorum_peers,
                     iroh: self.iroh.clone(),
                     ..Default::default()
                 },
             )?);
             forger.log_loaded();
+            if let Some(iroh) = &self.iroh {
+                iroh.set_forging_keys(forger.keys(), cfg.delegate.announce);
+            }
             self.forging = Some(forger.status.clone());
             tokio::spawn(forger.run());
         }
@@ -270,7 +288,7 @@ pub async fn resolve_snapshot(source: &str, snapshot_dir: &Path) -> Result<PathB
 }
 
 /// Run the blocking import on the blocking pool with Ctrl+C support.
-pub async fn run_import(storage: Arc<Storage>, dir: PathBuf, fast: bool, quiet: bool) -> Result<ImportReport> {
+pub async fn run_import(storage: Arc<Storage>, dir: PathBuf, fast: bool, strict: bool, quiet: bool) -> Result<ImportReport> {
     let meta = SnapshotMeta::read(&dir)?;
     tracing::info!(
         folder = meta.folder,
@@ -279,6 +297,7 @@ pub async fn run_import(storage: Arc<Storage>, dir: PathBuf, fast: bool, quiet: 
         end_height = meta.blocks.end,
         compressed = !meta.skip_compression,
         fast,
+        strict,
         "importing snapshot"
     );
     let pb = import_bar(quiet)?;
@@ -291,7 +310,7 @@ pub async fn run_import(storage: Arc<Storage>, dir: PathBuf, fast: bool, quiet: 
     });
     let pb_worker = pb.clone();
     let report = tokio::task::spawn_blocking(move || {
-        snapshot::import_snapshot(&storage, &dir, ImportOptions { fast }, &pb_worker, &cancel)
+        snapshot::import_snapshot(&storage, &dir, ImportOptions { fast, strict }, &pb_worker, &cancel)
     })
     .await
     .map_err(|e| Error::Sync(format!("import task failed: {e}")))??;

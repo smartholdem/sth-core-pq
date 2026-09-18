@@ -40,6 +40,7 @@ fn header(height: u64, previous: &str, txs: Vec<Transaction>) -> Block {
         payload_hash: EMPTY_PAYLOAD.into(),
         generator_public_key: GENERATOR.into(),
         block_signature: Some(FAKE_SIG.into()),
+        pq_signature: None,
         transactions: txs,
     };
     if height == 1 {
@@ -130,7 +131,7 @@ fn fast_import_applies_chain_and_is_resumable() {
     let pb = ProgressBar::hidden();
     let cancel = AtomicBool::new(false);
 
-    let report = import_snapshot(&storage, tmp.path(), ImportOptions { fast: true }, &pb, &cancel).unwrap();
+    let report = import_snapshot(&storage, tmp.path(), ImportOptions { fast: true, strict: false }, &pb, &cancel).unwrap();
     assert_eq!((report.imported, report.skipped, report.end_height), (3, 0, 3));
     assert!(!report.interrupted);
     assert_eq!(storage.get_last_block().unwrap().unwrap().id, blocks[2].id);
@@ -139,7 +140,7 @@ fn fast_import_applies_chain_and_is_resumable() {
     assert!(storage.get_transaction("596236ba37bc2d419f5825b2d771a74e151e7719923afefdef0b0baa9a8cfcb8").unwrap().is_some());
 
     // second run: everything already applied
-    let again = import_snapshot(&storage, tmp.path(), ImportOptions { fast: true }, &pb, &cancel).unwrap();
+    let again = import_snapshot(&storage, tmp.path(), ImportOptions { fast: true, strict: false }, &pb, &cancel).unwrap();
     assert_eq!((again.imported, again.skipped), (0, 3));
 }
 
@@ -148,7 +149,7 @@ fn full_verification_rejects_fake_signatures() {
     let tmp = tempfile::tempdir().unwrap();
     build_snapshot(tmp.path());
     let storage = Storage::temporary(Network::mainnet()).unwrap();
-    let err = import_snapshot(&storage, tmp.path(), ImportOptions { fast: false }, &ProgressBar::hidden(), &AtomicBool::new(false))
+    let err = import_snapshot(&storage, tmp.path(), ImportOptions { fast: false, strict: true }, &ProgressBar::hidden(), &AtomicBool::new(false))
         .unwrap_err();
     assert!(err.to_string().contains("block 1"), "{err}");
     assert_eq!(storage.get_last_height().unwrap(), 0);

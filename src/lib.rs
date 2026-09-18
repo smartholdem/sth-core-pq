@@ -4,6 +4,7 @@
 //! Rust rewrite of the `@smartholdem/core` data structures, cryptography and state storage.
 
 pub mod api;
+pub mod cli;
 pub mod config;
 pub mod crypto;
 pub mod delegate;
@@ -14,6 +15,7 @@ pub mod mem;
 pub mod mempool;
 pub mod models;
 pub mod node;
+pub mod newnet;
 pub mod node_config;
 pub mod node_pool;
 pub mod ntp;

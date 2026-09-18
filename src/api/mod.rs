@@ -7,7 +7,8 @@
 
 mod blocks;
 mod delegates;
-mod entities;
+mod sobj;
+pub mod tokens;
 mod locks;
 mod node;
 mod ntfry;
@@ -152,7 +153,11 @@ pub fn router(state: Shared) -> Router {
         .route("/", get(ntfry::root))
         .route("/status", get(status_page::page))
         .route("/api/ntfry/peers", get(ntfry::peers))
+        .route("/api/ntfry/delegates", get(ntfry::delegates))
         .route("/api/ntfry/metrics", get(ntfry::metrics))
+        .route("/api/ntfry/finality", get(ntfry::finality))
+        .route("/api/ntfry/tokens", get(ntfry::tokens))
+        .route("/api/ntfry/market", get(ntfry::market))
         .route("/api/blockchain", get(node::blockchain))
         .route("/api/node/status", get(node::status))
         .route("/api/node/syncing", get(node::syncing))
@@ -178,9 +183,14 @@ pub fn router(state: Shared) -> Router {
         .route("/api/transactions/:id", get(transactions::by_id))
         .route("/api/votes", get(transactions::votes))
         .route("/api/votes/:id", get(transactions::vote_by_id))
-        .route("/api/entities", get(entities::list))
-        .route("/api/entities/search", post(entities::search))
-        .route("/api/entities/:id", get(entities::by_id))
+        .route("/api/tokens", get(tokens::list))
+        .route("/api/tokens/:key", get(tokens::by_id))
+        .route("/api/tokens/:key/holders", get(tokens::holders))
+        .route("/api/tokens/:key/logo", get(tokens::logo))
+        .route("/api/wallets/:address/tokens", get(tokens::wallet_tokens))
+        .route("/api/sobj", get(sobj::list))
+        .route("/api/sobj/search", post(sobj::search))
+        .route("/api/sobj/:id", get(sobj::by_id))
         .route("/api/locks", get(locks::list))
         .route("/api/locks/unlocked", post(locks::unlocked))
         .route("/api/locks/:id", get(locks::by_id))

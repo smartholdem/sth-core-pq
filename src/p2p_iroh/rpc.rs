@@ -55,6 +55,10 @@ impl RpcHandler {
                     Err(e) => Response::Error { message: e.to_string() },
                 }
             }
+            Request::GetFinality => match self.storage.latest_finality_cert() {
+                Ok(certificate) => Response::Finality { certificate },
+                Err(e) => Response::Error { message: e.to_string() },
+            },
         }
     }
 }
@@ -119,6 +123,24 @@ pub async fn fetch_blocks(endpoint: &Endpoint, peers: &IrohPeers, peer: impl Int
         Ok(Response::Blocks { blocks }) => {
             peers.record_rpc(id, Some(started.elapsed().as_millis() as u64), blocks.last().map(|b| b.height));
             Ok(blocks)
+        }
+        Ok(_) => Err(Error::Sync("unexpected iroh response".into())),
+        Err(e) => {
+            peers.record_rpc(id, None, None);
+            Err(e)
+        }
+    }
+}
+
+/// `GetFinality` → the peer's highest SHIP-35 certificate (unverified — pass it to `FinalityTracker::adopt_certificate`).
+pub async fn fetch_finality(endpoint: &Endpoint, peers: &IrohPeers, peer: impl Into<EndpointAddr>) -> Result<Option<crate::storage::FinalityCert>> {
+    let peer: EndpointAddr = peer.into();
+    let id = peer.id;
+    let started = Instant::now();
+    match call(endpoint, peer, &Request::GetFinality).await {
+        Ok(Response::Finality { certificate }) => {
+            peers.record_rpc(id, Some(started.elapsed().as_millis() as u64), None);
+            Ok(certificate)
         }
         Ok(_) => Err(Error::Sync("unexpected iroh response".into())),
         Err(e) => {

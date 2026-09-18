@@ -22,6 +22,8 @@ pub enum Role {
 fn receives(tx: &Transaction, addr: &str) -> bool {
     tx.recipient_id.as_deref() == Some(addr)
         || tx.asset.as_ref().and_then(|a| a.payments.as_ref()).map(|p| p.iter().any(|x| x.recipient_id == addr)).unwrap_or(false)
+        || tx.token_asset().is_some_and(|a| a.recipient_id.as_deref() == Some(addr) || a.transfers.iter().flatten().any(|t| t.recipient_id == addr))
+        || tx.sobj_asset().is_some_and(|e| e.recipient_id.as_deref() == Some(addr))
 }
 
 /// Query filters that apply to a single transaction (block timestamp handled by the caller).

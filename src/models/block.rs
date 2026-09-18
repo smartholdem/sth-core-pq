@@ -27,9 +27,15 @@ pub struct Block {
     pub generator_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_signature: Option<String>,
+    /// Stage C (block version 1): ML-DSA-44 signature of the forging delegate over `sha256(header || blockSignature)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_signature: Option<super::PqSignatureBlock>,
     #[serde(default)]
     pub transactions: Vec<Transaction>,
 }
+
+/// Block version carrying `pqSignature` (Quantum Shield stage C, milestone `pq.blocks`).
+pub const BLOCK_VERSION_PQ: u32 = 1;
 
 impl Block {
     /// Header copy without transactions (core's `getHeader()`).

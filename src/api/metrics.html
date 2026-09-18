@@ -28,16 +28,32 @@ tr:hover td{background:#151a21}
 .bar{height:3px;background:var(--line);border-radius:2px;margin-top:10px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc);transition:width .6s ease}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:22px}@media(max-width:720px){.two{grid-template-columns:1fr}}
 .empty{color:var(--dim);padding:10px 8px}
-.calc{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:14px}@media(max-width:720px){.calc{grid-template-columns:repeat(2,1fr)}}
+.calc{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:14px}@media(max-width:720px){.calc{grid-template-columns:repeat(2,1fr)}}
 .calc label{display:block;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
 .calc input{display:block;width:100%;margin-top:6px;background:var(--card);border:1px solid var(--line);border-radius:4px;color:var(--acc);font:inherit;font-size:16px;font-weight:700;padding:8px 10px;outline:none;transition:border-color .2s}
 .calc input:focus{border-color:var(--acc)}
 .best td{color:var(--ok)}
+.bar{position:relative;height:28px;background:var(--card);border:1px solid var(--line);border-radius:4px;overflow:hidden;margin-bottom:14px}
+.bar-fill{height:100%;width:0;background:var(--ok);opacity:.35;transition:width .6s ease}
+.bar-text{position:absolute;inset:0;display:flex;align-items:center;padding:0 12px;font-weight:700;color:var(--acc);letter-spacing:.04em}
+.rust{color:var(--ok);font-weight:700}
+.legacy{color:var(--warn)}
+.tabs{display:flex;gap:6px;margin:22px 0 0}
+.tab{background:none;border:1px solid var(--line);border-bottom-color:transparent;color:var(--dim);font:inherit;font-size:11px;letter-spacing:.16em;text-transform:uppercase;padding:9px 18px;border-radius:6px 6px 0 0;cursor:pointer;transition:color .2s,background-color .2s}
+.tab:hover{color:var(--ink)}.tab.on{color:var(--acc);background:var(--card);border-color:var(--acc)}
+.panel{display:none}.panel.on{display:block}
+.logo{width:28px;height:28px;border-radius:6px;background:var(--card);border:1px solid var(--line);object-fit:contain;vertical-align:middle}
+.logo.none{display:inline-flex;align-items:center;justify-content:center;color:var(--dim);font-size:10px}
+.tok{display:flex;align-items:center;gap:10px}.tok b{color:var(--acc)}.tok small{color:var(--dim);display:block;font-size:11px}
+td.sup{min-width:260px;width:260px}.sup .bar{height:22px;margin:0}.sup .bar-text{font-size:11px;padding:0 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.flag{display:inline-block;border:1px solid var(--line);border-radius:3px;padding:0 6px;font-size:10px;color:var(--dim);margin-right:4px;letter-spacing:.08em}
 </style></head><body><div class="wrap">
 <h1>// <b>STH-CORE</b> NODE<i>_</i></h1>
 <div class="sub" id="sub">SmartHoldem relay / delegate node · Rust · sled · legacy 4001 + iroh</div>
 <span class="pill" id="pill">connecting</span>
 
+<div class="tabs" data-testid="metrics-tabs"><button class="tab on" data-tab="node" data-testid="tab-node">node</button><button class="tab" data-tab="tokens" data-testid="tab-tokens">tokens</button><button class="tab" data-tab="market" data-testid="tab-market">market</button></div>
+<div class="panel on" id="panel-node">
 <div class="grid">
  <div class="card"><div class="l">height</div><div class="v" id="height">…</div><div class="s" id="heights"></div></div>
  <div class="card"><div class="l">network</div><div class="v" id="net">…</div><div class="s" id="nets"></div></div>
@@ -53,7 +69,8 @@ tr:hover td{background:#151a21}
 <div class="grid">
  <div class="card"><div class="l">mempool</div><div class="v" id="mp">…</div><div class="s" id="mps"></div></div>
  <div class="card"><div class="l">forging</div><div class="v" id="fg">…</div><div class="s" id="fgs"></div></div>
- <div class="card" id="slot" style="grid-column:span 2"><div class="l">next slot</div><div class="v" id="slotv">—</div><div class="s" id="slots"></div><div class="bar"><i id="slotbar" style="width:0"></i></div></div>
+ <div class="card" data-testid="finality-card"><div class="l">finality <span class="dim">· SHIP-35</span></div><div class="v" id="fin" data-testid="finality-height">…</div><div class="s" id="fins" data-testid="finality-detail"></div></div>
+ <div class="card" id="slot"><div class="l">next slot</div><div class="v" id="slotv">—</div><div class="s" id="slots"></div><div class="bar"><i id="slotbar" style="width:0"></i></div></div>
 </div>
 
 <hr><h2>last blocks</h2>
@@ -64,15 +81,50 @@ tr:hover td{background:#151a21}
 <div><h2>legacy peers</h2><table><thead><tr><th>peer</th><th>ver</th><th class="r">height</th><th class="r">blocks</th><th>state</th></tr></thead><tbody id="lpeers"></tbody></table></div>
 </div>
 
-<hr><h2>payout calculator <span class="dim">· N payouts: STH multipayment vs BNB Chain vs Solana</span></h2>
+<hr><h2>delegates on rust <span class="dim">· stage 1 of the roadmap: every active delegate on sth-core</span></h2>
+<div class="bar" data-testid="rust-delegates-bar"><div class="bar-fill" id="dfill"></div><span class="bar-text" id="dtext" data-testid="rust-delegates-count">—</span></div>
+<table><thead><tr><th>#</th><th>delegate</th><th>implementation</th><th class="r">votes</th><th class="r">node</th><th class="r">seen</th><th class="r" title="SHIP-35: proven votes for two blocks at one height / round until which the delegate is excluded (finality.slashing)">double votes / banned until</th></tr></thead><tbody id="dtab" data-testid="rust-delegates-table"></tbody></table>
+<div class="s dim">rust = delegate key signed an announce from a Rust node within 15 min · legacy = inferred: its recent blocks reached this node only through legacy peers (not Rust gateways) · unknown = not enough blocks seen yet, or a Rust node with `delegate.announce: false` · double votes = SHIP-35 equivocation proofs held by this node (<span id="slashnote">slashing off: shown, not enforced</span>)</div>
+<div id="eqwrap" style="display:none"><h2>equivocation proofs <span class="dim">· SHIP-35 · one delegate key, two block ids at one height — verifiable from the two signatures</span></h2>
+<table><thead><tr><th>delegate</th><th class="r">height</th><th>block ids</th><th class="r">detected at</th><th class="r">banned until round</th><th>state</th></tr></thead><tbody id="eqtab" data-testid="equivocations-table"></tbody></table></div>
+
+<hr><h2>payout calculator <span class="dim">· N payouts: STH multipayment vs BNB Chain vs Solana vs Robinhood Chain</span></h2>
 <div class="calc" id="calc">
  <label>payouts<input id="cN" type="number" min="1" step="1" value="1000" data-testid="calc-payouts"></label>
  <label>STH price, USDT<input id="cP" type="number" min="0" step="0.0001" value="0.0014" data-testid="calc-sth-price"></label>
  <label>BNB fee / transfer, $<input id="cB" type="number" min="0" step="0.001" value="0.02" data-testid="calc-bnb-fee"></label>
  <label>Solana fee / transfer, $<input id="cS" type="number" min="0" step="0.0001" value="0.0005" data-testid="calc-sol-fee"></label>
+ <label>Robinhood Chain fee / transfer, $<input id="cR" type="number" min="0" step="0.001" value="0.005" data-testid="calc-rh-fee"></label>
 </div>
 <table><thead><tr><th>network</th><th class="r">transactions</th><th class="r">signatures</th><th class="r">fee</th><th class="r">usd</th><th class="r">vs STH</th></tr></thead><tbody id="ctab" data-testid="calc-table"></tbody></table>
 <div class="s dim" id="cnote" data-testid="calc-note"></div>
+
+</div>
+
+<div class="panel" id="panel-tokens" data-testid="tokens-panel">
+<div class="grid">
+ <div class="card"><div class="l">tokens</div><div class="v" id="tkn">…</div><div class="s" id="tkns"></div></div>
+ <div class="card"><div class="l">manifests</div><div class="v cyan" id="tkm">…</div><div class="s" id="tkms"></div></div>
+ <div class="card"><div class="l">issue fee</div><div class="v" id="tkf">…</div><div class="s" id="tkfs"></div></div>
+ <div class="card"><div class="l">status</div><div class="v" id="tka">…</div><div class="s" id="tkas"></div></div>
+</div>
+<hr><h2>token explorer <span class="dim">· native tokens (typeGroup 3) · manifest and logo stored in the chain</span></h2>
+<table><thead><tr><th>token</th><th>supply / cap</th><th class="r">decimals</th><th>flags</th><th>owner</th><th class="r">issued</th></tr></thead><tbody id="ttab" data-testid="tokens-table"></tbody></table>
+<hr><h2>latest issues</h2>
+<table><thead><tr><th>token</th><th>name</th><th class="r">height</th><th>time</th><th class="r">confirmations</th><th>id</th></tr></thead><tbody id="tlast" data-testid="tokens-latest"></tbody></table>
+</div>
+
+<div class="panel" id="panel-market" data-testid="market-panel">
+<div class="grid">
+ <div class="card"><div class="l">open orders</div><div class="v" id="mkn">…</div><div class="s" id="mkns"></div></div>
+ <div class="card"><div class="l">tokens for sale</div><div class="v cyan" id="mkt">…</div><div class="s" id="mkts">on this page</div></div>
+ <div class="card"><div class="l">fees</div><div class="v" id="mkf">…</div><div class="s">sell / buy · price goes to the owner</div></div>
+ <div class="card"><div class="l">status</div><div class="v" id="mka">…</div><div class="s" id="mkas"></div></div>
+</div>
+<hr><h2>market <span class="dim">· open sale orders for smart objects (sObjects) and tokens · buy = one transaction, coins to the owner, object to the buyer</span></h2>
+<table><thead><tr><th>object</th><th>type</th><th class="r">price</th><th>owner</th><th>pointer</th><th>id</th></tr></thead><tbody id="mtab" data-testid="market-table"></tbody></table>
+<div class="s dim" id="mpage" data-testid="market-pager"></div>
+</div>
 
 <div class="foot">auto-refresh 3s · updated <span id="upd">—</span> · raw: <a href="/api/ntfry/metrics">/api/ntfry/metrics</a> · <a href="/api/ntfry/peers">/api/ntfry/peers</a></div>
 </div>
@@ -89,14 +141,21 @@ async function tick(){
   setv('height',fmt(c.height));$('heights').textContent=c.id?sh(c.id):'';
   setv('net',fmt(c.networkHeight),c.behind>1?'bad':'ok');$('nets').textContent=c.behind>1?`${fmt(c.behind)} blocks behind`:'tip reached';
   const age=c.lastBlockAge??0;setv('age',dur(age)+' ago',age>3*bt?(age>10*bt?'bad':'warn'):'ok');$('ages').textContent=c.blocksPerMin?`${c.blocksPerMin.toFixed(1)} blocks/min · slot ${bt}s`:`slot ${bt}s`;
-  setv('up',dur(d.node.uptime));$('ups').textContent=new Date(d.node.now*1000).toISOString().slice(11,19)+' UTC'+(d.node.rssBytes?` · rss ${(d.node.rssBytes/1048576).toFixed(0)} MB`:'');
+  setv('up',dur(d.node.uptime));$('ups').innerHTML=new Date(d.node.now*1000).toISOString().slice(11,19)+' UTC'+(d.node.rssBytes?` · rss ${(d.node.rssBytes/1048576).toFixed(0)} MB`:'')+` · quantum shield <b data-testid="pq-stage">stage ${d.node.pqStage||'A'}</b>: ${fmt(d.node.pqCommitments||0)} committed · ${fmt(d.node.pqActive||0)} PQ-active`+(d.mempool&&d.mempool.maxBytes?` · pool ${(d.mempool.bytes/1024).toFixed(0)} / ${(d.mempool.maxBytes/1024).toFixed(0)} KB`:'');
   const L=d.legacy;if(L.enabled){setv('lp',`${L.alive}/${L.known}`,L.alive?'':'bad');$('lps').textContent=`best ${fmt(L.bestHeight)} · ${L.banned} banned · ${L.parked} parked`}else{setv('lp','off','bad');$('lps').textContent=''}
-  const I=d.ntfry;if(I.enabled){setv('ip',`${I.neighbors}/${I.known}`,'cyan');$('ips').textContent=`${I.gateways} gateways · best ${fmt(I.bestHeight)}`+(I.gateway?` · this node is a gateway (${I.gateway})`:'');$('myid').textContent='· me '+sh(I.nodeId)}else{setv('ip','off','bad');$('ips').textContent='p2p.iroh.enabled: false';$('myid').textContent=''}
+  const I=d.ntfry;if(I.enabled){setv('ip',`${I.neighbors}/${I.known}`,'cyan');$('ips').textContent=`${I.gateways} gateways · best ${fmt(I.bestHeight)}`+(I.gateway?` · this node is a gateway (${I.gateway})`:'')+(I.homeRelays&&I.homeRelays.length?` · relay ${I.homeRelays.map(u=>u.replace(/^https?:\/\//,'').replace(/\/$/,'')).join(', ')}`:(I.relays&&I.relays.length?' · relay connecting…':' · no relay'));$('myid').textContent='· me '+sh(I.nodeId)}else{setv('ip','off','bad');$('ips').textContent='p2p.iroh.enabled: false';$('myid').textContent=''}
   const K=d.intake,lb=K.last;
   if(lb){const sc=lb.source==='gossip-iroh'?'cyan':lb.source==='forged'?'ok':'';setv('src',lb.label,sc);$('srcs').textContent=`${fmt(lb.height)} from ${lb.peer}`}else{setv('src','—','');$('srcs').textContent='no live block yet'}
   if(K.avgDelayMs!=null){const a=K.avgDelayMs/1000;setv('dly',`${a.toFixed(2)}s`,a<2?'ok':a<4?'warn':'bad');$('dlys').textContent=`last ${(lb.delayMs/1000).toFixed(2)}s · ${K.samples} blocks · `+Object.entries(K.bySource).map(([k,v])=>`${k} ${(v.avgDelayMs/1000).toFixed(1)}s×${v.count}`).join(' · ')}else{setv('dly','—','');$('dlys').textContent='after slot start, avg of last 100'}
-  setv('mp',fmt(d.mempool.count));$('mps').textContent=`max ${fmt(d.mempool.max)}`;
-  if(c.fees){fees={transfer:c.fees.transfer/1e8,multiPayment:c.fees.multiPayment/1e8,limit:c.multiPaymentLimit||256};calc()}
+  const DF=d.mempool.dynamicFees;setv('mp',fmt(d.mempool.count));$('mps').innerHTML=`max ${fmt(d.mempool.max)}`+(DF?` · <span data-testid="min-transfer-fee">min transfer ${(DF.minTransferFee/1e8).toFixed(4)} STH</span>${DF.enabled?' (dynamic)':' (static)'} · <span class="${DF.lowFeeRejected?'warn':'dim'}" data-testid="low-fee-rejected">${fmt(DF.lowFeeRejected)} low-fee rejected</span>`:'');
+  const FN=d.finality;if(FN){if(FN.enabled||FN.finalizedHeight){const lag=FN.lag;setv('fin',FN.finalizedHeight?fmt(FN.finalizedHeight):'—',FN.finalizedHeight?(lag<=2?'ok':lag<=21?'warn':'bad'):'');const EQ=(FN.equivocations||[]);$('fins').innerHTML=(FN.finalizedHeight?`lag ${fmt(lag)} · `:'no certificate yet · ')+`${FN.tipVotes}/${FN.quorum} votes at tip · ${FN.hard?'hard':'soft'} mode`+(FN.received?` · ${fmt(FN.received)} votes seen`:'')+(EQ.length?` · <span class="bad" data-testid="equivocations" title="${EQ.map(e=>`${e.username||e.publicKey.slice(0,12)} @${e.height}${e.banned?` banned ${e.roundsLeft} rounds`:''}`).join('\n')}">⚠ ${EQ.length} double vote${EQ.length>1?'s':''}${FN.slashing&&FN.slashing.enabled?` · ${EQ.filter(e=>e.banned).length} slashed`:' (slashing off)'}</span>`:'')}else{setv('fin','off','');$('fins').textContent='needs p2p.iroh.enabled (votes travel over iroh gossip)'}}
+  if(c.fees){fees={transfer:c.fees.transfer/1e8,multiPayment:c.fees.multiPayment/1e8,limit:c.multiPaymentLimit||256,dyn:DF&&DF.enabled?{rate:DF.minFeePool,transfer:DF.addonBytes.transfer||0,multiPayment:DF.addonBytes.multiPayment||0}:null};calc()}
+  const D=d.delegates;if(D){const PB=D.pqBlocks||{},SL=D.slashing||{};$('dfill').style.width=(100*D.rust/Math.max(1,D.active))+'%';$('dtext').textContent=`${D.rust} of ${D.active} active delegates on rust · ${D.legacy} legacy (inferred) · ${D.unknown} unknown`+(D.outdated?` · ⚠ ${D.outdated} below v${D.minCoreVersion}`:'')+(PB.activation?` · pq keys ${D.pqKeys}/${D.active}${PB.active?(PB.blocksLeft>0?` · v0 blocks allowed for ${fmt(PB.blocksLeft)} more blocks`:' · v1 hybrid blocks required'):` · pq.blocks at ${fmt(PB.activation)}`}`:'');
+   const pqcell=x=>PB.activation?(x.pqKey?' <span class="ok" title="ML-DSA key registered (pq-register)">pq ✓</span>':` <span class="${PB.active&&!(PB.blocksLeft>0)?'bad':'warn'}" title="no PQ key: this delegate will skip slots once pq.blocks grace closes" data-testid="delegate-pq-missing-${x.username}">pq missing</span>`):'';
+   $('dtab').innerHTML=D.list.map(x=>`<tr><td class="dim">${x.rank}</td><td>${x.username||x.publicKey.slice(0,12)}</td><td class="${x.outdated?'bad':x.implementation==='rust'?'rust':x.implementation==='legacy'?'legacy':'dim'}" ${x.outdated?`title="below minCoreVersion ${D.minCoreVersion} — this node will reject blocks of the current milestone rules" data-testid="delegate-outdated-${x.username}"`:''}>${x.implementation}${x.version?' '+x.version:''}${x.outdated?` <span class="bad">⚠ update to ≥ ${D.minCoreVersion}</span>`:''}${x.implementation==='legacy'?` <span class="dim">(${x.observed} blocks via legacy peers)</span>`:''}${pqcell(x)}</td><td class="r dim">${fmt(Math.round(+x.votes/1e8))}</td><td class="r dim">${x.node||'—'}</td><td class="r dim">${x.lastSeen!=null?x.lastSeen+'s':'—'}</td><td class="r ${x.doubleVotes?(x.banned?'bad':'warn'):'dim'}" data-testid="delegate-double-votes-${x.username}">${x.doubleVotes?`${x.doubleVotes} / ${x.banned?`round ${fmt(x.bannedUntilRound)} (${fmt(x.bannedUntilRound-SL.currentRound)} left)`:SL.enabled?`expired (${fmt(x.bannedUntilRound)})`:`${fmt(x.bannedUntilRound)} · not enforced`}`:'—'}</td></tr>`).join('');
+   const EQS=D.equivocations||[];$('slashnote').textContent=SL.enabled?`slashing on: ${SL.rounds} rounds exclusion, current round ${fmt(SL.currentRound)}`:'slashing off: shown, not enforced';
+   $('eqwrap').style.display=EQS.length?'':'none';
+   $('eqtab').innerHTML=EQS.slice().sort((a,b)=>b.height-a.height).map(e=>`<tr><td class="${e.banned?'bad':'warn'}">${e.username||e.publicKey.slice(0,16)}</td><td class="r">${fmt(e.height)}</td><td class="id" title="${e.blockIds.join('\n')}">${e.blockIds[0].slice(0,12)}… / ${e.blockIds[1].slice(0,12)}…</td><td class="r dim">${fmt(e.detectedHeight)}</td><td class="r">${fmt(e.bannedUntilRound)}</td><td class="${e.banned?'bad':'dim'}">${e.banned?`banned · ${fmt(e.roundsLeft)} rounds left`:SL.enabled?'expired':'recorded (slashing off)'}</td></tr>`).join('')}
   const F=d.forging;
   if(F.enabled){const act=F.delegates.filter(x=>x.active).length;setv('fg',`${F.forgedCount}`,act?'ok':'warn');$('fgs').textContent=F.delegates.map(x=>`${x.username}${x.rank?' #'+x.rank:''}`).join(', ')||'no delegates';slot=F.nextSlot;
    if(F.lastForged)$('fgs').textContent+=` · last ${fmt(F.lastForged.height)} (${F.lastForged.acceptedBy} peers)`}
@@ -112,19 +171,58 @@ function countdown(){const left=slot?slot.startsAtUnix-Date.now()/1000:null;
  if(left>0){$('slotv').textContent=dur(Math.ceil(left));$('slots').textContent=`slot ${slot.slot} · ${slot.delegate} · ${new Date(slot.startsAtUnix*1000).toISOString().slice(11,19)} UTC`;const total=Math.max(bt*21,1);$('slotbar').style.width=`${Math.max(0,100-left/total*100)}%`}
  else{$('slotv').textContent='forging…';$('slotbar').style.width='100%'}}
 tick();setInterval(tick,3000);setInterval(countdown,500);
-let fees={transfer:1,multiPayment:0.1,limit:256};
+let tab='node';
+document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>{tab=b.dataset.tab;document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x===b));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('on',p.id==='panel-'+tab));if(tab==='tokens')tokens();if(tab==='market')market()}));
+const unit=(v,d)=>{const s=String(v).padStart(d+1,'0');const int=d?s.slice(0,-d):s,frac=d?s.slice(-d).replace(/0+$/,''):'';return Number(int).toLocaleString('en-US')+(frac?'.'+frac:'')};
+async function tokens(){
+ try{
+  const T=(await (await fetch('/api/ntfry/tokens')).json()).data;
+  setv('tkn',fmt(T.count),T.count?'':'');$('tkns').textContent=`${T.withLogo} with logo`;
+  setv('tkm',fmt(T.withManifest),'cyan');$('tkms').textContent=`meta fee ${T.fees.meta/1e8} STH · logo ≤ ${T.maxLogoBytes/1024} KB svg/png`;
+  setv('tkf',`${T.fees.init/1e8} STH`);$('tkfs').textContent=`${T.fees.init/2e8} burned · transfer ${T.fees.transfer/1e8} + ${T.fees.transferPerRecipient/1e8}×n (≤ ${T.maxRecipients})`;
+  if(T.active){setv('tka','active','ok');$('tkas').textContent='typeGroup 3 accepted'}else{setv('tka','dormant','warn');$('tkas').textContent='waiting for milestone tokens: true (H_TOKENS)'}
+  const logo=t=>t.meta&&t.meta.logoUrl?`<img class="logo" src="${t.meta.logoUrl}" alt="" loading="lazy">`:`<span class="logo none">${t.symbol.slice(0,2)}</span>`;
+  const flags=t=>[t.mintable?'mintable':'',t.burnable?'burnable':'',(t.flags&4)?'frozen':''].filter(Boolean).map(f=>`<span class="flag">${f}</span>`).join('')||'<span class="dim">fixed</span>';
+  $('ttab').innerHTML=T.tokens.map(t=>{const pct=Number(t.supplyCap)?Math.min(100,100*Number(t.supply)/Number(t.supplyCap)):0;
+   return `<tr data-testid="token-row-${t.symbol}"><td><div class="tok">${logo(t)}<div><b>${t.symbol}</b><small>${t.meta?t.meta.name:'<i>no manifest</i>'}${t.meta&&t.meta.website?` · <a class="dim" href="${t.meta.website}" target="_blank" rel="noopener">${t.meta.website.replace(/^https?:\/\//,'')}</a>`:''}</small></div></div></td>
+   <td class="sup"><div class="bar"><div class="bar-fill" style="width:${pct}%"></div><span class="bar-text">${unit(t.supply,t.decimals)} / ${unit(t.supplyCap,t.decimals)}</span></div></td>
+   <td class="r dim">${t.decimals}</td><td>${flags(t)}</td><td class="dim" title="${t.owner}">${sh(t.owner)}</td><td class="r dim">${fmt(t.initHeight)}</td></tr>`}).join('')||`<tr><td colspan=6 class="empty">${T.active?'no tokens issued yet':'tokens are dormant on this network'}</td></tr>`;
+  $('tlast').innerHTML=T.tokens.slice(0,10).map(t=>`<tr><td><div class="tok">${logo(t)}<b>${t.symbol}</b></div></td><td>${t.meta?t.meta.name:'<span class="dim">—</span>'}</td><td class="r">${fmt(t.initHeight)}</td><td class="dim">${t.initUnix?new Date(t.initUnix*1000).toISOString().slice(0,19).replace('T',' '):'—'}</td><td class="r dim">${fmt(t.confirmations)}</td><td class="id" title="${t.id}">${t.id.slice(0,20)}…</td></tr>`).join('')||'<tr><td colspan=6 class="empty">nothing yet</td></tr>';
+ }catch(e){$('ttab').innerHTML='<tr><td colspan=6 class="empty">api unreachable</td></tr>'}
+}
+setInterval(()=>{if(tab==='tokens')tokens();if(tab==='market')market()},10000);
+let mpage=1;const ETYPES={1:'business',2:'product',3:'plugin',4:'delegate',5:'ticker',6:'module'};
+async function market(){
+ try{
+  const r=await (await fetch(`/api/ntfry/market?page=${mpage}&limit=100`)).json();const M=r.data,P=r.meta;
+  setv('mkn',fmt(P.totalCount));$('mkns').textContent=P.totalCount>100?`page ${P.page} of ${P.pageCount} · 100 per page`:'all shown';
+  setv('mkt',fmt(M.orders.filter(o=>o.token).length),'cyan');
+  setv('mkf',`${M.fees.sell/1e8} / ${M.fees.buy/1e8} STH`);
+  if(M.active){setv('mka','open','ok');$('mkas').textContent='sobjV2 active · sell / buy accepted'}else{setv('mka','closed','warn');$('mkas').textContent='waiting for milestone sobjV2'}
+  const logo=o=>o.token&&o.token.logoUrl?`<img class="logo" src="${o.token.logoUrl}" alt="" loading="lazy">`:`<span class="logo none">${(o.name||'?').slice(0,2)}</span>`;
+  $('mtab').innerHTML=M.orders.map(o=>`<tr data-testid="market-row-${o.id.slice(0,8)}"><td><div class="tok">${logo(o)}<div><b>${o.name||'—'}</b><small>${o.token?`token · ${o.token.name||o.token.symbol} · supply ${unit(o.token.supply,o.token.decimals)}`:'sObject'}</small></div></div></td>
+   <td><span class="flag">${ETYPES[o.type]||'type '+o.type}</span>${o.subType?`<span class="flag">sub ${o.subType}</span>`:''}</td>
+   <td class="r"><b>${(Number(o.price)/1e8).toLocaleString('en-US')}</b> <span class="dim">STH</span></td>
+   <td class="dim" title="${o.owner}">${sh(o.owner)}</td><td class="dim">${o.ntfryData?o.ntfryData.slice(0,40):'—'}</td><td class="id" title="${o.id}">${o.id.slice(0,16)}…</td></tr>`).join('')||`<tr><td colspan=6 class="empty">${M.active?'no open orders':'market is closed on this network'}</td></tr>`;
+  $('mpage').innerHTML=P.pageCount>1?`<button class="tab" ${P.page<=1?'disabled':''} onclick="mpage=Math.max(1,mpage-1);market()">← prev</button> page ${P.page} / ${P.pageCount} <button class="tab" ${P.page>=P.pageCount?'disabled':''} onclick="mpage=Math.min(${P.pageCount},mpage+1);market()">next →</button>`:'';
+ }catch(e){$('mtab').innerHTML='<tr><td colspan=6 class="empty">api unreachable</td></tr>'}
+}
+let fees={transfer:1,multiPayment:0.1,limit:256,dyn:null};
 function calc(){
- const N=Math.max(1,Math.floor(+$('cN').value||0)),P=+$('cP').value||0,B=+$('cB').value||0,S=+$('cS').value||0;
- const txs=Math.ceil(N/fees.limit),sth=txs*fees.multiPayment,sthUsd=sth*P;
+ const N=Math.max(1,Math.floor(+$('cN').value||0)),P=+$('cP').value||0,B=+$('cB').value||0,S=+$('cS').value||0,R=+$('cR').value||0;
+ // dynamic fees: (addon + wire bytes) × rate; transfer = 156 B, multipayment = 59 + 2 + 29 × recipients + 64 B
+ const dyn=fees.dyn,tf=dyn?(dyn.transfer+156)*dyn.rate/1e8:fees.transfer,mpf=n=>dyn?(dyn.multiPayment+125+29*n)*dyn.rate/1e8:fees.multiPayment;
+ const txs=Math.ceil(N/fees.limit),last=N-(txs-1)*fees.limit,sth=(txs-1)*mpf(fees.limit)+mpf(last),sthUsd=sth*P;
  const usd=v=>v<0.01?'$'+v.toFixed(6):'$'+v.toLocaleString('en-US',{maximumFractionDigits:2});
  const x=v=>sthUsd>0?(v/sthUsd>=100?'×'+fmt(Math.round(v/sthUsd)):'×'+(v/sthUsd).toFixed(1)):'—';
  const rows=[
   ['SmartHoldem · multipayment',txs,txs,`${sth.toLocaleString('en-US',{maximumFractionDigits:2})} STH`,usd(sthUsd),'—',true],
-  ['SmartHoldem · single transfers',N,N,`${fmt(N*fees.transfer)} STH`,usd(N*fees.transfer*P),x(N*fees.transfer*P),false],
+  ['SmartHoldem · single transfers',N,N,`${(N*tf).toLocaleString('en-US',{maximumFractionDigits:4})} STH`,usd(N*tf*P),x(N*tf*P),false],
   ['BNB Chain',N,N,`${fmt(N)} × gas`,usd(N*B),x(N*B),false],
-  ['Solana',N,N,`${fmt(N)} × fee`,usd(N*S),x(N*S),false]];
+  ['Solana',N,N,`${fmt(N)} × fee`,usd(N*S),x(N*S),false],
+  ['Robinhood Chain (L2)',N,N,`${fmt(N)} × gas (ETH)`,usd(N*R),x(N*R),false]];
  $('ctab').innerHTML=rows.map(r=>`<tr class="${r[6]?'best':''}"><td>${r[0]}</td><td class="r">${fmt(r[1])}</td><td class="r">${fmt(r[2])}</td><td class="r">${r[3]}</td><td class="r">${r[4]}</td><td class="r dim">${r[5]}</td></tr>`).join('');
- $('cnote').textContent=`mainnet static fees: multipayment ${fees.multiPayment} STH per tx (up to ${fees.limit} recipients), transfer ${fees.transfer} STH · 1 STH = ${P} USDT · BNB/Solana fees are editable estimates`;
+ $('cnote').textContent=dyn?`dynamic fees on this node: (addon + bytes) × ${dyn.rate} smartoshi/byte → transfer ${tf.toFixed(4)} STH, full multipayment (${fees.limit} recipients) ${mpf(fees.limit).toFixed(4)} STH · 1 STH = ${P} USDT · BNB/Solana/Robinhood fees are editable estimates`:`mainnet static fees: multipayment ${fees.multiPayment} STH per tx (up to ${fees.limit} recipients), transfer ${fees.transfer} STH · 1 STH = ${P} USDT · BNB/Solana/Robinhood fees are editable estimates`;
 }
-['cN','cP','cB','cS'].forEach(i=>$(i).addEventListener('input',calc));calc();
+['cN','cP','cB','cS','cR'].forEach(i=>$(i).addEventListener('input',calc));calc();
 </script></body></html>

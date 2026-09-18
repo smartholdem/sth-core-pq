@@ -34,6 +34,14 @@ pub fn deserialize_block_header(bytes: &[u8], network: &Network) -> Result<Block
     } else {
         None
     };
+    // stage C: `alg u8 || len u16 LE || ML-DSA signature` after the classic signature on version-1 blocks
+    let pq_signature = if version >= crate::models::BLOCK_VERSION_PQ && r.remaining() >= 3 {
+        let algorithm = r.u8()?;
+        let len = r.u16_le()? as usize;
+        Some(crate::models::PqSignatureBlock { algorithm, signature: r.hex(len)? })
+    } else {
+        None
+    };
     if r.remaining() > 0 {
         return Err(Error::Serialization(format!(
             "block {height}: {} unexpected trailing bytes after header",
@@ -55,6 +63,7 @@ pub fn deserialize_block_header(bytes: &[u8], network: &Network) -> Result<Block
         payload_hash,
         generator_public_key,
         block_signature,
+        pq_signature,
         transactions: Vec::new(),
     };
     block.id = Some(if height == 1 { network.genesis_block_id.to_string() } else { block_id(&block)? });

@@ -165,6 +165,9 @@ pub fn load_transactions(dir: &Path, meta: &SnapshotMeta) -> Result<HashMap<u64,
 pub struct ImportOptions {
     /// Skip secp256k1 signature verification (trusted dump). Ids, linkage and payload hashes are still checked.
     pub fast: bool,
+    /// History audit: additionally run the wallet-aware rules (second signatures, smart objects) on every block,
+    /// exactly as the live node does — the import stops at the first block legacy accepted but we would reject.
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +322,9 @@ pub fn import_snapshot(
         tip = ChainTip { height: block.height, id: block.id.clone() };
         chunk.push(block);
         if chunk.len() >= IMPORT_CHUNK {
+            if opts.strict {
+                crate::sync::check_stateful_rules(storage, network, &chunk)?;
+            }
             storage.apply_blocks(&chunk)?;
             imported += chunk.len() as u64;
             chunk.clear();
@@ -330,6 +336,9 @@ pub fn import_snapshot(
         }
     }
     if !chunk.is_empty() {
+        if opts.strict {
+            crate::sync::check_stateful_rules(storage, network, &chunk)?;
+        }
         storage.apply_blocks(&chunk)?;
         imported += chunk.len() as u64;
         pb.set_position(tip.height);

@@ -41,8 +41,51 @@ const PREFIX_ROUND: &[u8] = b"rd:";
 const PREFIX_UNDO: &[u8] = b"undo:";
 /// `dv:<delegate public key>` → vote weight (BE u64), maintained incrementally on every wallet write.
 const PREFIX_VOTES: &[u8] = b"dv:";
-/// `en:<name lowercase>-<type>` → registration transaction id (network-wide entity name uniqueness).
-const PREFIX_ENTITY_NAME: &[u8] = b"en:";
+/// SmartObject (sObject) name index: `en:<name lowercase>-<type>` → registration transaction id (network-wide
+/// uniqueness). The `en:` prefix is historical (kept so existing databases need no migration) — it is an sObject key.
+const PREFIX_SOBJ_NAME: &[u8] = b"en:";
+/// SmartObject owner index: `eo:<registrationId>` → current owner address, written only after an sObject transfer /
+/// buy (default owner = registrant). Historical prefix, sObject key.
+const PREFIX_SOBJ_OWNER: &[u8] = b"eo:";
+/// `mk:<registrationId>` → owner address for every open sale order (sobjV2 market).
+const PREFIX_MARKET: &[u8] = b"mk:";
+/// `tk:<tokenId>` → owner address (immutable, written by TokenInit); `tks:<SYMBOL>` → tokenId.
+const PREFIX_TOKEN_OWNER: &[u8] = b"tk:";
+const PREFIX_TOKEN_SYMBOL: &[u8] = b"tks:";
+/// `pqc:<address>` → alg — wallets with a Quantum Shield commitment (count for metrics).
+const PREFIX_PQ_COMMIT: &[u8] = b"pqc:";
+/// `pqk:<address>` → alg — wallets with a registered PQ key (stage B, count for metrics).
+const PREFIX_PQ_KEY: &[u8] = b"pqk:";
+/// `fc:<height BE u64>` → SHIP-35 finality certificate (JSON).
+const PREFIX_FINALITY: &[u8] = b"fc:";
+
+/// `eq:<delegate public key>:<height BE u64>` → proven double vote of that delegate at that height (SHIP-35 slashing, full history).
+const PREFIX_EQUIVOCATION: &[u8] = b"eq:";
+
+/// SHIP-35 equivocation proof: one delegate key signed two different block ids at the same height. Anyone can verify it
+/// from the two signatures alone; a node that holds it excludes the delegate from round snapshots while `finality.slashing`
+/// is on (`banned_until_round`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EquivocationProof {
+    pub height: u64,
+    pub public_key: String,
+    pub block_ids: [String; 2],
+    pub signatures: [String; 2],
+    /// Tip height of the node that recorded the proof (round of exclusion starts at the next round).
+    pub detected_height: u64,
+    pub banned_until_round: u64,
+}
+
+/// SHIP-35 finality certificate: ≥ quorum delegate votes for one `(height, blockId)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinalityCert {
+    pub height: u64,
+    pub block_id: String,
+    /// delegate public key → Schnorr signature over the vote hash
+    pub votes: BTreeMap<String, String>,
+}
 const KEY_VOTE_INDEX: &[u8] = b"meta:vote_index";
 /// Blocks that can be rolled back (undo records kept) once undo logging is on.
 pub const UNDO_DEPTH: u64 = 1_000;
@@ -80,21 +123,52 @@ pub struct WalletState {
     pub locks: BTreeMap<String, LockRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_signature: Option<MultiSignatureAsset>,
-    /// AIP-36 entities registered by this wallet, keyed by registration transaction id.
+    /// smart objects (sObjects) registered by this wallet, keyed by registration transaction id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", alias = "entities")]
+    pub sobjects: BTreeMap<String, SmartObject>,
+    /// Quantum Shield stage A: last `sthpq1:` commitment published by this wallet (self-transfer vendorField).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_commitment: Option<crate::crypto::pq::PqCommitment>,
+    /// Quantum Shield stage B: registered ML-DSA key (type 1, v3). Replaces the legacy second public key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_key: Option<crate::crypto::pq::PqKey>,
+    /// Native token balances: tokenId → amount in minimal units.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub entities: BTreeMap<String, EntityRecord>,
+    pub tokens: BTreeMap<String, u64>,
+    /// Tokens this wallet initialized (owner side): tokenId → registry state. Lives in the owner wallet so undo is automatic.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens_issued: BTreeMap<String, TokenState>,
 }
 
-/// `attributes.entities[<registrationId>]` as legacy core stores it.
+/// Consensus state of a native token (SPEC-TOKENS-NATIVE §5), stored in the owner's wallet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EntityRecord {
+pub struct TokenState {
+    pub symbol: String,
+    pub decimals: u8,
+    pub flags: u8,
+    pub supply: u64,
+    pub supply_cap: u64,
+    pub owner: String,
+    pub init_height: u64,
+    /// On-chain manifest (TokenMeta), last one wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<crate::models::TokenMeta>,
+}
+
+/// `attributes.sobjects[<registrationId>]` — one SmartObject (sObject): a named, owned, transferable on-chain object (typeGroup 2 / type 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartObject {
     #[serde(rename = "type")]
     pub type_: u8,
     pub sub_type: u8,
-    pub data: crate::models::EntityData,
+    pub data: crate::models::SmartObjectData,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resigned: bool,
+    /// Open sale order (smartoshi), sobjV2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<u64>,
 }
 
 /// Open HTLC lock (`attributes.htlc.locks[id]` / `/api/locks`).
@@ -141,7 +215,7 @@ impl WalletState {
         self.locks.values().map(|l| l.amount).sum()
     }
 
-    fn new(address: &str) -> Self {
+    pub fn new(address: &str) -> Self {
         Self {
             address: address.to_string(),
             public_key: None,
@@ -157,7 +231,11 @@ impl WalletState {
             resigned: false,
             locks: BTreeMap::new(),
             multi_signature: None,
-            entities: BTreeMap::new(),
+            sobjects: BTreeMap::new(),
+            pq_commitment: None,
+            pq_key: None,
+            tokens: BTreeMap::new(),
+            tokens_issued: BTreeMap::new(),
         }
     }
 
@@ -199,8 +277,47 @@ impl WalletState {
         if let Some(m) = &d.multi_signature {
             self.multi_signature = Some(m.clone());
         }
-        for (id, rec) in &d.entities {
-            self.entities.insert(id.clone(), rec.clone());
+        if let Some(c) = &d.pq_commitment {
+            self.pq_commitment = Some(c.clone());
+        }
+        if let Some(k) = &d.pq_key {
+            self.pq_key = Some(k.clone());
+            self.second_public_key = None;
+        }
+        for (id, st) in &d.tokens_issued {
+            self.tokens_issued.insert(id.clone(), st.clone());
+        }
+        for (id, m) in &d.token_meta {
+            let st = self.tokens_issued.get_mut(id).ok_or_else(|| Error::Sync(format!("token {id} not issued by {}", self.address)))?;
+            st.meta = Some(m.clone());
+        }
+        for (id, change) in &d.token_supply {
+            let st = self.tokens_issued.get_mut(id).ok_or_else(|| Error::Sync(format!("token {id} not issued by {}", self.address)))?;
+            let v = st.supply as i128 + change;
+            if v < 0 || v > u64::MAX as i128 {
+                return Err(Error::Sync(format!("token {id} supply out of range")));
+            }
+            st.supply = v as u64;
+        }
+        for (id, change) in &d.tokens {
+            let v = *self.tokens.get(id).unwrap_or(&0) as i128 + change;
+            if v < 0 || v > u64::MAX as i128 {
+                return Err(Error::Sync(format!("negative token balance for {} ({id})", self.address)));
+            }
+            if v == 0 {
+                self.tokens.remove(id);
+            } else {
+                self.tokens.insert(id.clone(), v as u64);
+            }
+        }
+        for id in &d.sobjects_removed {
+            self.sobjects.remove(id);
+        }
+        for id in &d.tokens_removed {
+            self.tokens_issued.remove(id);
+        }
+        for (id, rec) in &d.sobjects {
+            self.sobjects.insert(id.clone(), rec.clone());
         }
         Ok(())
     }
@@ -224,11 +341,26 @@ struct WalletDelta {
     locks_added: Vec<LockRecord>,
     locks_removed: Vec<String>,
     multi_signature: Option<MultiSignatureAsset>,
-    /// Entity records written by this block (register / update / resign), keyed by registration id.
-    entities: Vec<(String, EntityRecord)>,
+    /// sObject records written by this block (register / update / resign), keyed by registration id.
+    sobjects: Vec<(String, SmartObject)>,
+    /// sObjects / token registries handed over to another wallet (sObject transfer).
+    sobjects_removed: Vec<String>,
+    tokens_removed: Vec<String>,
+    /// sObject ownership changes to index: id → new owner.
+    sobj_owner: Vec<(String, String)>,
+    pq_commitment: Option<crate::crypto::pq::PqCommitment>,
+    pq_key: Option<crate::crypto::pq::PqKey>,
+    /// tokenId → balance change.
+    tokens: BTreeMap<String, i128>,
+    /// TokenInit by this wallet.
+    tokens_issued: Vec<(String, TokenState)>,
+    /// tokenId → supply change (applied to the owner wallet's registry entry).
+    token_supply: BTreeMap<String, i128>,
+    /// TokenMeta by the owner (applied to its registry entry).
+    token_meta: Vec<(String, crate::models::TokenMeta)>,
 }
 
-fn entity_name_key(name: &str, type_: u8) -> String {
+fn sobj_name_key(name: &str, type_: u8) -> String {
     format!("{}-{}", name.to_lowercase(), type_)
 }
 
@@ -286,6 +418,14 @@ fn tx_addresses(tx: &Transaction, network: u8) -> Result<Vec<String>> {
     }
     if let Some(payments) = tx.asset.as_ref().and_then(|a| a.payments.as_ref()) {
         out.extend(payments.iter().map(|p| p.recipient_id.clone()));
+    }
+    // token recipients (transfer items, mint) and the new owner of a transferred sObject see the transaction in their history
+    if let Some(a) = tx.token_asset() {
+        out.extend(a.transfers.iter().flatten().map(|t| t.recipient_id.clone()));
+        out.extend(a.recipient_id.clone());
+    }
+    if let Some(e) = tx.sobj_asset() {
+        out.extend(e.recipient_id.clone());
     }
     out.sort();
     out.dedup();
@@ -667,6 +807,12 @@ impl Storage {
             if let Some(u) = &state.username {
                 t.insert(prefixed(PREFIX_WALLET_USERNAME, u), address.as_bytes())?;
             }
+            if let Some(c) = &state.pq_commitment {
+                t.insert(prefixed(PREFIX_PQ_COMMIT, address), &[c.algorithm][..])?;
+            }
+            if let Some(k) = &state.pq_key {
+                t.insert(prefixed(PREFIX_PQ_KEY, address), &[k.algorithm][..])?;
+            }
             for id in &delta.locks_removed {
                 t.remove(prefixed(PREFIX_LOCK, id))?;
             }
@@ -674,44 +820,122 @@ impl Storage {
                 let json = serde_json::to_vec(l).map_err(Error::Json).or_else(abort)?;
                 t.insert(prefixed(PREFIX_LOCK, &l.lock_id), json)?;
             }
-            for (id, rec) in &delta.entities {
+            for (id, rec) in &delta.sobjects {
                 if let Some(name) = &rec.data.name {
-                    t.insert(prefixed(PREFIX_ENTITY_NAME, &entity_name_key(name, rec.type_)), id.as_bytes())?;
+                    t.insert(prefixed(PREFIX_SOBJ_NAME, &sobj_name_key(name, rec.type_)), id.as_bytes())?;
                 }
+                // market index follows the record: open order → owner, otherwise gone
+                if rec.price.is_some() && !rec.resigned {
+                    t.insert(prefixed(PREFIX_MARKET, id), address.as_bytes())?;
+                } else {
+                    t.remove(prefixed(PREFIX_MARKET, id))?;
+                }
+            }
+            for (id, st) in &delta.tokens_issued {
+                t.insert(prefixed(PREFIX_TOKEN_OWNER, id), address.as_bytes())?;
+                t.insert(prefixed(PREFIX_TOKEN_SYMBOL, &st.symbol), id.as_bytes())?;
+            }
+            for (id, owner) in &delta.sobj_owner {
+                t.insert(prefixed(PREFIX_SOBJ_OWNER, id), owner.as_bytes())?;
             }
             out.push(state);
         }
         Ok(out)
     }
 
-    // ------------------------------------------------------- entities (AIP-36)
+    // ------------------------------------------------------- native tokens
+    pub fn token_owner(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.tree.get(prefixed(PREFIX_TOKEN_OWNER, id))?.map(|v| String::from_utf8_lossy(&v).into_owned()))
+    }
 
-    /// Registration id holding `name` for entity `type_` (network-wide unique, case-insensitive).
-    pub fn entity_by_name(&self, name: &str, type_: u8) -> Result<Option<String>> {
+    pub fn token_id_by_symbol(&self, symbol: &str) -> Result<Option<String>> {
+        Ok(self.tree.get(prefixed(PREFIX_TOKEN_SYMBOL, symbol))?.map(|v| String::from_utf8_lossy(&v).into_owned()))
+    }
+
+    pub fn token_state(&self, id: &str) -> Result<Option<TokenState>> {
+        let Some(owner) = self.token_owner(id)? else { return Ok(None) };
+        Ok(self.get_wallet(&owner)?.and_then(|w| w.tokens_issued.get(id).cloned()))
+    }
+
+    /// All initialized tokens (scans the `tk:` index; one wallet read per token).
+    pub fn all_tokens(&self) -> Result<Vec<(String, TokenState)>> {
+        let mut out = Vec::new();
+        for item in self.tree.scan_prefix(PREFIX_TOKEN_OWNER) {
+            let (k, _) = item?;
+            let id = String::from_utf8_lossy(&k[PREFIX_TOKEN_OWNER.len()..]).into_owned();
+            if let Some(st) = self.token_state(&id)? {
+                out.push((id, st));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Holders of a token (full wallet scan — fine for the API, not for consensus).
+    pub fn token_holders(&self, id: &str) -> Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        for item in self.tree.scan_prefix(PREFIX_WALLET) {
+            let (_, v) = item?;
+            let w: WalletState = serde_json::from_slice(&v)?;
+            if let Some(b) = w.tokens.get(id) {
+                out.push((w.address.clone(), *b));
+            }
+        }
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
+    // ------------------------------------------------------- smart objects (sObjects)
+
+    /// Registration id holding `name` for sObject `type_` (network-wide unique, case-insensitive).
+    pub fn sobj_by_name(&self, name: &str, type_: u8) -> Result<Option<String>> {
         Ok(self
             .tree
-            .get(prefixed(PREFIX_ENTITY_NAME, &entity_name_key(name, type_)))?
+            .get(prefixed(PREFIX_SOBJ_NAME, &sobj_name_key(name, type_)))?
             .map(|v| String::from_utf8_lossy(&v).into_owned()))
     }
 
-    /// Entity record + owner address by registration id.
-    pub fn get_entity(&self, registration_id: &str) -> Result<Option<(String, EntityRecord)>> {
-        let Some(tx) = self.get_transaction(registration_id)? else { return Ok(None) };
-        let owner = address_from_public_key(&tx.sender_public_key, self.network.pubkey_hash)?;
-        Ok(self.get_wallet(&owner)?.and_then(|w| w.entities.get(registration_id).map(|r| (owner.clone(), r.clone()))))
+    /// sObject record + owner address by registration id.
+    pub fn get_sobject(&self, registration_id: &str) -> Result<Option<(String, SmartObject)>> {
+        let owner = match self.tree.get(prefixed(PREFIX_SOBJ_OWNER, registration_id))? {
+            Some(v) => String::from_utf8_lossy(&v).into_owned(),
+            None => {
+                let Some(tx) = self.get_transaction(registration_id)? else { return Ok(None) };
+                address_from_public_key(&tx.sender_public_key, self.network.pubkey_hash)?
+            }
+        };
+        Ok(self.get_wallet(&owner)?.and_then(|w| w.sobjects.get(registration_id).map(|r| (owner.clone(), r.clone()))))
     }
 
-    /// All entities (registration id, owner, record), registration order not guaranteed.
-    pub fn all_entities(&self) -> Result<Vec<(String, String, EntityRecord)>> {
+    /// All sObjects (registration id, owner, record), registration order not guaranteed.
+    pub fn all_sobjects(&self) -> Result<Vec<(String, String, SmartObject)>> {
         let mut out = Vec::new();
-        for item in self.tree.scan_prefix(PREFIX_ENTITY_NAME) {
+        for item in self.tree.scan_prefix(PREFIX_SOBJ_NAME) {
             let (_, v) = item?;
             let id = String::from_utf8_lossy(&v).into_owned();
-            if let Some((owner, rec)) = self.get_entity(&id)? {
+            if let Some((owner, rec)) = self.get_sobject(&id)? {
                 out.push((id, owner, rec));
             }
         }
         Ok(out)
+    }
+
+    /// Open sale orders: (registrationId, owner, record), oldest registration first — `offset`/`limit` paginate the index scan.
+    pub fn market_orders(&self, offset: usize, limit: usize) -> Result<(Vec<(String, String, SmartObject)>, usize)> {
+        let mut out = Vec::new();
+        let mut total = 0usize;
+        for item in self.tree.scan_prefix(PREFIX_MARKET) {
+            let (k, v) = item?;
+            total += 1;
+            if total <= offset || out.len() >= limit {
+                continue;
+            }
+            let id = String::from_utf8_lossy(&k[PREFIX_MARKET.len()..]).into_owned();
+            let owner = String::from_utf8_lossy(&v).into_owned();
+            if let Some(rec) = self.get_wallet(&owner)?.and_then(|w| w.sobjects.get(&id).cloned()) {
+                out.push((id, owner, rec));
+            }
+        }
+        Ok((out, total))
     }
 
     // ------------------------------------------------------- locks / rounds / ranking
@@ -819,11 +1043,96 @@ impl Storage {
     }
 
     /// Top `count` active (non-resigned) delegates — the forging set of the next round.
+    /// Wallets that published a Quantum Shield commitment (stage A).
+    pub fn pq_commitment_count(&self) -> usize {
+        self.tree.scan_prefix(PREFIX_PQ_COMMIT).count()
+    }
+
+    /// Wallets protected by a registered PQ key (stage B).
+    pub fn pq_key_count(&self) -> usize {
+        self.tree.scan_prefix(PREFIX_PQ_KEY).count()
+    }
+
+    pub fn put_finality_cert(&self, cert: &FinalityCert) -> Result<()> {
+        let mut k = PREFIX_FINALITY.to_vec();
+        k.extend_from_slice(&cert.height.to_be_bytes());
+        self.tree.insert(k, serde_json::to_vec(cert)?)?;
+        Ok(())
+    }
+
+    pub fn finality_cert(&self, height: u64) -> Result<Option<FinalityCert>> {
+        let mut k = PREFIX_FINALITY.to_vec();
+        k.extend_from_slice(&height.to_be_bytes());
+        Ok(self.tree.get(k)?.map(|v| serde_json::from_slice(&v)).transpose()?)
+    }
+
+    fn equivocation_prefix(public_key: &str) -> Vec<u8> {
+        let mut k = PREFIX_EQUIVOCATION.to_vec();
+        k.extend_from_slice(public_key.as_bytes());
+        k.push(b':');
+        k
+    }
+
+    pub fn put_equivocation(&self, proof: &EquivocationProof) -> Result<()> {
+        let mut k = Self::equivocation_prefix(&proof.public_key);
+        k.extend_from_slice(&proof.height.to_be_bytes());
+        self.tree.insert(k, serde_json::to_vec(proof)?)?;
+        Ok(())
+    }
+
+    /// Latest (highest height) proof against `public_key`.
+    pub fn equivocation(&self, public_key: &str) -> Result<Option<EquivocationProof>> {
+        match self.tree.scan_prefix(Self::equivocation_prefix(public_key)).next_back() {
+            Some(r) => Ok(Some(serde_json::from_slice(&r?.1)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every proof against `public_key`, oldest first.
+    pub fn equivocation_history(&self, public_key: &str) -> Result<Vec<EquivocationProof>> {
+        self.tree.scan_prefix(Self::equivocation_prefix(public_key)).map(|r| Ok(serde_json::from_slice(&r?.1)?)).collect()
+    }
+
+    /// All proofs of all delegates (history), oldest first per delegate.
+    pub fn equivocations(&self) -> Result<Vec<EquivocationProof>> {
+        self.tree.scan_prefix(PREFIX_EQUIVOCATION).map(|r| Ok(serde_json::from_slice(&r?.1)?)).collect()
+    }
+
+    /// Delegates excluded from `round` by a proven equivocation (empty unless milestone `finality.slashing`).
+    pub fn banned_delegates(&self, round: u64, height: u64) -> Result<Vec<String>> {
+        if !self.network.milestone(height.max(1)).finality.slashing {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<String> = self.equivocations()?.into_iter().filter(|p| p.banned_until_round > round).map(|p| p.public_key).collect();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Highest certificate held by this node (`fc:` keys are big-endian heights).
+    pub fn latest_finality_cert(&self) -> Result<Option<FinalityCert>> {
+        match self.tree.scan_prefix(PREFIX_FINALITY).next_back() {
+            Some(r) => Ok(Some(serde_json::from_slice(&r?.1)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Top `count` delegates by vote for the round that starts after the current tip (slashed ones skipped, SHIP-35).
     pub fn active_delegates(&self, count: usize) -> Result<Vec<DelegateRank>> {
+        let next = self.get_last_height()? + 1;
+        let round = crate::delegate::round::round_info(next, self.network.milestone(next).active_delegates as u64).round;
+        self.active_delegates_excluding(count, &self.banned_delegates(round, next)?)
+    }
+
+    /// Top `count` by vote ignoring slashing (who *would* be active — used to judge equivocation proofs about banned keys).
+    pub fn active_delegates_ranked(&self, count: usize) -> Result<Vec<DelegateRank>> {
+        self.active_delegates_excluding(count, &[])
+    }
+
+    fn active_delegates_excluding(&self, count: usize, banned: &[String]) -> Result<Vec<DelegateRank>> {
         Ok(self
             .delegate_ranking()?
             .into_iter()
-            .filter(|(w, _)| !w.resigned)
+            .filter(|(w, _)| !w.resigned && !w.public_key.as_deref().is_some_and(|pk| banned.iter().any(|b| b == pk)))
             .take(count)
             .map(|(w, votes)| DelegateRank { public_key: w.public_key.unwrap_or_default(), votes })
             .collect())
@@ -914,12 +1223,36 @@ impl Storage {
         if height <= 1 {
             return Err(Error::Sync("cannot roll back the genesis block".into()));
         }
+        // SHIP-35: a certified block is final — hard mode refuses, soft mode only warns (legacy majority may still fork)
+        if let Some(cert) = self.latest_finality_cert()?.filter(|c| c.height >= height) {
+            if self.network.milestone(height).finality.active {
+                return Err(Error::Sync(format!("FinalityViolation: block {height} is final (certificate at {} with {} votes), refusing to roll back", cert.height, cert.votes.len())));
+            }
+            tracing::warn!(height, certified = cert.height, votes = cert.votes.len(), "rolling back a FINAL block (finality soft mode) — the network forked past a certificate");
+            let mut k = PREFIX_FINALITY.to_vec();
+            k.extend_from_slice(&cert.height.to_be_bytes());
+            self.tree.remove(k)?;
+        }
         let block = self.get_block_by_height(height)?.ok_or_else(|| Error::NotFound(format!("block {height}")))?;
         let undo_raw = self.tree.get(undo_key(height))?.ok_or_else(|| Error::Sync(format!("no undo record for block {height}")))?;
         let undo: UndoRecord = serde_json::from_slice(&undo_raw)?;
         let net = self.network.pubkey_hash;
+        // `tks:<SYMBOL>` → tokenId entries, to drop the symbol index of a rolled-back TokenInit
+        let token_symbol_keys: Vec<(Vec<u8>, String)> = if block.transactions.iter().any(|t| t.type_group == crate::models::TYPE_GROUP_TOKEN) {
+            self.tree.scan_prefix(PREFIX_TOKEN_SYMBOL).filter_map(|r| r.ok()).map(|(k, v)| (k.to_vec(), String::from_utf8_lossy(&v).into_owned())).collect()
+        } else {
+            Vec::new()
+        };
         self.tree
             .transaction(|t| {
+                for (address, _) in &undo {
+                    if let Some(v) = t.get(prefixed(PREFIX_WALLET, address))? {
+                        let cur: WalletState = serde_json::from_slice(&v).map_err(Error::Json).or_else(abort)?;
+                        for id in cur.sobjects.keys() {
+                            t.remove(prefixed(PREFIX_MARKET, id))?;
+                        }
+                    }
+                }
                 for (address, previous) in &undo {
                     let key = prefixed(PREFIX_WALLET, address);
                     let current: Option<WalletState> = match t.get(&key)? {
@@ -927,9 +1260,21 @@ impl Storage {
                         None => None,
                     };
                     Self::adjust_votes(t, vote_weight(current.as_ref()), vote_weight(previous.as_ref()))?;
+                    // mk: index follows the wallets' sObject records (removals for every touched wallet ran first)
+                    for (id, rec) in previous.iter().flat_map(|w| w.sobjects.iter()) {
+                        if rec.price.is_some() && !rec.resigned {
+                            t.insert(prefixed(PREFIX_MARKET, id), address.as_bytes())?;
+                        }
+                    }
                     // lk: index follows the wallets' lock maps
                     for id in current.iter().flat_map(|w| w.locks.keys()) {
                         t.remove(prefixed(PREFIX_LOCK, id))?;
+                    }
+                    if current.as_ref().is_some_and(|c| c.pq_commitment.is_some()) && !previous.as_ref().is_some_and(|p| p.pq_commitment.is_some()) {
+                        t.remove(prefixed(PREFIX_PQ_COMMIT, address))?;
+                    }
+                    if current.as_ref().is_some_and(|c| c.pq_key.is_some()) && !previous.as_ref().is_some_and(|p| p.pq_key.is_some()) {
+                        t.remove(prefixed(PREFIX_PQ_KEY, address))?;
                     }
                     match previous {
                         Some(w) => {
@@ -951,11 +1296,38 @@ impl Storage {
                         }
                     }
                 }
+                // sObject → owner before this block (from the undo snapshot); covers transfer, buy and chains within the block
+                let mut prev_owner: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                for (address, previous) in &undo {
+                    for id in previous.iter().flat_map(|w| w.sobjects.keys()) {
+                        prev_owner.insert(id.clone(), address.clone());
+                    }
+                }
                 for (seq, tx) in block.transactions.iter().enumerate() {
                     let Some(id) = &tx.id else { continue };
-                    if let Some(e) = tx.entity_asset().filter(|e| e.action == crate::models::entity::ACTION_REGISTER) {
+                    if let Some(e) = tx.sobj_asset().filter(|e| e.action == crate::models::sobj::ACTION_REGISTER) {
                         if let Some(name) = &e.data.name {
-                            t.remove(prefixed(PREFIX_ENTITY_NAME, &entity_name_key(name, e.type_)))?;
+                            t.remove(prefixed(PREFIX_SOBJ_NAME, &sobj_name_key(name, e.type_)))?;
+                        }
+                    }
+                    if let Some(e) = tx.sobj_asset().filter(|e| matches!(e.action, crate::models::sobj::ACTION_TRANSFER | crate::models::sobj::ACTION_BUY)) {
+                        if let Some(reg) = e.registration_id.as_ref() {
+                            let owner = match prev_owner.get(reg) {
+                                Some(o) => o.clone(),
+                                None => address_from_public_key(&tx.sender_public_key, net).or_else(abort)?,
+                            };
+                            t.insert(prefixed(PREFIX_SOBJ_OWNER, reg), owner.as_bytes())?;
+                            if t.get(prefixed(PREFIX_TOKEN_OWNER, reg))?.is_some() {
+                                t.insert(prefixed(PREFIX_TOKEN_OWNER, reg), owner.as_bytes())?;
+                            }
+                        }
+                    }
+                    if tx.type_group == crate::models::TYPE_GROUP_TOKEN && tx.type_ == crate::models::token::INIT {
+                        if let Some(a) = tx.token_asset() {
+                            t.remove(prefixed(PREFIX_TOKEN_OWNER, &a.id))?;
+                            for (k, _) in token_symbol_keys.iter().filter(|(_, id)| *id == a.id) {
+                                t.remove(k.as_slice())?;
+                            }
                         }
                     }
                     t.remove(prefixed(PREFIX_TX, id))?;
@@ -1005,9 +1377,19 @@ impl Storage {
         let net = self.network.pubkey_hash;
 
         let generator = address_from_public_key(&block.generator_public_key, net)?;
+        let ms = self.network.milestone(block.height);
+        let init_count = block.transactions.iter().filter(|t| t.type_group == crate::models::TYPE_GROUP_TOKEN && t.type_ == crate::models::token::INIT).count() as u64;
+        let burned = if init_count > 0 && !self.network.burn_address.is_empty() {
+            init_count * ms.token_fees.init_burn()
+        } else {
+            0
+        };
+        if burned > 0 {
+            deltas.entry(self.network.burn_address.clone()).or_default().balance += burned as i128;
+        }
         {
             let d = deltas.entry(generator).or_default();
-            d.balance += block.reward as i128 + block.total_fee as i128;
+            d.balance += block.reward as i128 + block.total_fee as i128 - burned as i128;
             d.public_key = Some(block.generator_public_key.clone());
             d.produced_blocks += 1;
             d.forged_fees += block.total_fee;
@@ -1027,11 +1409,58 @@ impl Storage {
                 d.nonce += 1;
                 d.public_key = Some(tx.sender_public_key.clone());
             }
-            if let Some(e) = tx.entity_asset() {
-                let (Some(id), Some(existing)) = (tx.id.as_ref(), Some(deltas.get(&sender).map(|d| d.entities.clone()).unwrap_or_default())) else { continue };
+            if let Some(e) = tx.sobj_asset() {
+                let (Some(id), Some(existing)) = (tx.id.as_ref(), Some(deltas.get(&sender).map(|d| d.sobjects.clone()).unwrap_or_default())) else { continue };
+                if matches!(e.action, crate::models::sobj::ACTION_TRANSFER | crate::models::sobj::ACTION_BUY) {
+                    let Some(reg_id) = e.registration_id.clone() else { continue };
+                    let buy = e.action == crate::models::sobj::ACTION_BUY;
+                    // current owner: pending insert in this block wins over storage
+                    let pending_owner = deltas.iter().find(|(_, d)| d.sobjects.iter().any(|(k, _)| *k == reg_id)).map(|(o, _)| o.clone());
+                    let (from, to) = if buy {
+                        let Some(owner) = pending_owner.clone().or_else(|| self.get_sobject(&reg_id).ok().flatten().map(|(o, _)| o)) else { continue };
+                        (owner, sender.clone())
+                    } else {
+                        let Some(to) = e.recipient_id.clone() else { continue };
+                        (sender.clone(), to)
+                    };
+                    let rec = deltas
+                        .get(&from)
+                        .and_then(|d| d.sobjects.iter().rev().find(|(k, _)| *k == reg_id).map(|(_, r)| r.clone()))
+                        .or_else(|| self.get_wallet(&from).ok().flatten().and_then(|w| w.sobjects.get(&reg_id).cloned()));
+                    let Some(mut rec) = rec else { continue };
+                    if buy {
+                        let price = rec.price.unwrap_or(0) as i128;
+                        deltas.entry(sender.clone()).or_default().balance -= price;
+                        deltas.entry(from.clone()).or_default().balance += price;
+                    }
+                    rec.price = None;
+                    let token = deltas
+                        .get(&from)
+                        .and_then(|d| d.tokens_issued.iter().rev().find(|(k, _)| *k == reg_id).map(|(_, s)| s.clone()))
+                        .or_else(|| self.token_state(&reg_id).ok().flatten());
+                    {
+                        // received earlier in this block and handed over again: drop the pending insert so removal wins
+                        let d = deltas.entry(from.clone()).or_default();
+                        d.sobjects.retain(|(k, _)| *k != reg_id);
+                        d.tokens_issued.retain(|(k, _)| *k != reg_id);
+                        d.sobj_owner.retain(|(k, _)| *k != reg_id);
+                        d.sobjects_removed.push(reg_id.clone());
+                        if token.is_some() {
+                            d.tokens_removed.push(reg_id.clone());
+                        }
+                    }
+                    let d = deltas.entry(to.clone()).or_default();
+                    d.sobjects.push((reg_id.clone(), rec));
+                    d.sobj_owner.push((reg_id.clone(), to.clone()));
+                    if let Some(mut st) = token {
+                        st.owner = to.clone();
+                        d.tokens_issued.push((reg_id, st));
+                    }
+                    continue;
+                }
                 let record = match e.action {
-                    crate::models::entity::ACTION_REGISTER => {
-                        (id.clone(), EntityRecord { type_: e.type_, sub_type: e.sub_type, data: e.data.clone(), resigned: false })
+                    crate::models::sobj::ACTION_REGISTER => {
+                        (id.clone(), SmartObject { type_: e.type_, sub_type: e.sub_type, data: e.data.clone(), resigned: false, price: None })
                     }
                     _ => {
                         let Some(reg_id) = e.registration_id.clone() else { continue };
@@ -1040,17 +1469,53 @@ impl Storage {
                             .rev()
                             .find(|(k, _)| *k == reg_id)
                             .map(|(_, r)| r.clone())
-                            .or_else(|| self.get_wallet(&sender).ok().flatten().and_then(|w| w.entities.get(&reg_id).cloned()));
+                            .or_else(|| self.get_wallet(&sender).ok().flatten().and_then(|w| w.sobjects.get(&reg_id).cloned()));
                         let Some(mut rec) = current else { continue };
-                        if e.action == crate::models::entity::ACTION_UPDATE {
-                            rec.data.ipfs_data = e.data.ipfs_data.clone();
-                        } else {
-                            rec.resigned = true;
+                        match e.action {
+                            crate::models::sobj::ACTION_UPDATE => rec.data.ntfry_data = e.data.ntfry_data.clone(),
+                            crate::models::sobj::ACTION_SELL => rec.price = e.price.filter(|p| *p > 0),
+                            _ => rec.resigned = true,
                         }
                         (reg_id, rec)
                     }
                 };
-                deltas.entry(sender.clone()).or_default().entities.push(record);
+                deltas.entry(sender.clone()).or_default().sobjects.push(record);
+                continue;
+            }
+            if let Some(a) = tx.token_asset() {
+                use crate::models::token;
+                match tx.type_ {
+                    token::INIT => {
+                        let symbol = self.get_sobject(&a.id)?.and_then(|(_, rec)| rec.data.name).unwrap_or_default();
+                        let init = a.initial_supply.unwrap_or(0);
+                        let st = TokenState { symbol, decimals: a.decimals.unwrap_or(0), flags: a.flags.unwrap_or(0), supply: init, supply_cap: a.supply_cap.unwrap_or(0), owner: sender.clone(), init_height: block.height, meta: None };
+                        let d = deltas.entry(sender.clone()).or_default();
+                        d.tokens_issued.push((a.id.clone(), st));
+                        *d.tokens.entry(a.id.clone()).or_default() += init as i128;
+                    }
+                    token::TRANSFER => {
+                        for it in a.transfers.unwrap_or_default() {
+                            *deltas.entry(sender.clone()).or_default().tokens.entry(a.id.clone()).or_default() -= it.amount as i128;
+                            *deltas.entry(it.recipient_id).or_default().tokens.entry(a.id.clone()).or_default() += it.amount as i128;
+                        }
+                    }
+                    token::MINT => {
+                        let amount = a.amount.unwrap_or(0) as i128;
+                        *deltas.entry(a.recipient_id.clone().unwrap_or_default()).or_default().tokens.entry(a.id.clone()).or_default() += amount;
+                        *deltas.entry(sender.clone()).or_default().token_supply.entry(a.id.clone()).or_default() += amount;
+                    }
+                    token::META => {
+                        if let Some(m) = a.meta {
+                            deltas.entry(sender.clone()).or_default().token_meta.push((a.id.clone(), m));
+                        }
+                    }
+                    _ => {
+                        let amount = a.amount.unwrap_or(0) as i128;
+                        *deltas.entry(sender.clone()).or_default().tokens.entry(a.id.clone()).or_default() -= amount;
+                        let owner = self.token_owner(&a.id)?.or_else(|| deltas.iter().find(|(_, d)| d.tokens_issued.iter().any(|(id, _)| *id == a.id)).map(|(o, _)| o.clone())).unwrap_or_else(|| sender.clone());
+                        *deltas.entry(owner).or_default().token_supply.entry(a.id.clone()).or_default() -= amount;
+                    }
+                }
                 continue;
             }
             if tx.type_group != crate::models::TYPE_GROUP_CORE {
@@ -1060,6 +1525,13 @@ impl Storage {
                 tx_type::TRANSFER => {
                     if let Some(r) = &tx.recipient_id {
                         deltas.entry(r.clone()).or_default().balance += tx.amount as i128;
+                        // Quantum Shield stage A: self-transfer carrying `sthpq1:<alg>:<sha256(pk)>`
+                        if *r == sender && tx.amount >= 1 {
+                            if let Some((algorithm, commitment)) = tx.vendor_field.as_deref().and_then(crate::crypto::pq::parse_commitment) {
+                                deltas.entry(sender.clone()).or_default().pq_commitment =
+                                    Some(crate::crypto::pq::PqCommitment { algorithm, commitment, height: block.height });
+                            }
+                        }
                     }
                 }
                 tx_type::MULTI_PAYMENT => {
@@ -1083,7 +1555,12 @@ impl Storage {
                 }
                 tx_type::SECOND_SIGNATURE => {
                     if let Some(sig) = tx.asset.as_ref().and_then(|a| a.signature.as_ref()) {
-                        deltas.entry(sender.clone()).or_default().second_public_key = Some(sig.public_key.clone());
+                        if tx.is_pq() {
+                            deltas.entry(sender.clone()).or_default().pq_key =
+                                Some(crate::crypto::pq::PqKey { algorithm: sig.algorithm.unwrap_or(crate::crypto::pq::ALG_ML_DSA_44), public_key: sig.public_key.clone(), since: block.height });
+                        } else {
+                            deltas.entry(sender.clone()).or_default().second_public_key = Some(sig.public_key.clone());
+                        }
                     }
                 }
                 tx_type::DELEGATE_RESIGNATION => {

@@ -45,7 +45,7 @@ fn human_time_matches_legacy_format() {
 
 #[tokio::test]
 async fn blockchain_blocks_and_transactions_have_legacy_shape() {
-    let (base, _s) = spawn_api().await;
+    let (base, storage) = spawn_api().await;
 
     let (st, v) = get(&base, "/api/blockchain").await;
     assert_eq!(st, 200);
@@ -58,6 +58,17 @@ async fn blockchain_blocks_and_transactions_have_legacy_shape() {
     assert_eq!(b["forged"]["fee"], "100000000");
     assert_eq!(b["forged"]["total"], "100000000");
     assert_eq!(b["generator"]["address"], "SXsQxVCEux4kkRFNrQJiQg6JT9K6SKLgS7");
+    assert_eq!(b["finalized"], false, "no SHIP-35 certificate yet");
+    let (_, f) = get(&base, "/api/ntfry/finality").await;
+    assert_eq!(f["data"]["enabled"], false);
+    assert_eq!(f["data"]["quorum"], 15, "⌊2·21/3⌋+1");
+    storage.put_finality_cert(&sth_core::storage::FinalityCert { height: 11704043, block_id: b["id"].as_str().unwrap().to_string(), votes: Default::default() }).unwrap();
+    let (_, v) = get(&base, "/api/blocks/11704043").await;
+    assert_eq!(v["data"]["finalized"], true);
+    let (_, v) = get(&base, "/api/blocks/last").await;
+    assert_eq!(v["data"]["finalized"], true);
+    let (_, f) = get(&base, "/api/ntfry/finality").await;
+    assert_eq!(f["data"]["finalizedHeight"], 11704043);
     assert_eq!(b["confirmations"], 0);
     assert_eq!(b["transactions"], 1);
     assert_eq!(b["timestamp"]["unix"], 1788368656);
@@ -225,6 +236,13 @@ async fn legacy_compat_endpoints() {
     assert_eq!(crypto["data"]["genesisBlock"]["transactions"].as_array().unwrap().len(), 1855);
     let (_, cfg) = get(&base, "/api/node/configuration").await;
     assert_eq!(cfg["data"]["constants"]["fees"]["staticFees"]["delegateRegistration"], 1_000_000_000_000u64);
+    assert_eq!(cfg["data"]["transactionPool"]["dynamicFees"]["enabled"], true);
+    for k in ["ship11", "ship11Blocks", "aip11", "aip37"] {
+        assert_eq!(cfg["data"]["constants"][k], true, "{k}: SHIP keys and historical aliases are both reported");
+    }
+    assert_eq!(cfg["data"]["constants"]["ship13"], cfg["data"]["constants"]["aip36"], "sObjects activate at 11 800 000 — same answer under both names");
+    assert_eq!(cfg["data"]["transactionPool"]["dynamicFees"]["minFeePool"], 3000);
+    assert_eq!(cfg["data"]["transactionPool"]["dynamicFees"]["addonBytes"]["transfer"], 100);
     assert_eq!(cfg["data"]["constants"]["blockBurnAddress"], true);
     let (_, fees) = get(&base, "/api/transactions/fees").await;
     assert_eq!(fees["data"]["1"]["transfer"], "100000000");
@@ -244,9 +262,9 @@ async fn legacy_compat_endpoints() {
     assert_eq!(locks["meta"]["totalCount"], 0);
     let (code, _) = get(&base, "/api/locks/deadbeef").await;
     assert_eq!(code, 404);
-    let (_, ent) = get(&base, "/api/entities").await;
+    let (_, ent) = get(&base, "/api/sobj").await;
     assert_eq!(ent["data"].as_array().unwrap().len(), 0);
-    let (code, _) = get(&base, "/api/entities/x").await;
+    let (code, _) = get(&base, "/api/sobj/x").await;
     assert_eq!(code, 404);
     let (code, _) = get(&base, "/api/peers/10.0.0.1").await;
     assert_eq!(code, 404);

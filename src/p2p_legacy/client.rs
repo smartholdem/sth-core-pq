@@ -243,6 +243,7 @@ pub fn decode_blocks(payload: &[u8]) -> Result<Vec<Block>> {
             payload_hash: h.payload_hash,
             generator_public_key: h.generator_public_key,
             block_signature: if h.block_signature.is_empty() { None } else { Some(h.block_signature) },
+            pq_signature: None,
             transactions,
         });
     }

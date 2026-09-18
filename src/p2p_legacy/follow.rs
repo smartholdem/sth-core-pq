@@ -50,6 +50,7 @@ impl std::fmt::Debug for P2pOptions {
 /// Where a block range is pulled from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Source {
+    /// Legacy peer IP; the port is the network's `p2p.legacy_port` (4001 mainnet, 4002 newnet) — see `Legacy` display below.
     Legacy(String),
     Iroh(iroh::EndpointId),
 }
@@ -57,7 +58,7 @@ pub enum Source {
 impl std::fmt::Display for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Source::Legacy(ip) => write!(f, "{ip}:4001"),
+            Source::Legacy(ip) => write!(f, "legacy:{ip}"),
             Source::Iroh(id) => write!(f, "iroh:{}", id.fmt_short()),
         }
     }
@@ -86,7 +87,7 @@ fn tip_of(storage: &Storage) -> Result<ChainTip> {
 }
 
 /// Fetch one range from a peer (fresh connection: legacy peers reset the socket after a large reply).
-async fn fetch_range(table: &PeerTable, ip: &str, from: u64, limit: u32, timeout: Duration) -> Option<Vec<Block>> {
+async fn fetch_range(table: &PeerTable, ip: &str, from: u64, limit: u32, timeout: Duration) -> std::result::Result<Vec<Block>, String> {
     let started = Instant::now();
     let result = async {
         let mut peer = LegacyPeer::connect(ip, table.port(), timeout).await?;
@@ -98,17 +99,17 @@ async fn fetch_range(table: &PeerTable, ip: &str, from: u64, limit: u32, timeout
             let reached = blocks.last().map(|b| b.height);
             tracing::debug!(peer = ip, from, asked = limit, got = blocks.len(), ms = started.elapsed().as_millis() as u64, "getBlocks ok");
             table.record_blocks_success(ip, started.elapsed(), blocks.len(), reached);
-            Some(blocks)
+            Ok(blocks)
         }
         Ok(_) => {
             tracing::debug!(peer = ip, from, "getBlocks returned nothing");
             table.record_blocks_failure(ip);
-            None
+            Err("empty reply".into())
         }
         Err(e) => {
             tracing::debug!(peer = ip, from, error = %e, "getBlocks failed");
             table.record_blocks_failure(ip);
-            None
+            Err(e.to_string())
         }
     }
 }
@@ -140,6 +141,7 @@ struct Fetched {
     to: u64,
     source: Source,
     blocks: Option<Vec<Block>>,
+    error: Option<String>,
 }
 
 /// Candidate sources for a range ending at `need_height`: iroh peers that have it (fastest first),
@@ -211,10 +213,13 @@ async fn worker(
             tokio::time::sleep(Duration::from_millis(150)).await;
             continue;
         };
-        let blocks = match (&source, &iroh) {
-            (Source::Legacy(ip), _) => fetch_range(&table, ip, from, limit, timeout).await,
-            (Source::Iroh(id), Some(node)) => fetch_range_iroh(node, *id, from, limit).await,
-            (Source::Iroh(_), None) => None,
+        let (blocks, error) = match (&source, &iroh) {
+            (Source::Legacy(ip), _) => match fetch_range(&table, ip, from, limit, timeout).await {
+                Ok(b) => (Some(b), None),
+                Err(e) => (None, Some(e)),
+            },
+            (Source::Iroh(id), Some(node)) => (fetch_range_iroh(node, *id, from, limit).await, None),
+            (Source::Iroh(_), None) => (None, None),
         };
         {
             let mut s = sched.lock().unwrap_or_else(|e| e.into_inner());
@@ -222,7 +227,7 @@ async fn worker(
             // legacy nodes drop the socket after a getBlocks reply and refuse the same IP for a moment: space from the reply
             s.last_request.insert(source.clone(), Instant::now());
         }
-        if out.send(Fetched { from, to, source, blocks }).await.is_err() {
+        if out.send(Fetched { from, to, source, blocks, error }).await.is_err() {
             return;
         }
     }
@@ -275,18 +280,44 @@ pub async fn catch_up(storage: Arc<Storage>, table: Arc<PeerTable>, opts: &P2pOp
             }
         }
     };
+    // near the tip keep undo records so a fork (e.g. blocks forged while isolated) can be rolled back
+    storage.set_undo_enabled(target - tip.height <= 2 * crate::storage::UNDO_DEPTH);
+    let mut fork_depth = 1u64;
     let mut failures_in_row = 0u32;
     let result: Result<()> = async {
         loop {
             // apply everything contiguous with the tip
             while let Some((source, blocks)) = pending.remove(&tip.height) {
                 let from = tip.height;
+                let forked = blocks[0].height == tip.height + 1 && tip.id.as_deref().is_some_and(|id| blocks[0].previous_block != id);
+                if forked {
+                    // every peer serves another branch on top of our tip: our last blocks are orphaned
+                    let target = tip.height.saturating_sub(fork_depth).max(1);
+                    let st = storage.clone();
+                    let rolled = tokio::task::spawn_blocking(move || st.rollback_to(target)).await.map_err(|e| Error::Sync(e.to_string()))?;
+                    match rolled {
+                        Ok(h) => tracing::warn!(peer = %source, from = tip.height, to = h, their_previous = blocks[0].previous_block.get(..16).unwrap_or(""), "fork detected during catch-up, rolled back"),
+                        Err(e) => {
+                            tracing::error!(error = %e, height = tip.height, "rollback failed or refused (FinalityViolation = SHIP-35 hard mode protects a final block; otherwise undo records missing — delete the database and resync from snapshot)");
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                        }
+                    }
+                    fork_depth = (fork_depth * 3).min(crate::storage::UNDO_DEPTH);
+                    tip = tip_of(&storage)?;
+                    pb.set_position(tip.height);
+                    pending.clear();
+                    let mut s = sched.lock().unwrap_or_else(|e| e.into_inner());
+                    s.retry.clear();
+                    s.next_from = tip.height;
+                    continue;
+                }
                 match apply(&storage, blocks, tip.clone(), opts.verify).await {
                     Ok(new_tip) => {
                         applied += new_tip.height - tip.height;
                         tip = new_tip;
                         pb.set_position(tip.height);
                         failures_in_row = 0;
+                        fork_depth = 1;
                     }
                     Err(e) => {
                         tracing::warn!(peer = %source, from, error = %e, "peer blocks rejected, re-requesting range");
@@ -329,6 +360,14 @@ pub async fn catch_up(storage: Arc<Storage>, table: Arc<PeerTable>, opts: &P2pOp
                 }
                 _ => {
                     failures_in_row += 1;
+                    // with a handful of peers every failure matters — say why (large networks: debug + re-probe warning)
+                    let few_peers = table.len() <= 3;
+                    let error = f.error.as_deref().unwrap_or(if f.blocks.is_some() { "reply did not start at the requested height" } else { "no reply" });
+                    if few_peers {
+                        tracing::warn!(peer = %f.source, from = f.from, to = f.to, error, "getBlocks failed");
+                    } else {
+                        tracing::debug!(peer = %f.source, from = f.from, to = f.to, error, "getBlocks failed");
+                    }
                     if f.from >= tip.height {
                         sched.lock().unwrap_or_else(|e| e.into_inner()).retry.insert((f.from, f.to));
                     }
@@ -432,18 +471,18 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
                 let rolled = tokio::task::spawn_blocking(move || st.rollback_to(target)).await.map_err(|e| Error::Sync(e.to_string()))?;
                 match rolled {
                     Ok(h) => tracing::warn!(peer = ip, from = tip.height, to = h, "fork detected, rolled back"),
-                    Err(e) => tracing::error!(error = %e, "rollback failed (undo records missing?) — resync from snapshot may be required"),
+                    Err(e) => tracing::error!(error = %e, "rollback failed or refused (FinalityViolation = SHIP-35 hard mode protects a final block; otherwise undo records missing — resync from snapshot may be required)"),
                 }
                 fork_depth = (fork_depth * 3).min(crate::storage::UNDO_DEPTH);
                 break;
             }
             let tx_count: usize = blocks.iter().map(|b| b.transactions.len()).sum();
-            let newest = blocks.last().map(|b| (b.height, b.timestamp));
+            let newest = blocks.last().map(|b| (b.height, b.timestamp, b.generator_public_key.clone()));
             match apply(storage, blocks, tip, opts.verify).await {
                 Ok(new_tip) => {
                     fork_depth = 1;
-                    if let Some((h, ts)) = newest {
-                        crate::intake::record(crate::intake::Source::PullLegacy, &ip, h, ts, &network);
+                    if let Some((h, ts, gen)) = &newest {
+                        crate::intake::record(crate::intake::Source::PullLegacy, &ip, *h, *ts, gen, &network);
                     }
                     if from == to {
                         tracing::info!("Received new block at height {} with {} transactions from {}", group(to), tx_count, ip);

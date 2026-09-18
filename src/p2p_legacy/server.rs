@@ -86,6 +86,11 @@ impl LegacyServer {
     }
 
     async fn dispatch(&self, path: &str, payload: &[u8], remote: SocketAddr) -> (u16, Vec<u8>) {
+        // a node that talks the block protocol to us is a peer candidate (verified by the next status probe);
+        // this is how a private network's first node learns about nodes that dial in
+        if path.starts_with("p2p.blocks.") && self.table.add(&remote.ip().to_string()) {
+            tracing::info!(peer = %remote.ip(), "new legacy peer discovered from inbound connection");
+        }
         let result = match path {
             "p2p.peer.getStatus" => self.get_status(),
             "p2p.peer.getPeers" => self.get_peers(),
@@ -213,10 +218,11 @@ impl LegacyServer {
         let verify = self.verify;
         let txs = block.transactions.len();
         let block_ts = block.timestamp;
+        let generator = block.generator_public_key.clone();
         tokio::task::spawn_blocking(move || apply_blocks(&st, &net, &[block], tip, verify))
             .await
             .map_err(|e| Error::Sync(format!("apply task failed: {e}")))??;
-        crate::intake::record(crate::intake::Source::PushLegacy, remote.ip().to_string(), height, block_ts, self.storage.network());
+        crate::intake::record(crate::intake::Source::PushLegacy, remote.ip().to_string(), height, block_ts, &generator, self.storage.network());
         tracing::info!("Received new block at height {} with {} transactions from {}", crate::delegate::forger::group(height), txs, remote.ip());
         let _ = self.received.send(height);
         self.mempool.prune_confirmed().await;

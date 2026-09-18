@@ -4,7 +4,7 @@
 //! whether one of our delegates owns the slot; if so build, sign, apply and broadcast the block.
 //! Forks are handled by the follow loop (rollback + resync), so the forger only ever extends the tip.
 
-use super::block_builder::{forge_block, select_transactions};
+use super::block_builder::{forge_block_with, select_transactions};
 use super::round::{forging_order, round_info, slot_number, slot_start};
 use crate::crypto::{serialize_block_with_transactions, KeyPair};
 use crate::error::Result;
@@ -30,13 +30,16 @@ pub struct ForgerOptions {
     pub max_lag: u64,
     /// Share (0.0–1.0) of responding peers that must report our exact tip before we forge.
     pub quorum_share: f64,
+    /// Absolute minimum of peers that must agree with our tip (guards against forging alone while
+    /// isolated: one or two of our own iroh nodes echoing our tip is not a network).
+    pub min_quorum_peers: usize,
     /// iroh layer whose peers take part in the quorum next to the legacy ones.
     pub iroh: Option<Arc<crate::p2p_iroh::IrohNode>>,
 }
 
 impl Default for ForgerOptions {
     fn default() -> Self {
-        Self { broadcast_fanout: 6, max_lag: 1, quorum_share: 0.5, iroh: None }
+        Self { broadcast_fanout: 6, max_lag: 1, quorum_share: 0.5, min_quorum_peers: 3, iroh: None }
     }
 }
 
@@ -59,6 +62,9 @@ pub struct DelegateStatus {
     pub address: String,
     pub rank: Option<usize>,
     pub active: bool,
+    /// Stage C readiness: PQ key registered on chain (`pq-register`) and its passphrase configured (`delegate.pq_secrets`).
+    pub pq_registered: bool,
+    pub pq_secret: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -108,6 +114,8 @@ fn now_unix() -> i64 {
 pub struct Forger {
     pub status: Arc<std::sync::Mutex<ForgingStatus>>,
     keys: Vec<KeyPair>,
+    /// ML-DSA-44 keys for hybrid block signatures (matched to a delegate through its on-chain `pq_key`).
+    pq_keys: Vec<crate::crypto::pq::PqKeyPair>,
     storage: Arc<Storage>,
     mempool: Arc<Mempool>,
     peers: Arc<PeerTable>,
@@ -115,9 +123,20 @@ pub struct Forger {
 }
 
 impl Forger {
-    pub fn new(secrets: &[String], storage: Arc<Storage>, mempool: Arc<Mempool>, peers: Arc<PeerTable>, opts: ForgerOptions) -> Result<Self> {
+    pub fn new(secrets: &[String], pq_secrets: &[String], storage: Arc<Storage>, mempool: Arc<Mempool>, peers: Arc<PeerTable>, opts: ForgerOptions) -> Result<Self> {
         let keys = secrets.iter().map(|s| KeyPair::from_passphrase(s)).collect::<Result<Vec<_>>>()?;
-        Ok(Self { status: Default::default(), keys, storage, mempool, peers, opts })
+        let pq_keys = pq_secrets.iter().filter(|s| !s.trim().is_empty()).map(|s| crate::crypto::pq::PqKeyPair::from_passphrase(s)).collect();
+        Ok(Self { status: Default::default(), keys, pq_keys, storage, mempool, peers, opts })
+    }
+
+    /// The configured PQ key that matches the delegate's registered `pq_key`, if any.
+    fn pq_key_for(&self, public_key: &str) -> Option<&crate::crypto::pq::PqKeyPair> {
+        let registered = self.storage.find_wallet(public_key).ok().flatten().and_then(|w| w.pq_key)?;
+        self.pq_keys.iter().find(|k| k.public_key_hex() == registered.public_key)
+    }
+
+    pub fn keys(&self) -> Vec<KeyPair> {
+        self.keys.clone()
     }
 
     pub fn public_keys(&self) -> Vec<String> {
@@ -165,6 +184,10 @@ impl Forger {
             let tip = self.storage.get_last_block().ok().flatten().ok_or("empty database")?;
             let views = self.network_view(8).await;
             if views.is_empty() {
+                // quorum_share 0 = private / single-node network (`init newnet`): forge without peers
+                if self.opts.quorum_share <= 0.0 {
+                    return Ok(tip);
+                }
                 return Err("no legacy peer answered getStatus".into());
             }
             for v in views.iter().filter(|v| !v.ip.starts_with("iroh:")) {
@@ -172,19 +195,28 @@ impl Forger {
             }
             let max_h = views.iter().map(|v| v.height).max().unwrap_or(0);
             let same: usize = views.iter().filter(|v| v.height == tip.height && Some(v.id.as_str()) == tip.id.as_deref()).count();
-            let needed = ((views.len() as f64 * self.opts.quorum_share.clamp(0.0, 1.0)).ceil() as usize).max(1);
+            let needed = ((views.len() as f64 * self.opts.quorum_share.clamp(0.0, 1.0)).ceil() as usize).max(self.opts.min_quorum_peers.max(1));
             if max_h <= tip.height && same >= needed {
                 return Ok(tip);
             }
             if Instant::now() >= deadline {
                 let heights: Vec<String> = views.iter().map(|v| format!("{}={}", v.ip, v.height)).collect();
+                if views.len() < self.opts.min_quorum_peers {
+                    return Err(format!(
+                        "only {} peer(s) reachable [{}], need at least {} agreeing — refusing to forge in isolation",
+                        views.len(),
+                        heights.join(", "),
+                        self.opts.min_quorum_peers
+                    ));
+                }
                 return Err(format!(
-                    "local tip {} ({}) vs peers [{}]: {} of {} peers agree with us",
+                    "local tip {} ({}) vs peers [{}]: {} of {} peers agree with us (need {})",
                     tip.height,
                     tip.id.as_deref().map(|i| &i[..8]).unwrap_or("?"),
                     heights.join(", "),
                     same,
-                    views.len()
+                    views.len(),
+                    needed
                 ));
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -222,7 +254,12 @@ impl Forger {
             let address = k.address(self.storage.network().pubkey_hash).unwrap_or_default();
             let rank = ranking.iter().position(|(w, _)| w.public_key.as_deref() == Some(pk.as_str())).map(|i| i + 1);
             let name = self.name_of(&pk);
-            statuses.push(DelegateStatus { username: name.clone(), public_key: pk.clone(), address: address.clone(), rank, active: rank.is_some_and(|r| r <= n) });
+            let pq_registered = self.storage.find_wallet(&pk).ok().flatten().is_some_and(|w| w.pq_key.is_some());
+            let pq_secret = self.pq_key_for(&pk).is_some();
+            if self.storage.network().pq_blocks_activation_height().is_some() && !pq_secret {
+                tracing::warn!("Delegate {name}: no matching PQ key for hybrid block signatures (pq.blocks) — register one with `sth-cli pq-register` and add its passphrase to delegate.pq_secrets");
+            }
+            statuses.push(DelegateStatus { username: name.clone(), public_key: pk.clone(), address: address.clone(), rank, active: rank.is_some_and(|r| r <= n), pq_registered, pq_secret });
             match rank {
                 Some(r) if r <= n => {
                     tracing::info!("Delegate {name}: address {address}, rank {r} of {n} (active), public key {pk}");
@@ -315,9 +352,22 @@ impl Forger {
             return Ok(());
         }
 
+        // stage C: hybrid signature needs our PQ key matching the delegate's on-chain pq_key; without it v0 is only legal in the grace window
+        let (v1_ok, v0_ok) = network.block_versions_allowed(next_height);
+        let pq = if v1_ok { self.pq_key_for(expected) } else { None };
+        if v1_ok && pq.is_none() {
+            if v0_ok {
+                tracing::warn!("Delegate {name} forges a version-0 block: no PQ key for pq.blocks (grace window still open) — register one before it closes");
+            } else {
+                let reason = "BlockPqKeyMissingError: pq.blocks requires a registered PQ key + delegate.pq_secrets".to_string();
+                tracing::error!("Skipping slot {slot} for delegate {name}: {reason}");
+                self.record_skip(slot, &name, reason);
+                return Ok(());
+            }
+        }
         let pool = self.mempool.all().await;
         let txs = select_transactions(&self.storage, network, pool, next_height)?;
-        let block = forge_block(network, keys, &tip, slot_start(slot, blocktime), txs)?;
+        let block = forge_block_with(network, keys, pq, &tip, slot_start(slot, blocktime), txs)?;
         let chain_tip = ChainTip { height: tip.height, id: tip.id.clone() };
         let st = self.storage.clone();
         let net = network.clone();
@@ -325,15 +375,16 @@ impl Forger {
         tokio::task::spawn_blocking(move || apply_blocks(&st, &net, &[b], chain_tip, true))
             .await
             .map_err(|e| crate::error::Error::Sync(format!("apply task failed: {e}")))??;
-        crate::intake::record(crate::intake::Source::Forged, name.clone(), block.height, block.timestamp, network);
+        crate::intake::record(crate::intake::Source::Forged, name.clone(), block.height, block.timestamp, &block.generator_public_key, network);
         tracing::info!(
-            "Forged new block {} by delegate {} ({}) at height {} with {} transactions (fees {})",
+            "Forged new block {} by delegate {} ({}) at height {} with {} transactions (fees {}){}",
             block.id.as_deref().unwrap_or(""),
             name,
             keys.public_key_hex(),
             group(block.height),
             block.transactions.len(),
-            block.total_fee
+            block.total_fee,
+            if block.pq_signature.is_some() { " · v1 hybrid secp256k1 + ML-DSA-44" } else { "" }
         );
         self.mempool.prune_confirmed().await;
         {

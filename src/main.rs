@@ -5,7 +5,6 @@
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
-use sth_core::config::Network;
 use sth_core::crypto::{verify_block, ChainObject};
 use sth_core::models::Block;
 use sth_core::node::{download_bar, resolve_snapshot, run_import, NodeContext, RunFlags};
@@ -20,12 +19,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
+
 #[derive(Parser)]
 #[command(name = "sth-core", version, about = "SmartHoldem relay node (Rust)")]
 struct Cli {
     /// Sled database directory (default: node.yaml `db_path`, else ./data).
     #[arg(long, global = true)]
     db_path: Option<PathBuf>,
+    /// Configuration file (default: ./node.yaml when present, else built-in mainnet defaults). Its `network` /
+    /// `network_dir` select the chain for every command (`sth-core init newnet` networks included).
+    #[arg(long, global = true, value_name = "node.yaml")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -40,6 +44,12 @@ enum Command {
     ImportBlock { file: PathBuf },
     /// Show a stored wallet.
     Wallet { address: String },
+    /// Roll the local chain back to HEIGHT (needs undo records; stop the node first). Use after a private fork
+    /// when automatic recovery failed; the node re-downloads the blocks from peers on next start.
+    Rollback {
+        #[arg(long)]
+        to: u64,
+    },
     /// Catch up with the network over the legacy REST API (temporary bootstrap; resumable).
     Sync {
         /// Comma-separated node URLs (default: node0..node5.smartholdem.io).
@@ -87,22 +97,18 @@ enum Command {
     },
     /// Initialise a commented `node.yaml` configuration file.
     Init {
-        /// Where to write the configuration.
-        #[arg(long, default_value = DEFAULT_CONFIG_FILE)]
-        config: PathBuf,
         /// Overwrite an existing file.
         #[arg(long)]
         force: bool,
         /// Also export the embedded network files (crypto-networks layout) into ./network.
         #[arg(long)]
         network_files: bool,
+        #[command(subcommand)]
+        newnet: Option<InitCmd>,
     },
     /// Run the relay node from `node.yaml` (CLI flags override the file): optional snapshot bootstrap →
     /// catch up → follow the chain + local REST API.
     Run {
-        /// Configuration file (default: ./node.yaml when present, else built-in defaults).
-        #[arg(long, value_name = "node.yaml")]
-        config: Option<PathBuf>,
         /// Bind address of the local API (env CORE_API_HOST — keep 127.0.0.1, local bridge only).
         #[arg(long, env = "CORE_API_HOST")]
         api_host: Option<String>,
@@ -147,6 +153,8 @@ enum Command {
         #[arg(long)]
         reward_address: Option<String>,
     },
+    /// Build, sign and post a transaction through the local REST API (transfer, sObject, tokens).
+    Tx(sth_core::cli::TxArgs),
     /// Print (creating if needed) the iroh EndpointId of this node — share it as `p2p.iroh.bootstrap` on other nodes.
     IrohId {
         #[arg(long, default_value = "./iroh.key")]
@@ -173,6 +181,52 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum InitCmd {
+    /// Generate a private / test network (mainnet rules from block 1, tokens & PQ off): network files, signed genesis
+    /// with N delegates, their passphrases and node.yaml on separate ports. Nothing touches mainnet.
+    Newnet {
+        #[arg(long, default_value = "./testnet")]
+        out: PathBuf,
+        #[arg(long, default_value = "TSH")]
+        ticker: String,
+        #[arg(long, default_value = "SmartHoldemTestNet")]
+        title: String,
+        #[arg(long, default_value_t = 21)]
+        delegates: u16,
+        /// Address version byte (mainnet 63 = "S…"; 30 = "D…").
+        #[arg(long, default_value_t = 30)]
+        pubkey_hash: u8,
+        #[arg(long, default_value_t = 4002)]
+        p2p_port: u16,
+        #[arg(long, default_value_t = 4004)]
+        api_port: u16,
+        #[arg(long, default_value_t = 4889)]
+        metrics_port: u16,
+        /// Deterministic seed for every key (same seed → same network). Random if omitted.
+        #[arg(long)]
+        seed: Option<String>,
+        /// Activate native tokens at this height (omit = off).
+        #[arg(long)]
+        tokens_at: Option<u64>,
+        /// Activate Quantum Shield stage B (v3 transactions, ML-DSA-44) at this height (omit = off).
+        #[arg(long)]
+        pq_at: Option<u64>,
+        /// Activate Quantum Shield stage C (version-1 blocks with hybrid secp256k1 + ML-DSA-44 signatures, 21-block grace) at this height.
+        #[arg(long)]
+        pq_blocks_at: Option<u64>,
+        /// SHIP-35 hard finality (rollback below a certificate refused, equivocation slashing) from height 1. Default: soft mode.
+        #[arg(long, default_value_t = false)]
+        finality_hard: bool,
+        /// Treasury premine in whole coins.
+        #[arg(long, default_value_t = 100_000_000)]
+        treasury: u64,
+        /// Stake per delegate in whole coins.
+        #[arg(long, default_value_t = 1_000)]
+        delegate_stake: u64,
+    },
+}
+
+#[derive(Subcommand)]
 enum SnapshotCmd {
     /// Download the newest `<start>-<end>.tgz` and extract it.
     Download {
@@ -187,6 +241,9 @@ enum SnapshotCmd {
         /// Skip secp256k1 signature checks (trusted dump).
         #[arg(long)]
         fast_import: bool,
+        /// History audit: also apply the live wallet-aware rules (second signature, smart objects) to every block.
+        #[arg(long, conflicts_with = "fast_import")]
+        strict: bool,
         #[arg(long)]
         quiet: bool,
     },
@@ -215,8 +272,13 @@ async fn main() -> anyhow::Result<()> {
     } else {
         println!("core version {}", env!("CARGO_PKG_VERSION"));
     }
-    let network = Network::mainnet();
-    let db_path: PathBuf = cli.db_path.clone().unwrap_or_else(|| PathBuf::from("./data"));
+    // `init` writes the config, everything else reads it: network files + db path come from node.yaml
+    let base_cfg = match &cli.command {
+        Command::Init { .. } => NodeConfig::default(),
+        _ => NodeConfig::load_or_default(cli.config.as_deref())?,
+    };
+    let network = base_cfg.load_network()?;
+    let db_path: PathBuf = cli.db_path.clone().unwrap_or_else(|| PathBuf::from(&base_cfg.db_path));
 
     match cli.command {
         Command::Info => {
@@ -260,6 +322,17 @@ async fn main() -> anyhow::Result<()> {
             storage.flush()?;
             tracing::info!(height = block.height, "block imported");
         }
+        Command::Rollback { to } => {
+            let storage = Storage::open(&db_path, network)?;
+            let tip = storage.get_last_height()?;
+            if to >= tip {
+                println!("nothing to do: tip {tip}, requested {to}");
+            } else {
+                let reached = storage.rollback_to(to)?;
+                storage.flush()?;
+                println!("rolled back {tip} -> {reached}");
+            }
+        }
         Command::Wallet { address } => {
             let storage = Storage::open(&db_path, network)?;
             match storage.get_wallet(&address)? {
@@ -267,7 +340,20 @@ async fn main() -> anyhow::Result<()> {
                 None => println!("wallet {address} not found"),
             }
         }
-        Command::Init { config, force, network_files } => {
+        Command::Init { newnet: Some(InitCmd::Newnet { out, ticker, title, delegates, pubkey_hash, p2p_port, api_port, metrics_port, seed, tokens_at, pq_at, pq_blocks_at, finality_hard, treasury, delegate_stake }), .. } => {
+            let seed = seed.unwrap_or_else(|| hex::encode(&iroh::SecretKey::generate().to_bytes()[..16]));
+            let opts = sth_core::newnet::NewNetOptions { ticker, title, delegates: delegates.max(1), pubkey_hash, p2p_port, api_port, metrics_port, seed: seed.clone(), tokens_at, pq_at, pq_blocks_at, finality_hard, treasury_supply: treasury * 100_000_000, delegate_stake: delegate_stake * 100_000_000 };
+            let n = sth_core::newnet::generate(&opts, &out)?;
+            println!("new network written to {}", out.display());
+            println!("  nethash     {}", n.nethash);
+            println!("  genesis id  {}", n.genesis_id);
+            println!("  treasury    {}  (passphrase in delegates.json)", n.treasury_address);
+            println!("  delegates   {} (passphrases in delegates.json, all forging in node.yaml)", n.delegate_passphrases.len());
+            println!("  seed        {seed}");
+            println!("run:  cd {} && sth-core run --config node.yaml", out.display());
+        }
+        Command::Init { force, network_files, newnet: None } => {
+            let config = cli.config.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE));
             if force && config.exists() {
                 std::fs::remove_file(&config).with_context(|| format!("removing {}", config.display()))?;
             }
@@ -281,10 +367,10 @@ async fn main() -> anyhow::Result<()> {
             println!("edit node.yaml (delegate.secrets to forge), then start with: sth-core run --config {}", config.display());
         }
         Command::Run {
-            config, api_host, api_port, no_api, nodes, concurrency, skip_verify, quiet, from_dump, fast_import, snapshot_dir,
+            api_host, api_port, no_api, nodes, concurrency, skip_verify, quiet, from_dump, fast_import, snapshot_dir,
             mempool_size, p2p, no_p2p, p2p_port, peers, parallel_peers, reward_address,
         } => {
-            let mut cfg = NodeConfig::load_or_default(config.as_deref())?;
+            let mut cfg = base_cfg;
             if let Some(p) = &cli.db_path {
                 cfg.db_path = p.display().to_string();
             }
@@ -340,6 +426,7 @@ async fn main() -> anyhow::Result<()> {
             let node = NodeContext::open(cfg).await?;
             node.run(RunFlags { quiet, force_bootstrap: from_dump.is_some() }).await?;
         }
+        Command::Tx(args) => sth_core::cli::run(sth_core::cli::ChainSource::Config(base_cfg), args).await?,
         Command::IrohId { key_file } => {
             let secret = sth_core::p2p_iroh::load_or_create_secret(&key_file)?;
             println!("{}", secret.public());
@@ -393,10 +480,13 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(dir = %dir.display(), end_height = meta.blocks.end, "snapshot ready");
                 println!("{}", dir.display());
             }
-            SnapshotCmd::Import { path, fast_import, quiet } => {
+            SnapshotCmd::Import { path, fast_import, strict, quiet } => {
                 let dir = tokio::task::spawn_blocking(move || snapshot::locate_snapshot_dir(&path)).await??;
                 let storage = Arc::new(Storage::open(&db_path, network)?);
-                let report = run_import(storage, dir, fast_import, quiet).await?;
+                let report = run_import(storage, dir, fast_import, strict, quiet).await?;
+                if strict && !report.interrupted {
+                    println!("history audit OK: {} blocks passed the live rules (second signature, smart objects)", report.imported);
+                }
                 if report.interrupted {
                     return Err(anyhow!("import interrupted"));
                 }
@@ -446,7 +536,7 @@ async fn main() -> anyhow::Result<()> {
             let storage = Arc::new(Storage::open(&db_path, network)?);
             if let Some(source) = from_dump {
                 let dir = resolve_snapshot(&source, &snapshot_dir).await?;
-                let report = run_import(storage.clone(), dir, fast_import, quiet).await?;
+                let report = run_import(storage.clone(), dir, fast_import, false, quiet).await?;
                 if report.interrupted {
                     return Err(anyhow!("import interrupted — rerun `sth-core sync --from-dump ...` to resume"));
                 }

@@ -38,15 +38,25 @@ pub struct DelegateConfig {
     pub secrets: Vec<String>,
     /// Optional path to a legacy `delegates.json`; its `secrets` are merged with the list above.
     pub secrets_file: String,
+    /// Quantum Shield stage C: passphrases of the delegates' ML-DSA-44 keys (the ones registered with `sth-cli pq-register`);
+    /// matched to a delegate by its on-chain `pq_key`. `STH_DELEGATE_PQ_PASSPHRASE` is appended. Needed once `pq.blocks` is on.
+    pub pq_secrets: Vec<String>,
     /// Legacy peers that receive every forged block via `postBlock`.
     pub broadcast_fanout: usize,
     /// Share (0.0–1.0) of responding peers (legacy + iroh) that must report our exact tip before forging.
+    /// `0.0` = private / single-node network (`init newnet`): the node forges even when no peer answers.
     pub quorum_share: f64,
+    /// Never forge with fewer than this many peers agreeing on our tip (default 3) — an isolated node
+    /// must skip its slot instead of building a private fork.
+    pub min_quorum_peers: usize,
+    /// Announce over iroh gossip (signed by the delegate key) that these delegates forge on a Rust node,
+    /// so every metrics page can show "N of 21 delegates on Rust". Public keys are public anyway.
+    pub announce: bool,
 }
 
 impl Default for DelegateConfig {
     fn default() -> Self {
-        Self { enabled: false, secrets: Vec::new(), secrets_file: String::new(), broadcast_fanout: 6, quorum_share: 0.5 }
+        Self { enabled: false, secrets: Vec::new(), secrets_file: String::new(), pq_secrets: Vec::new(), broadcast_fanout: 6, quorum_share: 0.5, min_quorum_peers: 3, announce: true }
     }
 }
 
@@ -111,13 +121,26 @@ pub struct IrohConfig {
     pub bootstrap: Vec<String>,
     /// Serve `GetStatus` / `GetBlocks` to other iroh nodes.
     pub serve_blocks: bool,
-    /// Use the public n0 relay servers for NAT traversal (turn off for LAN-only setups).
+    /// Use relay servers for NAT traversal (turn off for LAN-only setups). Relays used = NETFORY n1
+    /// (built in, `N1_RELAYS`) + public n0 (`relay_n0`) + `relays`.
     pub relay: bool,
+    /// Also use the public n0 relay servers (use1/usw1/euc1/aps1.relay.n0.iroh.link).
+    pub relay_n0: bool,
+    /// Extra relay URLs (`https://relay.example.org`), e.g. your own iroh-relay.
+    pub relays: Vec<String>,
 }
 
 impl Default for IrohConfig {
     fn default() -> Self {
-        Self { enabled: false, secret_key_file: "./iroh.key".into(), bootstrap: Vec::new(), serve_blocks: true, relay: true }
+        Self {
+            enabled: false,
+            secret_key_file: "./iroh.key".into(),
+            bootstrap: Vec::new(),
+            serve_blocks: true,
+            relay: true,
+            relay_n0: true,
+            relays: Vec::new(),
+        }
     }
 }
 
@@ -133,6 +156,47 @@ pub struct RewardsConfig {
 #[serde(default)]
 pub struct MempoolConfig {
     pub max_size: usize,
+    /// Byte budget of the pool (wire bytes of pending transactions). Keeps 2.5 KB Quantum Shield (v3) transactions from
+    /// crowding out ordinary 160-byte ones when the count limit alone would still allow it.
+    pub max_bytes: usize,
+    /// Fee policy of THIS node's pool — a per-node setting, not a consensus rule (blocks are never rejected for it).
+    pub dynamic_fees: DynamicFeesConfig,
+}
+
+/// Legacy `transactionPool.dynamicFees`: minimum fee = `(addon_bytes[type] + wire bytes) × satoshi_per_byte`.
+/// Off = a core transaction must carry exactly the static fee of its type (legacy behaviour with dynamic fees disabled).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DynamicFeesConfig {
+    pub enabled: bool,
+    /// Smartoshi per byte a transaction must pay to enter the pool.
+    pub min_fee_pool: u64,
+    /// Smartoshi per byte a transaction must pay to be relayed (accepted but kept local below it).
+    pub min_fee_broadcast: u64,
+    /// Virtual extra bytes per core type name (`transfer`, `vote`, `delegateRegistration`, ...).
+    pub addon_bytes: std::collections::BTreeMap<String, u64>,
+}
+
+impl DynamicFeesConfig {
+    /// Minimum fee for a transaction of `type_name` weighing `bytes` at `satoshi_per_byte`.
+    pub fn min_fee(&self, type_name: &str, bytes: usize, satoshi_per_byte: u64) -> u64 {
+        // type 5 is the Netfory pointer; `ipfs` is the legacy JSON key wallets know, `ntfry` is accepted in node.yaml
+        let addon = self.addon_bytes.get(type_name).or_else(|| (type_name == "ipfs").then(|| self.addon_bytes.get("ntfry")).flatten()).copied().unwrap_or(0);
+        addon.saturating_add(bytes as u64).saturating_mul(satoshi_per_byte.max(1))
+    }
+}
+
+impl Default for DynamicFeesConfig {
+    fn default() -> Self {
+        let addon_bytes = [
+            ("transfer", 100), ("secondSignature", 250), ("delegateRegistration", 400_000), ("vote", 100), ("multiSignature", 500),
+            ("ipfs", 250), ("multiPayment", 500), ("delegateResignation", 100), ("htlcLock", 100), ("htlcClaim", 0), ("htlcRefund", 0),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        Self { enabled: true, min_fee_pool: 3_000, min_fee_broadcast: 3_000, addon_bytes }
+    }
 }
 
 impl Default for NodeConfig {
@@ -196,14 +260,22 @@ impl Default for RewardsConfig {
 
 impl Default for MempoolConfig {
     fn default() -> Self {
-        Self { max_size: 5_000 }
+        Self { max_size: 5_000, max_bytes: 8 * 1024 * 1024, dynamic_fees: DynamicFeesConfig::default() }
     }
 }
 
 impl NodeConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path).map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
-        Self::parse(&raw).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
+        let mut cfg = Self::parse(&raw).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+        // network files live next to node.yaml (init newnet writes `network_dir: .`) — works from any cwd
+        let dir = cfg.network_dir.trim();
+        if !dir.is_empty() && Path::new(dir).is_relative() {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                cfg.network_dir = parent.join(dir).display().to_string();
+            }
+        }
+        Ok(cfg)
     }
 
     pub fn parse(yaml: &str) -> Result<Self> {
@@ -229,11 +301,14 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.network != "mainnet" {
-            return Err(Error::Config(format!("only mainnet is supported (got {})", self.network)));
+        if self.network != "mainnet" && self.network_dir.trim().is_empty() {
+            return Err(Error::Config(format!("network '{}' needs network_dir with its files (see `sth-core init newnet`)", self.network)));
         }
         if !(0.0..=1.0).contains(&self.delegate.quorum_share) {
             return Err(Error::Config("delegate.quorum_share must be between 0.0 and 1.0".into()));
+        }
+        if self.delegate.min_quorum_peers == 0 {
+            return Err(Error::Config("delegate.min_quorum_peers must be >= 1".into()));
         }
         if self.p2p.parallel_peers == 0 {
             return Err(Error::Config("p2p.parallel_peers must be >= 1".into()));
@@ -300,10 +375,22 @@ impl NodeConfig {
              #          Rust peers over iroh; they show us with gateway: true in /api/ntfry/peers). Both must be set.\n\
              #          p2p.iroh enables the Web 4.0 layer\n\
              #          (iroh endpoint + gossip topics for blocks / transactions, GetBlocks RPC); bootstrap = EndpointIds of peers.\n\
+             #          Relays (NAT traversal): relay: true uses the NETFORY n1 relays (relay-fsn7.sth.cx, relay-ru1.sth.cx) built in,\n\
+             #          relay_n0: true adds the public n0 relays, relays: [\"https://…\"] adds your own iroh-relay servers.\n\
              # rewards: RESERVED, not used yet — future relay/gateway rewards (block & snapshot distribution).\n\
              #          Not the delegate's reward: block rewards always go to the forging delegate's wallet.\n\
              # delegate: forging module. enabled: true + secrets: [passphrase] (or secrets_file: ./delegates.json, legacy format).\n\
+             #          min_quorum_peers (3): the slot is skipped unless that many peers confirm our tip — never forge while isolated.\n\
+             #          announce (true): tell the network (signed) that these delegates run on Rust — counted on the metrics page.\n\
              #          Forging happens only when this delegate is in the active top-21 of the round; fees go to its wallet.\n\
+             #          pq_secrets: [passphrase] = ML-DSA-44 key(s) registered on chain with `sth-cli pq-register` (Quantum Shield\n\
+             #          stage C): from milestone pq.blocks every block is version 1 with a hybrid secp256k1 + ML-DSA signature;\n\
+             #          a delegate without its PQ key skips the slot once the grace window (pq.blocksGrace) has closed.\n\
+             #          Finality (SHIP-35): the delegate keys also sign finality votes over iroh gossip — nothing to configure.\n\
+             # mempool: max_size / max_bytes = pool limits. dynamic_fees = fee policy of THIS node only (not consensus, same as the\n\
+             #          legacy transactionPool.dynamicFees): enabled: true accepts a core transaction when\n\
+             #          fee >= (addon_bytes[type] + wire bytes) × min_fee_pool and relays it from min_fee_broadcast (a transfer\n\
+             #          costs ≈ 0.007 STH); enabled: false demands exactly the static fee of the milestone (1 STH per transfer).\n\
              {body}"
         )
     }

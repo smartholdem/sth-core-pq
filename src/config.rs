@@ -37,10 +37,170 @@ pub struct Milestone {
     pub multi_payment_limit: u32,
     pub htlc_enabled: bool,
     pub block_burn_address: bool,
-    pub aip11: bool,
-    /// AIP-36 entity transactions (typeGroup 2 / type 6) accepted from this height.
-    pub aip36: bool,
-    pub aip37: bool,
+    /// SHIP-11: version-2 transaction wire format + Schnorr transaction signatures. JSON key `ship11`; the historical
+    /// `aip11` (and `txV2`) are accepted as aliases.
+    #[serde(default, rename = "ship11", alias = "aip11", alias = "txV2")]
+    pub tx_v2: bool,
+    /// SHIP-13: SmartObject (sObject, typeGroup 2 / type 6) transactions accepted from this height. JSON key `ship13`;
+    /// historical `aip36` and `sobj` are aliases.
+    #[serde(default, rename = "ship13", alias = "aip36", alias = "sobj")]
+    pub sobj_active: bool,
+    /// SHIP-11 (blocks): Schnorr block signatures. JSON key `ship11Blocks`; historical `aip37` and `schnorrBlocks` are aliases.
+    #[serde(default, rename = "ship11Blocks", alias = "aip37", alias = "schnorrBlocks")]
+    pub schnorr_blocks: bool,
+    /// Native tokens (typeGroup 3) accepted from this height.
+    #[serde(default)]
+    pub tokens: bool,
+    #[serde(default)]
+    pub token_fees: TokenFees,
+    #[serde(default = "default_token_recipients")]
+    pub token_transfer_max_recipients: u16,
+    /// sObject rules v2: `ntfryData` = any UTF-8 ≤ 255 bytes, type-5 names must be tickers. Off on mainnet until all
+    /// delegates run this core (legacy nodes keep the base58 / free-name rules). `entityV2` is read as an alias.
+    #[serde(default, alias = "entityV2")]
+    pub sobj_v2: bool,
+    /// Reject blocks whose sender cannot cover amount + fee (legacy `InsufficientBalanceError`). Off = log only
+    /// (lets mainnet operators verify history before the flag is switched on together with tokens / sobjV2).
+    #[serde(default)]
+    pub strict_balance: bool,
+    /// Lowest sth-core version that implements this milestone's rules (e.g. "0.14.0"); the Delegate Dashboard flags
+    /// Rust delegates announcing an older version. Empty = no requirement.
+    #[serde(default)]
+    pub min_core_version: String,
+    /// Quantum Shield stage B (v3 transactions with ML-DSA-44 second signatures). Off until every active delegate runs this core.
+    #[serde(default)]
+    pub pq: PqParams,
+    /// SHIP-35 BFT finality gadget: `active` = hard mode (rollback below a certified block is refused). Off = soft mode.
+    #[serde(default)]
+    pub finality: FinalityParams,
+}
+
+/// `milestones[].finality` — see docs/SHIPs/SHIP-35.md. Legacy nodes ignore votes, so soft mode is always safe.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FinalityParams {
+    /// Hard mode: a node never rolls back below the highest finality certificate it holds.
+    pub active: bool,
+    /// Votes needed for a certificate; 0 = ⌊2·activeDelegates/3⌋ + 1 (15 of 21).
+    pub quorum: u32,
+    /// Slashing: a delegate with a proven double vote (two ids at one height) leaves the active set for `slashingRounds`.
+    /// Consensus-affecting (round snapshots differ) — Rust-only network. Off = proofs are only recorded and shown.
+    pub slashing: bool,
+    /// Rounds of exclusion after a proven equivocation (default 30 ≈ 84 min at 21 × 8 s).
+    pub slashing_rounds: u32,
+}
+
+impl FinalityParams {
+    pub fn slashing_rounds(&self) -> u64 {
+        if self.slashing_rounds == 0 { 30 } else { self.slashing_rounds as u64 }
+    }
+}
+
+impl Milestone {
+    /// Finality quorum of this milestone (> 2/3 of the active set unless overridden).
+    pub fn finality_quorum(&self) -> u32 {
+        if self.finality.quorum > 0 { self.finality.quorum } else { self.active_delegates * 2 / 3 + 1 }
+    }
+}
+
+fn default_token_recipients() -> u16 {
+    64
+}
+
+/// `milestones[].pq` — see docs/SPEC-PQ-V3.md §6/§8.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PqParams {
+    /// v3 transactions accepted from this milestone.
+    #[serde(default)]
+    pub active: bool,
+    /// Surcharge per byte of the second-signature blocks (smartoshi), default 10 000 → +0.2423 STH per ML-DSA-44 block.
+    #[serde(default = "default_pq_fee_per_byte")]
+    pub fee_per_byte: u64,
+    /// Blocks after activation during which a wallet with a stage-A commitment may only register the committed key.
+    #[serde(default = "default_pq_commitment_grace")]
+    pub commitment_grace: u64,
+    /// Stage C: blocks must carry a hybrid secp256k1 + ML-DSA-44 signature (version 1). Rust-only network.
+    #[serde(default)]
+    pub blocks: bool,
+    /// Blocks after `blocks` activation during which version-0 blocks (delegates without a PQ key) are still accepted.
+    #[serde(default = "default_pq_blocks_grace")]
+    pub blocks_grace: u64,
+}
+
+fn default_pq_blocks_grace() -> u64 {
+    43_200
+}
+fn default_pq_fee_per_byte() -> u64 {
+    10_000
+}
+fn default_pq_commitment_grace() -> u64 {
+    86_400
+}
+impl Default for PqParams {
+    fn default() -> Self {
+        Self { active: false, fee_per_byte: default_pq_fee_per_byte(), commitment_grace: default_pq_commitment_grace(), blocks: false, blocks_grace: default_pq_blocks_grace() }
+    }
+}
+
+/// Static fees of typeGroup 3 (smartoshi). `transfer_per_recipient` is added for every recipient after the first.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenFees {
+    /// Every field has a default so a later milestone may patch a single key (e.g. `{ "tokenFees": { "initBurnPercent": 0 } }`).
+    #[serde(default = "default_init_fee")]
+    pub init: u64,
+    #[serde(default = "default_transfer_fee")]
+    pub transfer: u64,
+    #[serde(default = "default_transfer_per_recipient_fee")]
+    pub transfer_per_recipient: u64,
+    #[serde(default = "default_mint_fee")]
+    pub mint: u64,
+    #[serde(default = "default_burn_fee")]
+    pub burn: u64,
+    /// TokenMeta (on-chain manifest, default 1 STH).
+    #[serde(default = "default_meta_fee")]
+    pub meta: u64,
+    /// Share of the TokenInit fee sent to `burnAddress` (0 = no burn, 100 = whole fee). Milestone-switchable without a code fork.
+    #[serde(default = "default_init_burn_percent")]
+    pub init_burn_percent: u8,
+}
+
+fn default_init_fee() -> u64 {
+    50_000_000_000
+}
+fn default_transfer_fee() -> u64 {
+    10_000_000
+}
+fn default_transfer_per_recipient_fee() -> u64 {
+    1_000_000
+}
+fn default_mint_fee() -> u64 {
+    100_000_000
+}
+fn default_burn_fee() -> u64 {
+    10_000_000
+}
+
+fn default_meta_fee() -> u64 {
+    100_000_000
+}
+
+fn default_init_burn_percent() -> u8 {
+    50
+}
+
+impl TokenFees {
+    /// Smartoshi burned per TokenInit under this milestone.
+    pub fn init_burn(&self) -> u64 {
+        self.init * self.init_burn_percent.min(100) as u64 / 100
+    }
+}
+
+impl Default for TokenFees {
+    fn default() -> Self {
+        Self { init: default_init_fee(), transfer: default_transfer_fee(), transfer_per_recipient: default_transfer_per_recipient_fee(), mint: default_mint_fee(), burn: default_burn_fee(), meta: default_meta_fee(), init_burn_percent: default_init_burn_percent() }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,9 +238,17 @@ impl Default for Milestone {
             multi_payment_limit: 256,
             htlc_enabled: true,
             block_burn_address: true,
-            aip11: true,
-            aip36: false,
-            aip37: false,
+            tx_v2: true,
+            sobj_active: false,
+            schnorr_blocks: false,
+            tokens: false,
+            token_fees: TokenFees::default(),
+            token_transfer_max_recipients: 64,
+            finality: FinalityParams::default(),
+            sobj_v2: false,
+            strict_balance: false,
+            min_core_version: String::new(),
+            pq: PqParams::default(),
         }
     }
 }
@@ -101,6 +269,10 @@ impl Milestone {
     /// Static fee of a core transaction type by its camelCase name (`transfer`, `vote`, ...).
     pub fn static_fee(&self, name: &str) -> u64 {
         self.fees.static_fees.get(name).copied().unwrap_or(0)
+    }
+    /// Static fee of a core transaction type id (0 for unknown types).
+    pub fn static_fee_for_type(&self, type_: u16) -> u64 {
+        FEE_NAMES.iter().find(|(_, t)| *t == type_).map(|(name, _)| self.static_fee(name)).unwrap_or(0)
     }
 }
 
@@ -160,6 +332,20 @@ pub struct Network {
     pub raw_exceptions: Arc<Value>,
 }
 
+/// Historical / alias flag names (`aip11`, `txV2`, `aip36`, `sobj`, `aip37`, `schnorrBlocks`) → SHIP keys, so a file mixing
+/// old and new spellings across milestones merges into one field instead of tripping serde's duplicate-field check.
+pub const MILESTONE_KEY_ALIASES: [(&str, &str); 6] = [("aip11", "ship11"), ("txV2", "ship11"), ("aip36", "ship13"), ("sobj", "ship13"), ("aip37", "ship11Blocks"), ("schnorrBlocks", "ship11Blocks")];
+
+fn canonical_milestone_keys(entry: &Value) -> Value {
+    let Some(obj) = entry.as_object() else { return entry.clone() };
+    let mut out = Map::new();
+    for (k, v) in obj {
+        let key = MILESTONE_KEY_ALIASES.iter().find(|(old, _)| old == k).map(|(_, new)| (*new).to_string()).unwrap_or_else(|| k.clone());
+        out.insert(key, v.clone());
+    }
+    Value::Object(out)
+}
+
 fn deep_merge(base: &mut Value, patch: &Value) {
     match (base, patch) {
         (Value::Object(b), Value::Object(p)) => {
@@ -214,6 +400,9 @@ impl Network {
     /// Load `network.json`, `milestones.json`, `exceptions.json` (+ optional `genesisBlock.json[.gz]`) from `dir`;
     /// files that are missing fall back to the embedded mainnet ones.
     pub fn from_dir(dir: &Path) -> Result<Self> {
+        if !dir.is_dir() {
+            return Err(Error::Config(format!("network_dir {} does not exist", dir.display())));
+        }
         let read = |name: &str, fallback: &str| -> Result<String> {
             let p = dir.join(name);
             if p.exists() {
@@ -253,8 +442,11 @@ impl Network {
         let mut merged = Value::Object(Map::new());
         let mut milestones = Vec::with_capacity(entries.len());
         for e in entries {
-            deep_merge(&mut merged, e);
+            deep_merge(&mut merged, &canonical_milestone_keys(e));
             let m: Milestone = serde_json::from_value(merged.clone()).map_err(|e| Error::Config(format!("milestones.json: {e}")))?;
+            if m.token_fees.init_burn_percent > 100 {
+                return Err(Error::Config(format!("milestones.json: tokenFees.initBurnPercent must be 0..=100 (height {})", m.height)));
+            }
             milestones.push(m);
         }
         milestones.sort_by_key(|m| m.height);
@@ -283,6 +475,26 @@ impl Network {
 
     pub fn milestones(&self) -> &[Milestone] {
         &self.milestones
+    }
+
+    /// Height of the first milestone with `pq.active` (Quantum Shield stage B), if any.
+    pub fn pq_activation_height(&self) -> Option<u64> {
+        self.milestones.iter().find(|m| m.pq.active).map(|m| m.height)
+    }
+
+    /// First height with `pq.blocks` (hybrid block signatures), if any milestone enables it.
+    pub fn pq_blocks_activation_height(&self) -> Option<u64> {
+        self.milestones.iter().find(|m| m.pq.blocks).map(|m| m.height)
+    }
+
+    /// Block versions accepted at `height`: (v1 allowed, v0 allowed). v0 stays legal during `pq.blocksGrace`.
+    pub fn block_versions_allowed(&self, height: u64) -> (bool, bool) {
+        let m = self.milestone(height);
+        if !m.pq.blocks {
+            return (false, true);
+        }
+        let grace_end = self.pq_blocks_activation_height().unwrap_or(height).saturating_add(m.pq.blocks_grace);
+        (true, height < grace_end)
     }
 
     /// gzip-compressed `genesisBlock.json` of this network.
@@ -344,6 +556,7 @@ pub const FEE_NAMES: [(&str, u16); 11] = [
     ("delegateRegistration", 2),
     ("vote", 3),
     ("multiSignature", 4),
+    // type 5 = Netfory content pointer; `ipfs` is the legacy JSON key of staticFees / addonBytes that wallets rely on
     ("ipfs", 5),
     ("multiPayment", 6),
     ("delegateResignation", 7),
@@ -360,6 +573,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ship_keys_and_historical_aliases_merge_into_one_field() {
+        // historical aipNN spellings, wallet-lib aliases and SHIP keys may be mixed across milestones
+        let ms = MAINNET_MILESTONES_JSON
+            .replace("\"ship11\": true", "\"aip11\": true")
+            .replace("\"ship11Blocks\": true", "\"schnorrBlocks\": true")
+            .replace("\"ship13\": true", "\"aip36\": true, \"sobj\": true");
+        let n = Network::from_json(MAINNET_NETWORK_JSON, &ms, MAINNET_EXCEPTIONS_JSON, MAINNET_GENESIS_GZ).unwrap();
+        assert!(n.milestone(1).tx_v2);
+        assert!(n.milestone(564_000).schnorr_blocks && !n.milestone(563_999).schnorr_blocks);
+        assert!(n.milestone(11_800_000).sobj_active && !n.milestone(11_799_999).sobj_active);
+        // the embedded file itself uses the SHIP names
+        assert!(MAINNET_MILESTONES_JSON.contains("\"ship11\"") && MAINNET_MILESTONES_JSON.contains("\"ship13\"") && MAINNET_MILESTONES_JSON.contains("\"ship11Blocks\""));
+        assert!(!MAINNET_MILESTONES_JSON.contains("aip"));
+    }
+
+    #[test]
     fn mainnet_milestones_merge() {
         let n = Network::mainnet();
         assert_eq!(n.pubkey_hash, 63);
@@ -368,8 +597,8 @@ mod tests {
         assert_eq!(n.milestone(1).static_fee("delegateRegistration"), 100_000_000_000);
         assert_eq!(n.milestone(151_200).static_fee("delegateRegistration"), 1_000_000_000_000);
         assert_eq!(n.milestone(151_200).static_fee("transfer"), 100_000_000);
-        assert!(!n.milestone(563_999).aip37);
-        assert!(n.milestone(564_000).aip37);
+        assert!(!n.milestone(563_999).schnorr_blocks);
+        assert!(n.milestone(564_000).schnorr_blocks);
         assert_eq!(n.milestone(10_000_000).blocktime, 8);
         assert!(n.milestone(10_000_000).block_burn_address);
     }

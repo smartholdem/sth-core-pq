@@ -1,7 +1,7 @@
 //! Author: TechnoL0g
 //!
 //! Node / network resources: blockchain, node status, configuration (+crypto), fees, transaction
-//! types & schemas, peers (legacy shape), `/api/node/peers` health dashboard, entities (empty).
+//! types & schemas, peers (legacy shape), `/api/node/peers` health dashboard, sObjects (empty).
 
 use super::render::human_time;
 use super::{last_height, not_found, paginate, slice_page, ApiResult, Params, Shared};
@@ -56,8 +56,18 @@ pub async fn configuration(State(st): State<Shared>) -> ApiResult {
     if st.peer_table.is_some() {
         ports.insert("@smartholdem/core-p2p".into(), json!(st.peer_table.as_ref().map(|t| t.port()).unwrap_or(4001)));
     }
+    let df = st.mempool.dynamic_fees();
+    let dynamic_fees = if df.enabled {
+        json!({ "enabled": true, "minFeePool": df.min_fee_pool, "minFeeBroadcast": df.min_fee_broadcast, "addonBytes": df.addon_bytes })
+    } else {
+        json!({ "enabled": false })
+    };
     Ok(Json(json!({ "data": {
         "core": { "version": env!("CARGO_PKG_VERSION"), "implementation": "sth-core-rust" },
+        "quantumShield": { "stage": if m.pq.blocks { "C" } else if m.pq.active { "B" } else { "A" }, "algorithms": [crate::crypto::pq::ALG_ML_DSA_44], "commitmentPrefix": crate::crypto::pq::COMMITMENT_PREFIX, "activation": st.network.pq_activation_height() },
+        "pq": { "active": m.pq.active, "activation": st.network.pq_activation_height(), "algorithms": if m.pq.active { vec![crate::crypto::pq::ALG_ML_DSA_44] } else { vec![] }, "feePerByte": m.pq.fee_per_byte.to_string(), "commitmentGrace": m.pq.commitment_grace, "publicKeyBytes": crate::crypto::pq::PK_LEN, "signatureBytes": crate::crypto::pq::SIG_LEN,
+            "blocks": m.pq.blocks, "blocksActivation": st.network.pq_blocks_activation_height(), "blocksGrace": m.pq.blocks_grace, "blockVersion": if m.pq.blocks { crate::models::BLOCK_VERSION_PQ } else { m.block_version() } },
+        "finality": { "hard": m.finality.active, "quorum": m.finality_quorum(), "activeDelegates": m.active_delegates, "finalizedHeight": st.storage.latest_finality_cert()?.map(|c| c.height).unwrap_or(0) },
         "nethash": st.network.nethash,
         "slip44": st.network.slip44,
         "wif": st.network.wif,
@@ -70,13 +80,20 @@ pub async fn configuration(State(st): State<Shared>) -> ApiResult {
             "height": m.height, "reward": m.reward.to_string(), "activeDelegates": m.active_delegates, "blocktime": m.blocktime,
             "block": { "version": m.block_version(), "idFullSha256": m.id_full_sha256(), "maxTransactions": m.max_transactions(), "maxPayload": m.max_payload() },
             "epoch": human_time(st.network.epoch_unix),
+            "tokens": m.tokens,
+            "tokenFees": { "init": m.token_fees.init.to_string(), "transfer": m.token_fees.transfer.to_string(), "transferPerRecipient": m.token_fees.transfer_per_recipient.to_string(), "mint": m.token_fees.mint.to_string(), "burn": m.token_fees.burn.to_string(), "meta": m.token_fees.meta.to_string(), "initBurnPercent": m.token_fees.init_burn_percent, "initBurn": m.token_fees.init_burn().to_string() }, "tokenMetaMaxLogoBytes": crate::models::token::META_MAX_LOGO, "sobjV2": m.sobj_v2, "strictBalance": m.strict_balance, "minCoreVersion": m.min_core_version,
+            "tokenTransferMaxRecipients": m.token_transfer_max_recipients,
+            "tokenTickerSobjType": crate::models::token::TICKER_SOBJ_TYPE,
+            "tokenTickerRule": "^[A-Z0-9]{3,10}$",
             "fees": { "staticFees": Value::Object(fees) },
             "vendorFieldLength": m.vendor_field_length, "multiPaymentLimit": m.multi_payment_limit, "htlcEnabled": m.htlc_enabled,
-            "blockBurnAddress": m.block_burn_address, "aip11": m.aip11, "aip36": m.aip36, "aip37": m.aip37,
+            "blockBurnAddress": m.block_burn_address,
+            "ship11": m.tx_v2, "ship13": m.sobj_active, "ship11Blocks": m.schnorr_blocks,
+            "aip11": m.tx_v2, "aip36": m.sobj_active, "aip37": m.schnorr_blocks,
         },
         "transactionPool": {
-            "dynamicFees": { "enabled": false },
-            "maxTransactionsInPool": st.mempool.max_size(), "maxTransactionsPerSender": 150, "maxTransactionsPerRequest": 40,
+            "dynamicFees": dynamic_fees,
+            "maxTransactionsInPool": st.mempool.max_size(), "maxBytesInPool": st.mempool.max_bytes(), "maxTransactionsPerSender": 150, "maxTransactionsPerRequest": 40,
             "maxTransactionAge": 2700, "maxTransactionBytes": 2_000_000,
         },
     } })))
@@ -99,10 +116,10 @@ fn static_fee_map(st: &Shared) -> Result<Map<String, Value>, Error> {
 }
 
 pub async fn transaction_fees(State(st): State<Shared>) -> ApiResult {
-    use crate::models::entity;
+    use crate::models::sobj;
     let mut data = json!({ "1": Value::Object(static_fee_map(&st)?) });
-    if st.network.milestone(last_height(&st)? + 1).aip36 {
-        data["2"] = json!({ "entityRegistration": entity::FEE_REGISTER.to_string(), "entityUpdate": entity::FEE_UPDATE.to_string(), "entityResignation": entity::FEE_RESIGN.to_string() });
+    if st.network.milestone(last_height(&st)? + 1).sobj_active {
+        data["2"] = json!({ "sobjRegistration": sobj::FEE_REGISTER.to_string(), "sobjUpdate": sobj::FEE_UPDATE.to_string(), "sobjResignation": sobj::FEE_RESIGN.to_string() });
     }
     Ok(Json(json!({ "data": data })))
 }
@@ -138,16 +155,16 @@ pub async fn fees(State(st): State<Shared>, Query(q): Query<Params>) -> ApiResul
 
 pub async fn transaction_types(State(st): State<Shared>) -> ApiResult {
     let core: Map<String, Value> = [
-        ("Transfer", 0), ("SecondSignature", 1), ("DelegateRegistration", 2), ("Vote", 3), ("MultiSignature", 4), ("Ipfs", 5),
+        ("Transfer", 0), ("SecondSignature", 1), ("DelegateRegistration", 2), ("Vote", 3), ("MultiSignature", 4), ("Ipfs", 5), ("Ntfry", 5),
         ("MultiPayment", 6), ("DelegateResignation", 7), ("HtlcLock", 8), ("HtlcClaim", 9), ("HtlcRefund", 10),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), json!(v)))
     .collect();
-    // like legacy: business/bridgechain until aip36, Entity after it
-    let aip36 = st.network.milestone(last_height(&st)? + 1).aip36;
-    let magistrate: Map<String, Value> = if aip36 {
-        [("Entity", json!(6))].into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    // legacy-compatible type map: business/bridgechain names before sobj activation, SmartObject after it
+    let sobj_on = st.network.milestone(last_height(&st)? + 1).sobj_active;
+    let sobj_types: Map<String, Value> = if sobj_on {
+        [("SmartObject", json!(6))].into_iter().map(|(k, v)| (k.to_string(), v)).collect()
     } else {
         [
             ("BusinessRegistration", 0), ("BusinessResignation", 1), ("BusinessUpdate", 2),
@@ -157,7 +174,11 @@ pub async fn transaction_types(State(st): State<Shared>) -> ApiResult {
         .map(|(k, v)| (k.to_string(), json!(v)))
         .collect()
     };
-    Ok(Json(json!({ "data": { "1": Value::Object(core), "2": Value::Object(magistrate) } })))
+    let mut data = json!({ "1": Value::Object(core), "2": Value::Object(sobj_types) });
+    if st.network.milestone(last_height(&st)? + 1).tokens {
+        data["3"] = json!({ "TokenInit": 0, "TokenTransfer": 1, "TokenMint": 2, "TokenBurn": 3, "TokenMeta": 4 });
+    }
+    Ok(Json(json!({ "data": data })))
 }
 
 pub async fn transaction_schemas() -> ApiResult {

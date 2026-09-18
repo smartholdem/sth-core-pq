@@ -578,43 +578,273 @@ pub fn apply_blocks(storage: &Storage, network: &Network, blocks: &[Block], mut 
     Ok(tip)
 }
 
+/// Token state as seen inside a batch: storage + changes of already-checked transactions.
+use std::collections::{BTreeMap, HashMap};
+
+struct BatchTokenView<'a> {
+    storage: &'a Storage,
+    states: HashMap<String, crate::storage::TokenState>,
+    balances: HashMap<(String, String), u64>,
+    /// Pending sObject registrations of the batch (sender → id → record); raw pointer because the map is mutated between calls.
+    sobjects: *const HashMap<String, BTreeMap<String, crate::storage::SmartObject>>,
+}
+
+impl BatchTokenView<'_> {
+    fn apply(&mut self, type_: u16, a: &crate::models::TokenAsset, sender: &str, height: u64) {
+        use crate::models::token;
+        let mut bump = |addr: &str, delta: i128| {
+            let e = self.balances.entry((addr.to_string(), a.id.clone())).or_insert_with(|| {
+                self.storage.get_wallet(addr).ok().flatten().and_then(|w| w.tokens.get(&a.id).copied()).unwrap_or(0)
+            });
+            *e = (*e as i128 + delta).max(0) as u64;
+        };
+        match type_ {
+            token::INIT => {
+                let init = a.initial_supply.unwrap_or(0);
+                bump(sender, init as i128);
+                let symbol = crate::rules::TokenView::ticker_sobj(self, &a.id).map(|(_, n, _)| n).unwrap_or_default();
+                self.states.insert(a.id.clone(), crate::storage::TokenState { symbol, decimals: a.decimals.unwrap_or(0), flags: a.flags.unwrap_or(0), supply: init, supply_cap: a.supply_cap.unwrap_or(0), owner: sender.to_string(), init_height: height, meta: None });
+            }
+            token::TRANSFER => {
+                for it in a.transfers.as_deref().unwrap_or_default() {
+                    bump(sender, -(it.amount as i128));
+                    bump(&it.recipient_id, it.amount as i128);
+                }
+            }
+            token::MINT => {
+                let amount = a.amount.unwrap_or(0);
+                bump(a.recipient_id.as_deref().unwrap_or(""), amount as i128);
+                if let Some(st) = self.state_mut(&a.id) {
+                    st.supply = st.supply.saturating_add(amount);
+                }
+            }
+            token::META => {
+                if let Some(st) = self.state_mut(&a.id) {
+                    st.meta = a.meta.clone();
+                }
+            }
+            _ => {
+                let amount = a.amount.unwrap_or(0);
+                bump(sender, -(amount as i128));
+                if let Some(st) = self.state_mut(&a.id) {
+                    st.supply = st.supply.saturating_sub(amount);
+                }
+            }
+        }
+    }
+
+    fn set_owner(&mut self, id: &str, owner: &str) {
+        if let Some(st) = self.state_mut(id) {
+            st.owner = owner.to_string();
+        }
+    }
+
+    fn state_mut(&mut self, id: &str) -> Option<&mut crate::storage::TokenState> {
+        if !self.states.contains_key(id) {
+            let st = self.storage.token_state(id).ok().flatten()?;
+            self.states.insert(id.to_string(), st);
+        }
+        self.states.get_mut(id)
+    }
+}
+
+impl crate::rules::TokenView for BatchTokenView<'_> {
+    fn token_owner(&self, id: &str) -> Option<String> {
+        self.states.get(id).map(|s| s.owner.clone()).or_else(|| self.storage.token_owner(id).ok().flatten())
+    }
+    fn token_state(&self, id: &str) -> Option<crate::storage::TokenState> {
+        self.states.get(id).cloned().or_else(|| self.storage.token_state(id).ok().flatten())
+    }
+    fn token_balance(&self, address: &str, id: &str) -> u64 {
+        self.balances
+            .get(&(address.to_string(), id.to_string()))
+            .copied()
+            .unwrap_or_else(|| self.storage.get_wallet(address).ok().flatten().and_then(|w| w.tokens.get(id).copied()).unwrap_or(0))
+    }
+    fn ticker_sobj(&self, id: &str) -> Option<(String, String, bool)> {
+        // SAFETY: the pointer is refreshed before every use and the map outlives this view within check_stateful_rules.
+        let pending = unsafe { &*self.sobjects };
+        for (owner, recs) in pending {
+            if let Some(r) = recs.get(id) {
+                return (r.type_ == crate::models::token::TICKER_SOBJ_TYPE).then(|| (owner.clone(), r.data.name.clone().unwrap_or_default(), r.resigned));
+            }
+        }
+        let (owner, r) = self.storage.get_sobject(id).ok().flatten()?;
+        (r.type_ == crate::models::token::TICKER_SOBJ_TYPE).then(|| (owner, r.data.name.unwrap_or_default(), r.resigned))
+    }
+}
+
 /// Sequential, wallet-aware rules over a batch (legacy `throwIfCannotBeApplied`): second signatures and
-/// AIP-36 entities. Effects of earlier transactions in the batch count for later ones.
-fn check_stateful_rules(storage: &Storage, network: &Network, blocks: &[Block]) -> Result<()> {
+/// smart objects (sObjects). Effects of earlier transactions in the batch count for later ones.
+pub fn check_stateful_rules(storage: &Storage, network: &Network, blocks: &[Block]) -> Result<()> {
     use crate::crypto::address_from_public_key;
     use std::collections::{BTreeMap, HashMap, HashSet};
     let mut keys: HashMap<String, Option<String>> = HashMap::new();
-    let mut entities: HashMap<String, BTreeMap<String, crate::storage::EntityRecord>> = HashMap::new();
+    let mut pq_keys: HashMap<String, Option<crate::crypto::pq::PqKey>> = HashMap::new();
+    let pq_activation = network.pq_activation_height();
+    let mut sobjects: HashMap<String, BTreeMap<String, crate::storage::SmartObject>> = HashMap::new();
     let mut names: HashSet<String> = HashSet::new();
+    let mut transferred: HashMap<String, String> = HashMap::new();
+    // STH moved inside this batch (address → delta): every debit / credit storage will apply, in legacy order
+    // (transactions first, forger reward + fees after the block) → sender balance check like legacy `throwIfCannotBeApplied`
+    let mut sth_delta: HashMap<String, i128> = HashMap::new();
+    // HTLC locks opened inside the batch: lock id → (lock sender, recipient, amount)
+    let mut pending_locks: HashMap<String, (String, String, u64)> = HashMap::new();
+    let mut tokens = BatchTokenView { storage, states: HashMap::new(), balances: HashMap::new(), sobjects: &sobjects as *const _ };
     for block in blocks {
+        // stage C: the hybrid block signature is checked against the delegate's PQ key as of the state BEFORE this block
+        if block.version == crate::models::BLOCK_VERSION_PQ {
+            let generator = address_from_public_key(&block.generator_public_key, network.pubkey_hash)?;
+            let key = match pq_keys.get(&generator) {
+                Some(k) => k.clone(),
+                None => storage.get_wallet(&generator)?.and_then(|w| w.pq_key),
+            };
+            let key = key.ok_or_else(|| Error::BlockValidation(format!("block {}: BlockPqKeyMissingError: delegate {} has no registered PQ key", block.height, block.generator_public_key)))?;
+            if !crate::crypto::verify_block_pq_signature(block, &key.public_key)? {
+                return Err(Error::BlockValidation(format!("block {}: BlockPqSignatureError: pqSignature does not verify against the delegate's PQ key", block.height)));
+            }
+        }
         for tx in &block.transactions {
             let sender = address_from_public_key(&tx.sender_public_key, network.pubkey_hash)?;
-            let wallet = storage.get_wallet(&sender)?;
+            let mut wallet = storage.get_wallet(&sender)?;
+            if let Some(d) = sth_delta.get(&sender).copied().filter(|d| *d != 0) {
+                // a wallet first funded inside this batch has no storage record yet
+                let w = wallet.get_or_insert_with(|| crate::storage::WalletState::new(&sender));
+                w.balance = (w.balance as i128 + d).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            }
+            {
+                use crate::models::{tx_type, TYPE_GROUP_CORE};
+                let core = tx.type_group == TYPE_GROUP_CORE;
+                let payments: i128 = tx.asset.as_ref().and_then(|a| a.payments.as_ref()).map(|p| p.iter().map(|x| x.amount as i128).sum()).unwrap_or(0);
+                let spent = tx.amount as i128 + tx.fee as i128 + payments;
+                let available = wallet.as_ref().map(|w| w.balance as i128).unwrap_or(0);
+                if block.height > 1 && available < spent {
+                    let msg = format!("InsufficientBalanceError: sender {sender} has {available}, needs {spent}");
+                    if network.milestone(block.height).strict_balance {
+                        return Err(Error::BlockValidation(format!("block {} tx {}: {msg}", block.height, tx.id.as_deref().unwrap_or("?"))));
+                    }
+                    tracing::warn!(height = block.height, tx = tx.id.as_deref().unwrap_or("?"), %msg, "balance check would fail (milestone strictBalance is off)");
+                }
+                *sth_delta.entry(sender.clone()).or_default() -= spent;
+                if core {
+                    match tx.type_ {
+                        tx_type::TRANSFER => {
+                            if let Some(r) = &tx.recipient_id {
+                                *sth_delta.entry(r.clone()).or_default() += tx.amount as i128;
+                            }
+                        }
+                        tx_type::MULTI_PAYMENT => {
+                            for p in tx.asset.as_ref().and_then(|a| a.payments.as_ref()).into_iter().flatten() {
+                                *sth_delta.entry(p.recipient_id.clone()).or_default() += p.amount as i128;
+                            }
+                        }
+                        tx_type::HTLC_LOCK => {
+                            if let (Some(id), Some(r)) = (tx.id.clone(), tx.recipient_id.clone()) {
+                                pending_locks.insert(id, (sender.clone(), r, tx.amount));
+                            }
+                        }
+                        tx_type::HTLC_CLAIM | tx_type::HTLC_REFUND => {
+                            let lock_id = tx.asset.as_ref().and_then(|a| a.claim.as_ref().map(|c| c.lock_transaction_id.clone()).or_else(|| a.refund.as_ref().map(|r| r.lock_transaction_id.clone())));
+                            let lock = lock_id.as_deref().and_then(|id| {
+                                pending_locks.remove(id).or_else(|| {
+                                    let l = storage.get_lock(id).ok().flatten()?;
+                                    let from = address_from_public_key(&l.sender_public_key, network.pubkey_hash).ok()?;
+                                    Some((from, l.recipient_id, l.amount))
+                                })
+                            });
+                            if let Some((from, to, amount)) = lock {
+                                let credited = if tx.type_ == tx_type::HTLC_CLAIM { to } else { from };
+                                *sth_delta.entry(credited).or_default() += amount as i128;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             if !keys.contains_key(&sender) {
                 keys.insert(sender.clone(), wallet.as_ref().and_then(|w| w.second_public_key.clone()));
+                pq_keys.insert(sender.clone(), wallet.as_ref().and_then(|w| w.pq_key.clone()));
             }
             let fail = |e: String| {
                 Error::BlockValidation(format!("block {} tx {}: {e}", block.height, tx.id.as_deref().unwrap_or("?")))
             };
+            let view = crate::rules::PqWalletView {
+                second_public_key: keys[&sender].as_deref(),
+                pq_key: pq_keys[&sender].as_ref(),
+                commitment: wallet.as_ref().and_then(|w| w.pq_commitment.as_ref()),
+            };
+            if let Some(k) = crate::rules::check_pq(tx, network.milestone(block.height), block.height, pq_activation, view).map_err(fail)? {
+                pq_keys.insert(sender.clone(), Some(k));
+                keys.insert(sender.clone(), None);
+            }
             crate::rules::check_second_signature(tx, keys[&sender].as_deref()).map_err(fail)?;
             if let Some(pk) = crate::rules::registered_second_key(tx).map_err(fail)? {
                 keys.insert(sender.clone(), Some(pk.to_string()));
             }
-            if tx.is_entity() {
-                let pending = entities.entry(sender.clone()).or_default();
+            if tx.is_token() {
+                if !storage.network().milestone(block.height).tokens {
+                    return Err(fail("Token transaction before tokens activation".into()));
+                }
+                let a = crate::rules::check_token_format(tx, storage.network().milestone(block.height)).map_err(fail)?;
+                tokens.sobjects = &sobjects as *const _;
+                crate::rules::check_token(tx, &a, &sender, &tokens).map_err(fail)?;
+                tokens.apply(tx.type_, &a, &sender, block.height);
+                continue;
+            }
+            if tx.is_sobj() {
+                let e = tx.sobj_asset().unwrap_or_default();
+                // an sObject handed over earlier in the batch no longer answers to the old owner (storage still shows it there)
+                if let Some(reg) = e.registration_id.as_deref().filter(|_| e.action != crate::models::sobj::ACTION_BUY) {
+                    if transferred.get(reg).is_some_and(|owner| *owner != sender) {
+                        return Err(fail("SmartObjectNotRegisteredError".into()));
+                    }
+                }
                 let taken = |name: &str, t: u8| {
                     names.contains(&format!("{}-{t}", name.to_lowercase()))
-                        || storage.entity_by_name(name, t).ok().flatten().is_some()
+                        || storage.sobj_by_name(name, t).ok().flatten().is_some()
                 };
-                crate::rules::check_entity(tx, wallet.as_ref(), pending, taken).map_err(fail)?;
-                let e = tx.entity_asset().unwrap_or_default();
+                // batch-aware global lookup (pending maps first, then storage)
+                let lookup = |reg: &str| {
+                    sobjects
+                        .iter()
+                        .find_map(|(owner, recs)| recs.get(reg).map(|r| (owner.clone(), r.clone())))
+                        .or_else(|| storage.get_sobject(reg).ok().flatten())
+                };
+                let empty = BTreeMap::new();
+                let pending_ref = sobjects.get(&sender).unwrap_or(&empty);
+                let supply = |id: &str| crate::rules::TokenView::token_state(&tokens, id).map(|s| s.supply);
+                crate::rules::check_sobj(tx, storage.network().milestone(block.height), wallet.as_ref(), pending_ref, taken, &lookup, supply).map_err(fail)?;
+                let buy = e.action == crate::models::sobj::ACTION_BUY;
+                if buy || e.action == crate::models::sobj::ACTION_TRANSFER {
+                    let reg = e.registration_id.clone().unwrap_or_default();
+                    let (from, to) = if buy {
+                        let (owner, rec) = lookup(&reg).ok_or_else(|| fail("SmartObjectNotRegisteredError".into()))?;
+                        let price = rec.price.unwrap_or(0) as i128;
+                        *sth_delta.entry(sender.clone()).or_default() -= price;
+                        *sth_delta.entry(owner.clone()).or_default() += price;
+                        (owner, sender.clone())
+                    } else {
+                        (sender.clone(), e.recipient_id.clone().unwrap_or_default())
+                    };
+                    let mut rec = sobjects
+                        .get_mut(&from)
+                        .and_then(|m| m.remove(&reg))
+                        .or_else(|| storage.get_wallet(&from).ok().flatten().and_then(|w| w.sobjects.get(&reg).cloned()))
+                        .ok_or_else(|| fail("SmartObjectNotRegisteredError".into()))?;
+                    rec.price = None;
+                    sobjects.entry(to.clone()).or_default().insert(reg.clone(), rec);
+                    tokens.set_owner(&reg, &to);
+                    transferred.insert(reg, to);
+                    continue;
+                }
+                let pending = sobjects.entry(sender.clone()).or_default();
                 match e.action {
-                    crate::models::entity::ACTION_REGISTER => {
+                    crate::models::sobj::ACTION_REGISTER => {
                         let name = e.data.name.clone().unwrap_or_default();
                         names.insert(format!("{}-{}", name.to_lowercase(), e.type_));
                         pending.insert(
                             tx.id.clone().unwrap_or_default(),
-                            crate::storage::EntityRecord { type_: e.type_, sub_type: e.sub_type, data: e.data, resigned: false },
+                            crate::storage::SmartObject { type_: e.type_, sub_type: e.sub_type, data: e.data, resigned: false, price: None },
                         );
                     }
                     action => {
@@ -622,17 +852,24 @@ fn check_stateful_rules(storage: &Storage, network: &Network, blocks: &[Block]) 
                         let mut rec = pending
                             .get(&reg)
                             .cloned()
-                            .or_else(|| wallet.as_ref().and_then(|w| w.entities.get(&reg).cloned()))
-                            .ok_or_else(|| fail("EntityNotRegisteredError".into()))?;
-                        if action == crate::models::entity::ACTION_UPDATE {
-                            rec.data.ipfs_data = e.data.ipfs_data;
-                        } else {
-                            rec.resigned = true;
+                            .or_else(|| wallet.as_ref().and_then(|w| w.sobjects.get(&reg).cloned()))
+                            .ok_or_else(|| fail("SmartObjectNotRegisteredError".into()))?;
+                        match action {
+                            crate::models::sobj::ACTION_UPDATE => rec.data.ntfry_data = e.data.ntfry_data,
+                            crate::models::sobj::ACTION_SELL => rec.price = e.price.filter(|p| *p > 0),
+                            _ => rec.resigned = true,
                         }
                         pending.insert(reg, rec);
                     }
                 }
             }
+        }
+        // forger gets reward + fees after the block's transactions (legacy order)
+        if let Ok(generator) = address_from_public_key(&block.generator_public_key, network.pubkey_hash) {
+            let ms = network.milestone(block.height);
+            let inits = block.transactions.iter().filter(|t| t.type_group == crate::models::TYPE_GROUP_TOKEN && t.type_ == crate::models::token::INIT).count() as u64;
+            let burned = if network.burn_address.is_empty() { 0 } else { inits * ms.token_fees.init_burn() };
+            *sth_delta.entry(generator).or_default() += block.reward as i128 + block.total_fee as i128 - burned as i128;
         }
     }
     Ok(())
