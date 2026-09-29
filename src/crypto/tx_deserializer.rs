@@ -66,6 +66,16 @@ fn deserialize_type_payload(tx: &mut Transaction, r: &mut ByteReader) -> Result<
                 a.amount = Some(r.u64_le()?);
                 a.recipient_id = Some(read_address(r)?);
             }
+            token::SELL => {
+                a.amount = Some(r.u64_le()?);
+                a.price = Some(r.u64_le()?);
+            }
+            token::BUY | token::CANCEL => {
+                a.order_id = Some(r.hex(32)?);
+                if tx.type_ == token::BUY {
+                    a.amount = Some(r.u64_le()?);
+                }
+            }
             token::META => {
                 use base64::Engine;
                 let text = |r: &mut ByteReader, n: usize| -> Result<Option<String>> {

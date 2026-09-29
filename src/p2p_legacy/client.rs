@@ -156,9 +156,24 @@ impl LegacyPeer {
         self.request("p2p.peer.getStatus", &GetStatusRequest { headers: headers() }).await
     }
 
+    /// sth-core extension `p2p.pq.getAddrs` (PQ peers only): the peer's fresh sthpq address-book records.
+    pub async fn get_pq_addrs(&mut self) -> Result<Vec<crate::p2p_iroh::addrbook::SignedAddr>> {
+        let reply = self.roundtrip(TYPE_REQUEST, "p2p.pq.getAddrs", &[]).await?;
+        if reply.status_code != 200 {
+            return Err(Error::Sync(format!("{}: p2p.pq.getAddrs → status {}", self.host, reply.status_code)));
+        }
+        serde_json::from_slice(&reply.payload).map_err(|e| Error::Sync(format!("{}: p2p.pq.getAddrs decode: {e}", self.host)))
+    }
+
     pub async fn get_peers(&mut self) -> Result<Vec<PeerInfo>> {
         let r: GetPeersResponse = self.request("p2p.peer.getPeers", &GetPeersRequest { headers: headers() }).await?;
         Ok(r.peers)
+    }
+
+    /// `p2p.peer.getCommonBlocks`: highest of `ids` present in the peer's chain.
+    pub async fn get_common_blocks(&mut self, ids: Vec<String>) -> Result<Option<CommonBlock>> {
+        let r: GetCommonBlocksResponse = self.request("p2p.peer.getCommonBlocks", &GetCommonBlocksRequest { ids, headers: headers() }).await?;
+        Ok(r.common)
     }
 
     /// Blocks strictly above `last_block_height` (≤ 400), fully decoded with transactions.
@@ -187,13 +202,23 @@ impl LegacyPeer {
     pub async fn post_block(&mut self, serialized_block: Vec<u8>) -> Result<PostBlockResponse> {
         let req = PostBlockRequest { block: serialized_block, headers: headers() };
         let reply = self.roundtrip(TYPE_REQUEST, "p2p.blocks.postBlock", &req.encode_to_vec()).await?;
+        if reply.status_code != 200 {
+            // the peer's reason (legacy: "Block … is not chained"/"UnexpectedNonce…"; PQ Node: the apply error) — never
+            // swallow it into a default `{status:false, height:0}`
+            return Err(Error::Sync(format!("{}: postBlock → status {} ({})", self.host, reply.status_code, String::from_utf8_lossy(&reply.payload[..reply.payload.len().min(300)]))));
+        }
         Ok(PostBlockResponse::decode(reply.payload.as_slice()).unwrap_or_default())
     }
 
-    pub async fn post_transactions(&mut self, serialized: Vec<Vec<u8>>) -> Result<()> {
+    /// Returns how many transactions the peer's pool ACCEPTED (legacy answers a JSON array of accepted ids; a delivered
+    /// batch with an empty array = refused by its pool, e.g. fee below the peer's minimum).
+    pub async fn post_transactions(&mut self, serialized: Vec<Vec<u8>>) -> Result<usize> {
         let req = PostTransactionsRequest { transactions: serialized, headers: headers() };
-        let _reply = self.roundtrip(TYPE_REQUEST, "p2p.transactions.postTransactions", &req.encode_to_vec()).await?;
-        Ok(())
+        let reply = self.roundtrip(TYPE_REQUEST, "p2p.transactions.postTransactions", &req.encode_to_vec()).await?;
+        if reply.status_code != 200 {
+            return Err(Error::Sync(format!("{}: postTransactions → status {} ({})", self.host, reply.status_code, String::from_utf8_lossy(&reply.payload[..reply.payload.len().min(200)]))));
+        }
+        Ok(serde_json::from_slice::<Vec<String>>(&reply.payload).map(|ids| ids.len()).unwrap_or(0))
     }
 }
 

@@ -62,7 +62,12 @@ pub async fn start(
     let bootstrap_for_watchdog = bootstrap.clone();
     let blocks_topic = node.gossip.subscribe(node.topics.blocks, bootstrap.clone()).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
     let txs_topic = node.gossip.subscribe(node.topics.transactions, bootstrap.clone()).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
-    let finality_topic = node.gossip.subscribe(node.topics.finality, bootstrap).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
+    let finality_topic = node.gossip.subscribe(node.topics.finality, bootstrap.clone()).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
+    // sthpq address book (optional module): its own topic so nodes without the module never see the messages
+    if let Some(book) = node.addrbook.get().cloned() {
+        let addrs_topic = node.gossip.subscribe(node.topics.addrs, bootstrap).await.map_err(|e| Error::Sync(format!("gossip subscribe: {e}")))?;
+        tokio::spawn(super::addrbook::run(node.clone(), book, node.secret.clone(), addrs_topic, legacy_peers.clone()));
+    }
     let (block_sender, mut block_receiver) = blocks_topic.split();
     let (tx_sender, mut tx_receiver) = txs_topic.split();
     let (fin_sender, mut fin_receiver) = finality_topic.split();
@@ -128,7 +133,10 @@ pub async fn start(
                         };
                         node.peers.seen(msg.delivered_from, Some(block.height));
                         if let Err(e) = on_block(&node, &storage, &seen, msg.delivered_from, block, verify).await {
-                            tracing::debug!(error = %e, "gossip block not applied");
+                            match e {
+                                Error::StaleTip(msg) => tracing::debug!(%msg, "gossip block already applied by another path"),
+                                e => tracing::debug!(error = %e, "gossip block not applied"),
+                            }
                         }
                     }
                     Ok(Event::NeighborUp(id)) => {
@@ -199,21 +207,32 @@ pub async fn start(
     tokio::spawn(publish_finality(node.clone(), fin_sender, storage.clone()));
     tokio::spawn(sync_finality(node.clone(), storage.clone()));
     tokio::spawn(publish_delegates(node.clone(), [block_sender.clone(), tx_sender.clone()]));
-    tokio::spawn(publish_transactions(tx_sender, mempool.subscribe(), seen.clone()));
+    tokio::spawn(publish_transactions(tx_sender.clone(), mempool.subscribe(), Some(seen.clone())));
+    tokio::spawn(publish_transactions(tx_sender, mempool.subscribe_rebroadcast(), None));
     tokio::spawn(publish_blocks(block_sender, storage, node.peers.clone(), seen));
     Ok(())
 }
 
 /// Apply a gossiped block at tip+1, or gap-fill from the sender when it is ahead.
 async fn on_block(node: &IrohNode, storage: &Arc<Storage>, seen: &Mutex<Seen>, from: EndpointId, block: Block, verify: bool) -> Result<()> {
-    let mut tip = tip_of(storage)?;
+    let tip = tip_of(storage)?;
     if block.height <= tip.height {
+        // same height, other id → double-forge guard (optional module) checks the generator
+        if block.height + 1 >= tip.height {
+            if let Some(ours) = storage.get_block_by_height(block.height)? {
+                if ours.id != block.id {
+                    crate::delegate::guard::on_competing(crate::intake::Source::GossipIroh, &from.fmt_short().to_string(), &ours, &block);
+                }
+            }
+        }
         return Ok(());
     }
     if block.height == tip.height + 1 {
         let (h, ts, gen) = (block.height, block.timestamp, block.generator_public_key.clone());
-        tip = apply(storage, vec![block], tip, verify).await?;
+        let header = Block { transactions: Vec::new(), ..block.clone() };
+        let tip = apply(storage, vec![block], tip, verify).await?;
         crate::intake::record(crate::intake::Source::GossipIroh, from.fmt_short().to_string(), h, ts, &gen, storage.network());
+        crate::delegate::guard::on_accepted(crate::intake::Source::GossipIroh, &from.fmt_short().to_string(), &header, storage.network());
         let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
         s.heights.insert(h);
         s.trim();
@@ -221,30 +240,41 @@ async fn on_block(node: &IrohNode, storage: &Arc<Storage>, seen: &Mutex<Seen>, f
         return Ok(());
     }
     // behind: pull the gap from the announcing peer (bounded so a bogus announcement cannot stall us)
+    let tip = fill_gap_from(node, storage, from, block.height, verify).await?;
+    tracing::info!(height = tip.height, peer = %from.fmt_short(), "gap filled from iroh peer");
+    let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
+    s.heights.extend(tip.height.saturating_sub(64)..=tip.height);
+    s.trim();
+    Ok(())
+}
+
+/// Pull blocks from `from` until the local tip reaches `target` (≤ 8 RPC rounds); also used by the stall watchdog.
+pub async fn fill_gap_from(node: &IrohNode, storage: &Arc<Storage>, from: EndpointId, target: u64, verify: bool) -> Result<ChainTip> {
+    let mut tip = tip_of(storage)?;
     let mut rounds = 0;
-    while tip.height < block.height && rounds < 8 {
+    while tip.height < target && rounds < 8 {
         let batch = fetch_blocks(&node.endpoint, &node.peers, from, tip.height, super::rpc::MAX_BLOCKS).await?;
         if batch.is_empty() {
             break;
         }
-        let heights: Vec<u64> = batch.iter().map(|b| b.height).collect();
         tip = apply(storage, batch, tip, verify).await?;
-        let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
-        s.heights.extend(heights);
-        s.trim();
         rounds += 1;
     }
-    tracing::info!(height = tip.height, peer = %from.fmt_short(), "gap filled from iroh peer");
-    Ok(())
+    Ok(tip)
 }
 
-async fn publish_transactions(sender: GossipSender, mut events: tokio::sync::broadcast::Receiver<Vec<crate::models::Transaction>>, seen: Arc<Mutex<Seen>>) {
+/// `seen = Some` skips transactions that came in over gossip (fresh admissions); `None` re-publishes everything (re-broadcast
+/// of pending transactions the network has not forged).
+async fn publish_transactions(sender: GossipSender, mut events: tokio::sync::broadcast::Receiver<Vec<crate::models::Transaction>>, seen: Option<Arc<Mutex<Seen>>>) {
     loop {
         match events.recv().await {
             Ok(batch) => {
-                let fresh: Vec<_> = {
-                    let s = seen.lock().unwrap_or_else(|e| e.into_inner());
-                    batch.into_iter().filter(|t| t.id.as_ref().map_or(true, |id| !s.tx_ids.contains(id))).collect()
+                let fresh: Vec<_> = match &seen {
+                    Some(seen) => {
+                        let s = seen.lock().unwrap_or_else(|e| e.into_inner());
+                        batch.into_iter().filter(|t| t.id.as_ref().map_or(true, |id| !s.tx_ids.contains(id))).collect()
+                    }
+                    None => batch,
                 };
                 if fresh.is_empty() {
                     continue;
@@ -285,7 +315,7 @@ fn on_peers(
     for h in hints.iter().filter(|h| h.port == table.port()).take(64) {
         if table.add(&h.ip) {
             table.record_success(&h.ip, Duration::from_millis(h.latency_ms.max(1)), Some(h.height));
-            table.set_version(&h.ip, &h.version);
+            table.set_version(&h.ip, &h.version, false);
             added += 1;
         }
     }
@@ -381,6 +411,9 @@ async fn publish_peers(senders: [GossipSender; 2], table: Arc<crate::p2p_legacy:
     }
 }
 
+/// Votes per `Finality` gossip message (~2.6 KiB of JSON), safe for peers with the 4 KiB default message limit.
+pub const FINALITY_VOTES_PER_MESSAGE: usize = 8;
+
 /// SHIP-35: vote for every new tip with our active delegate keys (any source: forged, gossip, legacy port); the vote is
 /// re-sent once a slot later while the block is not yet certified, so late neighbours still collect it.
 async fn publish_finality(node: Arc<super::IrohNode>, sender: GossipSender, storage: Arc<Storage>) {
@@ -405,9 +438,24 @@ async fn publish_finality(node: Arc<super::IrohNode>, sender: GossipSender, stor
             voted = Some((tip.height, id, std::time::Instant::now(), true));
             continue;
         }
-        match sender.broadcast(GossipMessage::Finality { votes: votes.clone() }.encode().into()).await {
-            Ok(()) => tracing::info!(height = tip.height, votes = votes.len(), resend, "finality votes published"),
-            Err(e) => tracing::debug!(error = %e, "finality vote broadcast failed"),
+        // ≤ FINALITY_VOTES_PER_MESSAGE votes per gossip message: a JSON vote is ~320 bytes and every peer must accept the
+        // message under its own max_message_size (4 KiB on nodes before 0.25.12); the broadcast never blocks the loop
+        let mut sent = 0;
+        for chunk in votes.chunks(FINALITY_VOTES_PER_MESSAGE) {
+            match tokio::time::timeout(Duration::from_secs(5), sender.broadcast(GossipMessage::Finality { votes: chunk.to_vec() }.encode().into())).await {
+                Ok(Ok(())) => sent += chunk.len(),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, height = tip.height, votes = chunk.len(), "finality vote broadcast failed — own votes are counted locally, peers miss them");
+                    node.finality.note_broadcast_failed(e.to_string());
+                }
+                Err(_) => {
+                    tracing::warn!(height = tip.height, "finality vote broadcast timed out (gossip topic stuck?) — own votes are counted locally");
+                    node.finality.note_broadcast_failed("broadcast timed out after 5s");
+                }
+            }
+        }
+        if sent > 0 {
+            tracing::info!(height = tip.height, votes = sent, resend, "finality votes published");
         }
         voted = Some((tip.height, id, std::time::Instant::now(), resend));
     }

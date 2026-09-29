@@ -1,13 +1,18 @@
+#![recursion_limit = "256"]
 //! Author: TechnoL0g
 //!
 //! `sth-core` — SmartHoldem relay node core.
 //! Rust rewrite of the `@smartholdem/core` data structures, cryptography and state storage.
 
+pub mod alerts;
 pub mod api;
+pub mod banner;
+pub mod console;
 pub mod cli;
 pub mod config;
 pub mod crypto;
 pub mod delegate;
+pub mod doctor;
 pub mod error;
 pub mod genesis;
 pub mod intake;

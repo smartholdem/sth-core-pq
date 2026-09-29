@@ -194,8 +194,13 @@ fn proven_double_vote_excludes_the_delegate_for_slashing_rounds_in_hard_mode() {
     let active = n.storage.active_delegates(3).unwrap();
     assert_eq!(active.len(), 2, "only three delegates exist, the cheater is skipped");
     assert!(active.iter().all(|d| d.public_key != cheater.public_key_hex()));
-    // round snapshots (what forging_order uses) inherit the exclusion
-    let order = sth_core::delegate::round::forging_order(&n.storage, round_now, 3).unwrap();
+    // the running round keeps its boundary snapshot; the snapshot taken at the next boundary (height 3 → round 2)
+    // inherits the exclusion — that is what forging_order uses
+    assert!(sth_core::delegate::round::forging_order(&n.storage, round_now, 3).unwrap().is_some());
+    let _b3 = n.forge(1);
+    assert_eq!(n.storage.get_last_height().unwrap(), 3);
+    let order = sth_core::delegate::round::forging_order(&n.storage, round_now + 1, 3).unwrap().expect("snapshot at boundary 3");
+    assert_eq!(order.len(), 2);
     assert!(order.iter().all(|d| d.public_key != cheater.public_key_hex()));
 
     // a proof from the network is re-verified: forged signature / non-delegate / identical ids are refused
@@ -221,7 +226,7 @@ fn proven_double_vote_excludes_the_delegate_for_slashing_rounds_in_hard_mode() {
     inflated.signatures = [a3.signature, b3.signature];
     inflated.banned_until_round = 1_000_000;
     assert!(tracker.adopt_proof(&inflated).unwrap());
-    assert_eq!(n.storage.equivocation(&cheater.public_key_hex()).unwrap().unwrap().banned_until_round, round_now + 30);
+    assert_eq!(n.storage.equivocation(&cheater.public_key_hex()).unwrap().unwrap().banned_until_round, round_now + 1 + 30, "clamped to the current round (2 after block 3) + 30");
     assert_eq!(n.storage.equivocation_history(&cheater.public_key_hex()).unwrap().iter().map(|p| p.height).collect::<Vec<_>>(), vec![2, 3], "history keeps every height");
     assert_eq!(n.storage.banned_delegates(round_now, 3).unwrap(), vec![cheater.public_key_hex()], "one entry per delegate");
 }
@@ -265,4 +270,37 @@ async fn dashboard_shows_double_votes_and_proof_history() {
     assert_eq!(eq[0]["blockIds"].as_array().unwrap().len(), 2);
     let f: serde_json::Value = reqwest::get(format!("{base}/api/ntfry/finality")).await.unwrap().json().await.unwrap();
     assert_eq!(f["data"]["equivocations"].as_array().unwrap().len(), 1);
+}
+
+/// Publisher health for the metrics page: own votes signed for the tip are reported with their age, gossip failures are
+/// counted, and a vote batch bigger than the 4 KiB gossip default is split into chunks every peer can accept.
+#[test]
+fn snapshot_reports_own_votes_and_broadcast_failures() {
+    let mut n = newnet("fin-health", false);
+    let b = n.forge(0);
+    let t = FinalityTracker::new(n.storage.clone());
+    let before = t.snapshot();
+    assert_eq!((before.own_votes_at_tip, before.last_own_vote_age, before.broadcast_failed), (0, None, 0));
+    let votes = t.own_votes(&n.delegates, b.height, b.id.as_deref().unwrap());
+    assert_eq!(votes.len(), 3);
+    let after = t.snapshot();
+    assert_eq!(after.own_votes_at_tip, 3);
+    assert!(after.last_own_vote_age.is_some_and(|a| a <= 1), "{after:?}");
+    assert_eq!(after.last_own_votes, 3);
+    t.note_broadcast_failed("broadcast timed out after 5s");
+    let s = t.snapshot();
+    assert_eq!((s.broadcast_failed, s.last_error.as_str()), (1, "broadcast timed out after 5s"));
+    let v = serde_json::to_value(&s).unwrap();
+    assert!(v["ownVotesAtTip"] == 3 && v["broadcastFailed"] == 1 && v.get("lastOwnVoteAge").is_some(), "{v}");
+
+    // 16 delegate votes ≈ 5 KiB of JSON — over the default limit; chunks of 8 stay under it
+    let keys: Vec<KeyPair> = (0..16).map(|i| KeyPair::from_passphrase(&format!("voter {i}")).unwrap()).collect();
+    let many: Vec<_> = keys.iter().map(|k| sign_vote(k, b.height, b.id.as_deref().unwrap()).unwrap()).collect();
+    let whole = sth_core::p2p_iroh::proto::GossipMessage::Finality { votes: many.clone() }.encode();
+    assert!(whole.len() > 4096, "{} bytes", whole.len());
+    for chunk in many.chunks(sth_core::p2p_iroh::FINALITY_VOTES_PER_MESSAGE) {
+        let bytes = sth_core::p2p_iroh::proto::GossipMessage::Finality { votes: chunk.to_vec() }.encode();
+        assert!(bytes.len() < 4096, "chunk of {} votes is {} bytes", chunk.len(), bytes.len());
+    }
+    assert!(sth_core::p2p_iroh::GOSSIP_MAX_MESSAGE_SIZE >= 16 * 1024);
 }

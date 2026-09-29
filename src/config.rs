@@ -55,6 +55,8 @@ pub struct Milestone {
     pub token_fees: TokenFees,
     #[serde(default = "default_token_recipients")]
     pub token_transfer_max_recipients: u16,
+    pub token_market: TokenMarketParams,
+    pub masternodes: MasternodeParams,
     /// sObject rules v2: `ntfryData` = any UTF-8 ≤ 255 bytes, type-5 names must be tickers. Off on mainnet until all
     /// delegates run this core (legacy nodes keep the base58 / free-name rules). `entityV2` is read as an alias.
     #[serde(default, alias = "entityV2")]
@@ -164,6 +166,38 @@ pub struct TokenFees {
     /// Share of the TokenInit fee sent to `burnAddress` (0 = no burn, 100 = whole fee). Milestone-switchable without a code fork.
     #[serde(default = "default_init_burn_percent")]
     pub init_burn_percent: u8,
+    /// SHIP-43 token market (default 1 STH / 0.1 STH / 0.1 STH).
+    #[serde(default = "default_meta_fee")]
+    pub sell: u64,
+    #[serde(default = "default_transfer_fee")]
+    pub buy: u64,
+    #[serde(default = "default_transfer_fee")]
+    pub cancel: u64,
+}
+
+/// `milestones[].masternodes` — SHIP-42 Service Node registry (stage 1: registration + collateral floor, no payouts).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MasternodeParams {
+    pub enabled: bool,
+    /// Balance floor of the collateral address, smartoshi (default 10 000 STH).
+    #[serde(with = "crate::models::string_u64")]
+    pub collateral_amount: u64,
+}
+
+impl Default for MasternodeParams {
+    fn default() -> Self {
+        Self { enabled: false, collateral_amount: 1_000_000_000_000 }
+    }
+}
+
+/// `milestones[].tokenMarket` — SHIP-43 partial sell orders for token balances (Rust-only network).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TokenMarketParams {
+    pub enabled: bool,
+    /// Open orders per seller per token (0 = default 64).
+    pub max_open_orders: u32,
 }
 
 fn default_init_fee() -> u64 {
@@ -199,7 +233,7 @@ impl TokenFees {
 
 impl Default for TokenFees {
     fn default() -> Self {
-        Self { init: default_init_fee(), transfer: default_transfer_fee(), transfer_per_recipient: default_transfer_per_recipient_fee(), mint: default_mint_fee(), burn: default_burn_fee(), meta: default_meta_fee(), init_burn_percent: default_init_burn_percent() }
+        Self { init: default_init_fee(), transfer: default_transfer_fee(), transfer_per_recipient: default_transfer_per_recipient_fee(), mint: default_mint_fee(), burn: default_burn_fee(), meta: default_meta_fee(), init_burn_percent: default_init_burn_percent(), sell: default_meta_fee(), buy: default_transfer_fee(), cancel: default_transfer_fee() }
     }
 }
 
@@ -243,6 +277,8 @@ impl Default for Milestone {
             schnorr_blocks: false,
             tokens: false,
             token_fees: TokenFees::default(),
+            token_market: TokenMarketParams::default(),
+            masternodes: MasternodeParams::default(),
             token_transfer_max_recipients: 64,
             finality: FinalityParams::default(),
             sobj_v2: false,
@@ -318,6 +354,8 @@ pub struct Network {
     pub nethash: String,
     /// Id of block 1 (core patches the computed genesis id with this value).
     pub genesis_block_id: String,
+    /// `totalAmount` of block 1 — the initial emission (`supply` = this + block rewards, see [`Network::supply`]).
+    pub genesis_total_amount: u64,
     pub token: String,
     pub symbol: String,
     pub explorer: String,
@@ -451,7 +489,7 @@ impl Network {
         }
         milestones.sort_by_key(|m| m.height);
         let epoch_unix = parse_epoch(&milestones[0].epoch)?;
-        let genesis_block_id = genesis_id(genesis_gz)?;
+        let (genesis_block_id, genesis_total_amount) = genesis_head(genesis_gz)?;
         Ok(Self {
             name: n.name,
             message_prefix: n.message_prefix,
@@ -460,6 +498,7 @@ impl Network {
             slip44: n.slip44,
             nethash: n.nethash,
             genesis_block_id,
+            genesis_total_amount,
             token: n.client.token,
             symbol: n.client.symbol,
             explorer: n.client.explorer,
@@ -502,6 +541,23 @@ impl Network {
         &self.genesis_gz
     }
 
+    /// Circulating supply at `height` (legacy supply calculator): genesis `totalAmount` plus the block reward of every
+    /// height `1..=height`, each taken from the milestone active at that height.
+    pub fn supply(&self, height: u64) -> u64 {
+        let mut total = self.genesis_total_amount;
+        for (i, ms) in self.milestones.iter().enumerate() {
+            if ms.reward == 0 {
+                continue;
+            }
+            let start = ms.height.max(1);
+            let end = self.milestones.get(i + 1).map(|n| n.height.saturating_sub(1)).unwrap_or(u64::MAX).min(height);
+            if end >= start {
+                total = total.saturating_add(ms.reward.saturating_mul(end - start + 1));
+            }
+        }
+        total
+    }
+
     /// Milestone in effect at `height` (last milestone with `height <= h`).
     pub fn milestone(&self, height: u64) -> &Milestone {
         let h = height.max(1);
@@ -538,15 +594,18 @@ impl Default for Network {
 }
 
 /// Only the block id is needed here; the full genesis block lives in `crate::genesis`.
-fn genesis_id(gz: &[u8]) -> Result<String> {
+fn genesis_head(gz: &[u8]) -> Result<(String, u64)> {
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Head {
         id: String,
+        #[serde(with = "crate::models::string_u64")]
+        total_amount: u64,
     }
     let mut json = Vec::new();
     std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(gz), &mut json).map_err(|e| Error::Config(format!("genesisBlock gunzip: {e}")))?;
     let h: Head = serde_json::from_slice(&json).map_err(|e| Error::Config(format!("genesisBlock.json: {e}")))?;
-    Ok(h.id)
+    Ok((h.id, h.total_amount))
 }
 
 /// Core transaction type names in type order (`/api/transactions/fees`, `/api/node/fees`).
@@ -565,7 +624,7 @@ pub const FEE_NAMES: [(&str, u16); 11] = [
     ("htlcRefund", 10),
 ];
 
-/// Total supply of the chain (smartoshi), reported by `/api/blockchain`.
+/// Mainnet emission (smartoshi): block rewards are 0, so the supply equals the genesis `totalAmount`.
 pub const TOTAL_SUPPLY: u64 = 24_977_000_000_000_000;
 
 #[cfg(test)]

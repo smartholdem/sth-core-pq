@@ -26,6 +26,10 @@ pub struct PeerStats {
     pub successes: u64,
     pub total_failures: u64,
     pub version: String,
+    /// Advertises the `@smartholdem/core-pq` plugin in `getStatus` = another PQ Node (relay coverage stats).
+    pub pq: bool,
+    /// The peer's own accepted peer list from the last probe (`getPeers`) — what legacy shows in `/api/peers`.
+    pub accepted_peers: Vec<String>,
     pub last_ok: Option<Instant>,
     pub banned_until: Option<Instant>,
     /// Most recent latency samples (ms), newest last.
@@ -58,6 +62,8 @@ impl PeerStats {
             successes: 0,
             total_failures: 0,
             version: String::new(),
+            pq: false,
+            accepted_peers: Vec::new(),
             last_ok: None,
             banned_until: None,
             latency_history: std::collections::VecDeque::with_capacity(HISTORY_LEN),
@@ -173,10 +179,21 @@ impl PeerTable {
         }
     }
 
-    pub fn set_version(&self, ip: &str, version: &str) {
+    pub fn set_version(&self, ip: &str, version: &str, pq: bool) {
         if let Some(p) = self.lock().get_mut(ip) {
             p.version = version.to_string();
+            p.pq = pq;
         }
+    }
+
+    /// `(legacy peers, PQ Nodes)` among the alive, non-banned peers.
+    pub fn alive_by_kind(&self) -> (usize, usize) {
+        let now = Instant::now();
+        self.lock().values().filter(|p| p.successes > 0 && !p.is_banned(now)).fold((0, 0), |(l, q), p| if p.pq { (l, q + 1) } else { (l + 1, q) })
+    }
+
+    pub fn is_pq(&self, ip: &str) -> bool {
+        self.lock().get(ip).is_some_and(|p| p.pq)
     }
 
     /// A `getBlocks` reply of `count` blocks arrived after `latency`; speed is normalised to a full range.
@@ -231,6 +248,27 @@ impl PeerTable {
         self.lock().values().filter(|p| !p.is_banned(now)).map(|p| p.height).max().unwrap_or(0)
     }
 
+    /// Park a peer as a block source for `d` without counting a failure (it answers fine, it is just behind).
+    pub fn park_blocks_for(&self, ip: &str, d: Duration) {
+        if let Some(p) = self.lock().get_mut(ip) {
+            p.blocks_parked_until = Some(Instant::now() + d);
+        }
+    }
+
+    /// Lift the `getBlocks` parking of every alive peer (all block sources parked while the peers still answer
+    /// `getStatus` = we punished them for our own races, not for their faults). Returns how many were unparked.
+    pub fn unpark_blocks(&self) -> usize {
+        let now = Instant::now();
+        let mut map = self.lock();
+        let mut n = 0;
+        for p in map.values_mut().filter(|p| !p.is_banned(now) && p.is_blocks_parked(now)) {
+            p.blocks_parked_until = None;
+            p.blocks_failures = 0;
+            n += 1;
+        }
+        n
+    }
+
     /// All peers sorted best-first (banned peers last).
     pub fn snapshot(&self) -> Vec<PeerStats> {
         let now = Instant::now();
@@ -273,7 +311,10 @@ impl PeerTable {
                 Some(p) => {
                     alive += 1;
                     self.record_success(&ip, p.latency, Some(p.height));
-                    self.set_version(&ip, &p.version);
+                    self.set_version(&ip, &p.version, p.pq);
+                    if let Some(st) = self.lock().get_mut(&ip) {
+                        st.accepted_peers = p.accepted;
+                    }
                     discovered += self.add_many(p.peers);
                 }
                 None => self.record_failure(&ip),
@@ -288,7 +329,34 @@ struct Probe {
     latency: Duration,
     height: u64,
     version: String,
+    pq: bool,
     peers: Vec<String>,
+    /// Unfiltered `getPeers` answer (any port) — the peer's accepted set for `acceptance_check`.
+    accepted: Vec<String>,
+}
+
+/// `acceptance_check` result: which alive peers list `me` in their accepted peer set.
+#[derive(Debug, Default)]
+pub struct AcceptanceReport {
+    pub asked: usize,
+    pub listed: usize,
+    /// `(ip, height, version, lists us)` for every peer that answered `getPeers`.
+    pub peers: Vec<(String, u64, String, bool)>,
+}
+
+/// Which alive peers list `me` in their accepted peer set. Uses the `getPeers` answers collected by the last
+/// `refresh()` probe — legacy nodes refuse a second connection from the same IP for ~1 s, so asking again right after
+/// the probe only gets one or two answers. Peers whose probe failed are not counted (`sth-core peers --accepted`).
+pub async fn acceptance_check(table: &PeerTable, me: &str, _timeout: Duration) -> AcceptanceReport {
+    let mut report = AcceptanceReport::default();
+    for p in table.snapshot().into_iter().filter(|p| p.successes > 0 && p.last_ok.is_some()) {
+        let lists = p.accepted_peers.iter().any(|ip| ip == me);
+        report.asked += 1;
+        report.listed += usize::from(lists);
+        report.peers.push((p.ip, p.height, p.version, lists));
+    }
+    report.peers.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+    report
 }
 
 async fn probe(ip: &str, port: u16, timeout: Duration) -> Option<Probe> {
@@ -297,12 +365,12 @@ async fn probe(ip: &str, port: u16, timeout: Duration) -> Option<Probe> {
     let status = peer.get_status().await.ok()?;
     let latency = started.elapsed();
     let height = status.state.as_ref().map(|s| s.height as u64).unwrap_or(0);
-    let version = status.config.map(|c| c.version).unwrap_or_default();
-    let peers = match peer.get_peers().await {
-        Ok(list) => list.into_iter().filter(|p| p.port as u16 == port).map(|p| p.ip).collect(),
-        Err(_) => Vec::new(),
+    let (version, pq) = status.config.map(|c| (c.version, c.plugins.contains_key(super::server::CORE_PQ_PLUGIN))).unwrap_or_default();
+    let (peers, accepted) = match peer.get_peers().await {
+        Ok(list) => (list.iter().filter(|p| p.port as u16 == port).map(|p| p.ip.clone()).collect(), list.into_iter().map(|p| p.ip).collect()),
+        Err(_) => (Vec::new(), Vec::new()),
     };
-    Some(Probe { latency, height, version, peers })
+    Some(Probe { latency, height, version, pq, peers, accepted })
 }
 
 #[cfg(test)]
@@ -338,6 +406,20 @@ mod tests {
         let t = PeerTable::new(4001, ["a".to_string()]);
         assert_eq!(t.add_many(["a".to_string(), "b".to_string(), " ".to_string()]), 1);
         assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn park_blocks_for_moves_lagging_source_aside_without_a_failure() {
+        let t = PeerTable::new(4001, ["fast".to_string(), "ahead".to_string()]);
+        t.record_success("fast", Duration::from_millis(5), Some(100)); // lowest latency but stuck at 100
+        t.record_success("ahead", Duration::from_millis(200), Some(103));
+        assert_eq!(t.best_for_blocks(1), vec!["fast".to_string()], "3 blocks of lag do not outweigh 195 ms of latency");
+        t.park_blocks_for("fast", Duration::from_secs(60));
+        assert_eq!(t.best_for_blocks(1), vec!["ahead".to_string()]);
+        let p = t.snapshot().into_iter().find(|p| p.ip == "fast").unwrap();
+        assert_eq!((p.blocks_failures, p.failures), (0, 0), "parking for lag is not a failure");
+        assert_eq!(t.unpark_blocks(), 1);
+        assert_eq!(t.best_for_blocks(1), vec!["fast".to_string()]);
     }
 
     #[test]

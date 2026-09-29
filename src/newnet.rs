@@ -161,6 +161,7 @@ pub fn generate(opts: &NewNetOptions, out: &Path) -> Result<NewNet> {
     cfg.p2p.use_peer_list = false;
     cfg.p2p.legacy_listen = format!("0.0.0.0:{}", opts.p2p_port);
     cfg.p2p.iroh.enabled = false;
+    cfg.p2p.iroh.bootstrap = Vec::new();
     cfg.p2p.iroh.relay = false;
     cfg.p2p.iroh.relay_n0 = false;
     cfg.delegate.enabled = true;

@@ -32,6 +32,27 @@ enum Cmd {
     Wallet { address: String },
     /// Token by ticker or id: supply, owner, manifest, holders.
     Token { ticker: String },
+    /// SHIP-42 Service Node registry (`/api/masternodes`).
+    Masternodes {
+        #[arg(long)]
+        active: bool,
+    },
+    /// Pending transactions in the node's pool (`/api/transactions/unconfirmed`), optionally of one sender.
+    Mempool {
+        #[arg(long)]
+        sender: Option<String>,
+    },
+    /// Drop pending transactions from the node's pool (all, or one sender's). Works only against 127.0.0.1 on the node host.
+    MempoolPurge {
+        #[arg(long)]
+        sender: Option<String>,
+    },
+    /// SHIP-43 order book of a token: open asks, cheapest first.
+    TokenOrders {
+        ticker: String,
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+    },
     /// Smart object (sObject) by registration id, or by name with --type.
     Obj {
         id: String,
@@ -157,6 +178,9 @@ fn describe(t: &Value, me: &str) -> String {
                 2 => format!("token {id} mint {} units {}", token["amount"], dir(token["recipientId"].as_str().unwrap_or("?"))),
                 3 => format!("token {id} burn {} units", token["amount"]),
                 4 => format!("token {id} manifest: {}", token["meta"]["name"].as_str().unwrap_or("")),
+                5 => format!("token {id} ask: {} units at {} STH/unit", token["amount"], coins(&token["price"])),
+                6 => format!("token {id} buy {} units from order {}…", token["amount"], &token["orderId"].as_str().unwrap_or("")[..8]),
+                7 => format!("token {id} cancel order {}…", &token["orderId"].as_str().unwrap_or("")[..8]),
                 _ => format!("token tx type {ty}"),
             }
         }
@@ -316,6 +340,61 @@ async fn main() -> Result<()> {
                 ("pointer", e["data"]["ntfryData"].as_str().unwrap_or("—").to_string()),
                 ("status", if e["resigned"] == true { "resigned".into() } else if e["forSale"] == true { format!("for sale: {} STH", coins(&e["price"])) } else { "active".into() }),
             ]);
+            Ok(())
+        }
+        Cmd::Masternodes { active } => {
+            let q = if active { "?active=true&limit=100" } else { "?limit=100" };
+            let r = get(&http, &api, &format!("/api/masternodes{q}")).await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            println!("service nodes: {}", r["meta"]["totalCount"]);
+            for n in r["data"].as_array().into_iter().flatten() {
+                let roles: Vec<&str> = n["roles"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+                println!("  {:<8} {:<20} {}  {}  [{}]{}  since {}", if n["active"] == true { "active" } else { n["inactiveReason"].as_str().unwrap_or("inactive") }, n["name"].as_str().unwrap_or("—"), n["address"].as_str().unwrap_or("?"), &n["endpointId"].as_str().unwrap_or("")[..16], roles.join(","), n["api"].as_str().map(|a| format!("  {a}")).unwrap_or_default(), n["since"]);
+            }
+            Ok(())
+        }
+        Cmd::Mempool { sender } => {
+            let q = sender.as_deref().map(|s| format!("?senderId={s}&limit=100")).unwrap_or_else(|| "?limit=100".into());
+            let r = get(&http, &api, &format!("/api/transactions/unconfirmed{q}")).await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            println!("pending: {}", r["meta"]["totalCount"]);
+            for t in r["data"].as_array().into_iter().flatten() {
+                println!("  nonce {:<6} {} -> {}  amount={} fee={}  age={} blocks  id={}", t["nonce"].as_str().unwrap_or("?"), t["sender"].as_str().unwrap_or("?"), t["recipient"].as_str().unwrap_or("-"), t["amount"].as_str().unwrap_or("0"), t["fee"].as_str().unwrap_or("0"), t["pool"]["ageBlocks"], t["id"].as_str().unwrap_or("?"));
+            }
+            Ok(())
+        }
+        Cmd::MempoolPurge { sender } => {
+            let q = sender.as_deref().map(|s| format!("?senderId={s}")).unwrap_or_default();
+            let url = format!("{api}/api/transactions/unconfirmed{q}");
+            let r = http.delete(&url).timeout(Duration::from_secs(20)).send().await.with_context(|| format!("DELETE {url}"))?;
+            if r.status() == reqwest::StatusCode::FORBIDDEN {
+                bail!("refused: purge is accepted only from 127.0.0.1 on the node host (run sth-cli on the node with --api http://127.0.0.1:4003)");
+            }
+            let v: Value = r.error_for_status()?.json().await?;
+            println!("removed {} pending transaction(s){}", v["data"]["removed"], sender.map(|s| format!(" of {s}")).unwrap_or_default());
+            Ok(())
+        }
+        Cmd::TokenOrders { ticker, page } => {
+            let r = get(&http, &api, &format!("/api/tokens/{ticker}/orders?page={page}&limit=100")).await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            let m = &r["meta"];
+            println!("open asks for {}: {} (page {} / {})", ticker.to_uppercase(), m["totalCount"], m["page"], m["pageCount"]);
+            for o in r["data"].as_array().into_iter().flatten() {
+                let dec = o["decimals"].as_u64().unwrap_or(0) as u32;
+                let scale = 10f64.powi(dec as i32);
+                let remaining = o["remaining"].as_str().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / scale;
+                let price_unit = o["price"].as_str().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                println!("  {:>14.8} STH/token  {:>16.*} left  total {:>12} STH  {}  order {}", price_unit * scale / 1e8, dec as usize, remaining, coins(&o["total"]), o["seller"].as_str().unwrap_or("?"), &o["orderId"].as_str().unwrap_or("")[..16]);
+            }
             Ok(())
         }
         Cmd::Market { r#type, page } => {

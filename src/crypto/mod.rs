@@ -17,7 +17,7 @@ mod tx_deserializer;
 mod tx_serializer;
 
 pub use address::{address_from_bytes, address_from_multi_signature, address_from_public_key, address_to_bytes, validate_address};
-pub use block_deserializer::deserialize_block_header;
+pub use block_deserializer::{deserialize_block_header, deserialize_block_header_prefix};
 pub use block_serializer::{
     serialize_block_with_transactions,
     block_id, block_payload_hash, block_pq_message, block_signing_hash, serialize_block, verify_block,

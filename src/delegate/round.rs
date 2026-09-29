@@ -56,8 +56,17 @@ pub fn shuffle(delegates: &mut [DelegateRank], round: u64) {
     }
 }
 
-/// Forging order for `round` from the current ranking (or the stored round snapshot).
-pub fn forging_order(storage: &Storage, round: u64, max_delegates: usize) -> Result<Vec<DelegateRank>> {
+/// Forging order for `round` from the stored round snapshot (taken atomically after the boundary block, legacy
+/// `applyRound`). `Ok(None)` when the snapshot is missing — the forger must NOT guess from live balances: a mid-round
+/// ranking gives other delegates' slots (mainnet 2026-09-20: slot 12079774 forged as nicholasflamel, network: titan).
+pub fn forging_order(storage: &Storage, round: u64, _max_delegates: usize) -> Result<Option<Vec<DelegateRank>>> {
+    let Some(mut list) = storage.get_round(round)? else { return Ok(None) };
+    shuffle(&mut list, round);
+    Ok(Some(list))
+}
+
+/// Forging order for display (`/api/rounds/:round/delegates`): the snapshot, or the live ranking when none exists.
+pub fn forging_order_or_live(storage: &Storage, round: u64, max_delegates: usize) -> Result<Vec<DelegateRank>> {
     let mut list = match storage.get_round(round)? {
         Some(l) => l,
         None => storage.active_delegates(max_delegates)?,

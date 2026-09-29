@@ -5,7 +5,7 @@
 
 use super::render::human_time;
 use super::{last_height, not_found, paginate, slice_page, ApiResult, Params, Shared};
-use crate::config::{FEE_NAMES, TOTAL_SUPPLY};
+use crate::config::FEE_NAMES;
 use crate::error::Error;
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -21,7 +21,7 @@ pub async fn hello() -> ApiResult {
 
 pub async fn blockchain(State(st): State<Shared>) -> ApiResult {
     let last = st.storage.get_last_block()?.ok_or_else(|| not_found("Block"))?;
-    Ok(Json(json!({ "data": { "block": { "height": last.height, "id": last.id }, "supply": TOTAL_SUPPLY.to_string() } })))
+    Ok(Json(json!({ "data": { "block": { "height": last.height, "id": last.id }, "supply": st.network.supply(last.height).to_string() } })))
 }
 
 pub async fn status(State(st): State<Shared>) -> ApiResult {
@@ -30,6 +30,8 @@ pub async fn status(State(st): State<Shared>) -> ApiResult {
     Ok(Json(json!({ "data": {
         "synced": network_height.saturating_sub(h) <= 1,
         "now": h,
+        "irohEndpointId": st.iroh.as_ref().map(|i| i.id().to_string()),
+        "irohWalletApi": st.iroh.as_ref().map(|i| i.wallet_api.stats_json()),
         "blocksCount": network_height as i64 - h as i64,
         "timestamp": st.network.now_epoch(),
     } })))
@@ -63,7 +65,7 @@ pub async fn configuration(State(st): State<Shared>) -> ApiResult {
         json!({ "enabled": false })
     };
     Ok(Json(json!({ "data": {
-        "core": { "version": env!("CARGO_PKG_VERSION"), "implementation": "sth-core-rust" },
+        "core": { "version": env!("CARGO_PKG_VERSION"), "implementation": "sth-core-pq" },
         "quantumShield": { "stage": if m.pq.blocks { "C" } else if m.pq.active { "B" } else { "A" }, "algorithms": [crate::crypto::pq::ALG_ML_DSA_44], "commitmentPrefix": crate::crypto::pq::COMMITMENT_PREFIX, "activation": st.network.pq_activation_height() },
         "pq": { "active": m.pq.active, "activation": st.network.pq_activation_height(), "algorithms": if m.pq.active { vec![crate::crypto::pq::ALG_ML_DSA_44] } else { vec![] }, "feePerByte": m.pq.fee_per_byte.to_string(), "commitmentGrace": m.pq.commitment_grace, "publicKeyBytes": crate::crypto::pq::PK_LEN, "signatureBytes": crate::crypto::pq::SIG_LEN,
             "blocks": m.pq.blocks, "blocksActivation": st.network.pq_blocks_activation_height(), "blocksGrace": m.pq.blocks_grace, "blockVersion": if m.pq.blocks { crate::models::BLOCK_VERSION_PQ } else { m.block_version() } },
@@ -81,6 +83,8 @@ pub async fn configuration(State(st): State<Shared>) -> ApiResult {
             "block": { "version": m.block_version(), "idFullSha256": m.id_full_sha256(), "maxTransactions": m.max_transactions(), "maxPayload": m.max_payload() },
             "epoch": human_time(st.network.epoch_unix),
             "tokens": m.tokens,
+            "tokenMarket": token_market_json(m),
+            "masternodes": masternodes_json(m),
             "tokenFees": { "init": m.token_fees.init.to_string(), "transfer": m.token_fees.transfer.to_string(), "transferPerRecipient": m.token_fees.transfer_per_recipient.to_string(), "mint": m.token_fees.mint.to_string(), "burn": m.token_fees.burn.to_string(), "meta": m.token_fees.meta.to_string(), "initBurnPercent": m.token_fees.init_burn_percent, "initBurn": m.token_fees.init_burn().to_string() }, "tokenMetaMaxLogoBytes": crate::models::token::META_MAX_LOGO, "sobjV2": m.sobj_v2, "strictBalance": m.strict_balance, "minCoreVersion": m.min_core_version,
             "tokenTransferMaxRecipients": m.token_transfer_max_recipients,
             "tokenTickerSobjType": crate::models::token::TICKER_SOBJ_TYPE,
@@ -115,6 +119,15 @@ fn static_fee_map(st: &Shared) -> Result<Map<String, Value>, Error> {
     Ok(st.network.static_fees(h).into_iter().map(|(name, _, fee)| (name.to_string(), json!(fee.to_string()))).collect())
 }
 
+fn token_market_json(m: &crate::config::Milestone) -> Value {
+    let max = if m.token_market.max_open_orders == 0 { crate::rules::MAX_OPEN_ORDERS as u32 } else { m.token_market.max_open_orders };
+    json!({ "enabled": m.token_market.enabled, "maxOpenOrders": max, "fees": { "sell": m.token_fees.sell.to_string(), "buy": m.token_fees.buy.to_string(), "cancel": m.token_fees.cancel.to_string() } })
+}
+
+fn masternodes_json(m: &crate::config::Milestone) -> Value {
+    json!({ "enabled": m.masternodes.enabled, "collateralAmount": m.masternodes.collateral_amount.to_string() })
+}
+
 pub async fn transaction_fees(State(st): State<Shared>) -> ApiResult {
     use crate::models::sobj;
     let mut data = json!({ "1": Value::Object(static_fee_map(&st)?) });
@@ -124,33 +137,125 @@ pub async fn transaction_fees(State(st): State<Shared>) -> ApiResult {
     Ok(Json(json!({ "data": data })))
 }
 
-/// Fee statistics over the last `days` (1–30, default 7) from the chain (`avg/max/min/sum` per type).
-pub async fn fees(State(st): State<Shared>, Query(q): Query<Params>) -> ApiResult {
-    let days = q.parse::<u32>("days").unwrap_or(7).clamp(1, 30);
-    let tip = last_height(&st)?;
-    let since = st.network.now_epoch().saturating_sub(days * 86_400);
-    let from = st.storage.height_at_or_after(since)?;
-    let mut stats: std::collections::BTreeMap<(u32, u16), (u64, u64, u64, u64)> = Default::default();
-    let mut h = from;
-    while h <= tip {
-        for b in st.storage.get_blocks_from(h, 1_000)? {
-            for tx in &b.transactions {
-                let e = stats.entry((tx.type_group, tx.type_)).or_insert((0, 0, u64::MAX, 0));
-                e.0 += 1;
-                e.1 = e.1.max(tx.fee);
-                e.2 = e.2.min(tx.fee);
-                e.3 += tx.fee;
-            }
-        }
-        h += 1_000;
+#[derive(Clone, Copy)]
+struct FeeAgg {
+    count: u64,
+    sum: u64,
+    max: u64,
+    min: u64,
+}
+
+impl FeeAgg {
+    const EMPTY: FeeAgg = FeeAgg { count: 0, sum: 0, max: 0, min: u64::MAX };
+
+    fn add(&mut self, fee: u64) {
+        self.count += 1;
+        self.sum += fee;
+        self.max = self.max.max(fee);
+        self.min = self.min.min(fee);
     }
+
+    fn json(&self) -> Value {
+        json!({ "count": self.count, "avg": (self.sum / self.count.max(1)).to_string(), "max": self.max.to_string(), "min": self.min.to_string(), "sum": self.sum.to_string() })
+    }
+}
+
+fn fee_name(type_: u16) -> String {
+    FEE_NAMES.iter().find(|(_, t)| *t == type_).map(|(n, _)| n.to_string()).unwrap_or_else(|| type_.to_string())
+}
+
+fn types_json(stats: &std::collections::BTreeMap<(u32, u16), FeeAgg>) -> Value {
     let mut data: Map<String, Value> = Map::new();
-    for ((group, type_), (count, max, min, sum)) in stats {
-        let name = FEE_NAMES.iter().find(|(_, t)| *t == type_).map(|(n, _)| n.to_string()).unwrap_or_else(|| type_.to_string());
-        let entry = json!({ "avg": (sum / count.max(1)).to_string(), "max": max.to_string(), "min": min.to_string(), "sum": sum.to_string() });
-        data.entry(group.to_string()).or_insert_with(|| Value::Object(Map::new()))[name] = entry;
+    for ((group, type_), agg) in stats {
+        data.entry(group.to_string()).or_insert_with(|| Value::Object(Map::new()))[fee_name(*type_)] = agg.json();
+    }
+    Value::Object(data)
+}
+
+/// Every transaction whose block timestamp is in `[from_ts, to_ts]`, oldest first, straight from the height-ordered index
+/// (empty blocks are never decoded). `f(tx, block timestamp, height)`.
+fn scan_transactions(st: &Shared, from_ts: u32, to_ts: u32, mut f: impl FnMut(&crate::models::Transaction, u32, u64)) -> Result<(), super::ApiError> {
+    let Some(heights) = st.storage.heights_for_timestamps(Some(from_ts), Some(to_ts))? else { return Ok(()) };
+    let mut cache = None;
+    for entry in st.storage.transaction_index(None, heights, true) {
+        let entry = entry?;
+        if let Some((tx, ts)) = st.storage.transaction_at(&entry, &mut cache)? {
+            f(&tx, ts, entry.height);
+        }
+    }
+    Ok(())
+}
+
+/// Fee statistics over the last `days` (default 7): `avg/max/min/sum` per type (1–30 days, legacy shape), or with
+/// `groupBy=day` one bucket per UTC calendar day (1–90 days, oldest first) computed in a single pass; closed days are cached.
+pub async fn fees(State(st): State<Shared>, Query(q): Query<Params>) -> ApiResult {
+    if q.get("groupBy").map(|g| g == "day").unwrap_or(false) {
+        return fees_by_day(&st, &q);
+    }
+    let days = q.parse::<u32>("days").unwrap_or(7).clamp(1, 30);
+    let since = st.network.now_epoch().saturating_sub(days * 86_400);
+    let mut stats: std::collections::BTreeMap<(u32, u16), FeeAgg> = Default::default();
+    scan_transactions(&st, since, u32::MAX, |tx, _, _| stats.entry((tx.type_group, tx.type_)).or_insert(FeeAgg::EMPTY).add(tx.fee))?;
+    let mut data: Map<String, Value> = Map::new();
+    for ((group, type_), agg) in &stats {
+        let entry = json!({ "avg": (agg.sum / agg.count.max(1)).to_string(), "max": agg.max.to_string(), "min": agg.min.to_string(), "sum": agg.sum.to_string() });
+        data.entry(group.to_string()).or_insert_with(|| Value::Object(Map::new()))[fee_name(*type_)] = entry;
     }
     Ok(Json(json!({ "meta": { "days": days }, "data": Value::Object(data) })))
+}
+
+fn fees_by_day(st: &Shared, q: &Params) -> ApiResult {
+    let days = q.parse::<i64>("days").unwrap_or(7).clamp(1, 90);
+    let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let today = now_unix - now_unix.rem_euclid(86_400);
+    let first_day = today - (days - 1) * 86_400;
+    // a day is closed (immutable) once it ended more than 10 minutes ago — safe past any live rollback window
+    let closed_before = now_unix - 600;
+    let mut out: Vec<Value> = Vec::with_capacity(days as usize);
+    let cached: Vec<Option<Value>> = {
+        let cache = st.fee_days_cache.lock().expect("fee cache poisoned");
+        (0..days).map(|i| cache.get(&(first_day + i * 86_400)).cloned()).collect()
+    };
+    // scan only the uncached span (from the first missing day to today) in one pass
+    let first_missing = cached.iter().position(|c| c.is_none()).map(|i| first_day + i as i64 * 86_400);
+    let mut buckets: std::collections::BTreeMap<i64, (u64, u64, std::collections::BTreeSet<u64>, std::collections::BTreeMap<(u32, u16), FeeAgg>)> = Default::default();
+    if let Some(start) = first_missing {
+        let from_ts = st.network.unix_to_epoch(start.max(st.network.epoch_unix));
+        scan_transactions(st, from_ts, u32::MAX, |tx, ts, height| {
+            let unix = st.network.epoch_to_unix(ts);
+            let day = unix - unix.rem_euclid(86_400);
+            let b = buckets.entry(day).or_default();
+            b.0 += 1;
+            b.1 += tx.fee;
+            b.2.insert(height);
+            b.3.entry((tx.type_group, tx.type_)).or_insert(FeeAgg::EMPTY).add(tx.fee);
+        })?;
+    }
+    let mut cache = st.fee_days_cache.lock().expect("fee cache poisoned");
+    for (i, c) in cached.into_iter().enumerate() {
+        let day = first_day + i as i64 * 86_400;
+        let v = match c {
+            Some(v) => v,
+            None => {
+                let (count, sum, blocks, types) = buckets.remove(&day).unwrap_or_default();
+                let v = json!({
+                    "day": &human_time(day)[..10],
+                    "from": day,
+                    "to": day + 86_400,
+                    "count": count,
+                    "sum": sum.to_string(),
+                    "blocks": blocks.len(),
+                    "types": types_json(&types),
+                });
+                if day + 86_400 < closed_before {
+                    cache.insert(day, v.clone());
+                }
+                v
+            }
+        };
+        out.push(v);
+    }
+    Ok(Json(json!({ "meta": { "days": days, "groupBy": "day", "epoch": st.network.epoch_unix, "cachedDays": cache.len() }, "data": out })))
 }
 
 pub async fn transaction_types(State(st): State<Shared>) -> ApiResult {
@@ -177,6 +282,11 @@ pub async fn transaction_types(State(st): State<Shared>) -> ApiResult {
     let mut data = json!({ "1": Value::Object(core), "2": Value::Object(sobj_types) });
     if st.network.milestone(last_height(&st)? + 1).tokens {
         data["3"] = json!({ "TokenInit": 0, "TokenTransfer": 1, "TokenMint": 2, "TokenBurn": 3, "TokenMeta": 4 });
+        if st.network.milestone(last_height(&st)? + 1).token_market.enabled {
+            data["3"]["TokenSell"] = json!(5);
+            data["3"]["TokenBuy"] = json!(6);
+            data["3"]["TokenCancel"] = json!(7);
+        }
     }
     Ok(Json(json!({ "data": data })))
 }

@@ -173,3 +173,56 @@ fn sth_cli_rounds_the_ship41_minimum_up_to_a_thousandth_of_sth() {
     assert_eq!(sth_core::cli::dynamic_fee(&df2, "transfer", 100), 1_000_000);
     assert_eq!(sth_core::cli::dynamic_fee(&df2, "vote", 158), 1_300_000, "(100 + 158) × 5000 = 1 290 000 → 0.013 STH");
 }
+
+/// Fee advisor: legacy Core 3.8.2 pools take only the static fee (default) — a cheaper or different fee is accepted here
+/// (dynamic policy) but flagged, because only PQ delegates will forge it. With `legacy_dynamic_fees` the floor is the
+/// dynamic minimum instead.
+#[tokio::test]
+async fn fee_advisor_flags_fees_the_legacy_pools_refuse() {
+    let (storage, alice, bob) = funded_chain();
+    let pool = Mempool::new(storage.clone(), vec![], 100);
+    assert!(!pool.legacy_dynamic_fees());
+    assert_eq!(pool.legacy_min_transfer_fee(), 100_000_000, "static transfer fee of the milestone");
+
+    let cheap = transfer(&alice, 1, &bob, 25_000_000);
+    assert_eq!(pool.legacy_min_fee(&cheap), Some(100_000_000));
+    let hint = pool.fee_hint(&cheap).expect("0.25 STH is below the legacy static fee");
+    assert_eq!(hint["fee"], "25000000");
+    assert_eq!(hint["legacyMinFee"], "100000000");
+    assert_eq!(hint["legacyDynamicFees"], false);
+    let msg = hint["message"].as_str().unwrap();
+    assert!(msg.contains("below the legacy pool minimum 1.00000000 STH") && msg.contains("only PQ delegates") && msg.contains("use exactly 1.00000000 STH"), "{msg}");
+
+    let rich = transfer(&alice, 1, &bob, 200_000_000);
+    let msg = pool.fee_hint(&rich).expect("static pools refuse a fee above the static fee too")["message"].as_str().unwrap().to_string();
+    assert!(msg.contains("does not match the static fee"), "{msg}");
+    assert!(pool.fee_hint(&transfer(&alice, 1, &bob, 100_000_000)).is_none(), "the static fee is fine everywhere");
+
+    // the cheap one enters our (dynamic) pool and is counted as refused-by-legacy for the metrics page
+    let (resp, errors) = pool.add_many(vec![cheap]).await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(resp.accept.len(), 1);
+    assert_eq!(pool.below_legacy_min().await, 1);
+
+    // legacy peers with dynamic fees: the dynamic minimum is the floor, anything above is fine
+    let pool = Mempool::new(storage, vec![], 100).with_legacy_dynamic_fees(true);
+    let probe = transfer(&alice, 2, &bob, 1);
+    let min = (100 + wire_bytes(&probe) as u64) * 3_000;
+    assert_eq!(pool.legacy_min_fee(&probe), Some(min));
+    assert_eq!(pool.legacy_min_transfer_fee(), (100 + 156) * 3_000);
+    assert!(pool.fee_hint(&transfer(&alice, 2, &bob, 25_000_000)).is_none());
+    assert!(pool.fee_hint(&transfer(&alice, 2, &bob, 200_000_000)).is_none());
+    let hint = pool.fee_hint(&probe).unwrap();
+    assert_eq!(hint["legacyDynamicFees"], true);
+    assert!(hint["message"].as_str().unwrap().contains("at least"), "{hint}");
+}
+
+#[test]
+fn legacy_dynamic_fees_round_trips_in_node_yaml() {
+    let cfg = NodeConfig::default();
+    assert!(!cfg.mempool.legacy_dynamic_fees, "mainnet legacy peers demand the static fee");
+    let parsed = NodeConfig::parse("mempool:\n  legacy_dynamic_fees: true\n").unwrap();
+    assert!(parsed.mempool.legacy_dynamic_fees);
+    assert!(NodeConfig::default_yaml().contains("legacy_dynamic_fees: false"));
+    assert_eq!(parsed.mempool.max_size, cfg.mempool.max_size, "partial override keeps the other defaults");
+}

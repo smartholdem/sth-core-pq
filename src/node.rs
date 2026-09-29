@@ -81,6 +81,13 @@ impl NodeContext {
     pub async fn open(config: NodeConfig) -> Result<Self> {
         config.validate()?;
         let network = config.load_network()?;
+        {
+            let label = if config.p2p.legacy_public_addr.trim().is_empty() { network.name.clone() } else { config.p2p.legacy_public_addr.trim().to_string() };
+            crate::alerts::init(&config.alerts, label);
+            if crate::alerts::enabled() {
+                tracing::info!(telegram = !config.alerts.telegram_chat_id.is_empty(), webhook = !config.alerts.webhook_url.is_empty(), "operator alerts enabled");
+            }
+        }
         let storage = Arc::new(Storage::open_with_cache(Path::new(&config.db_path), network.clone(), config.db_cache_mb)?);
         storage.ensure_vote_index()?;
         let reward_address = config.reward_address()?;
@@ -101,7 +108,10 @@ impl NodeContext {
             Mempool::new(storage.clone(), config.sync.rest_nodes.clone(), config.mempool.max_size)
         }
         .with_max_bytes(config.mempool.max_bytes)
-        .with_dynamic_fees(config.mempool.dynamic_fees.clone()));
+        .with_max_age_blocks(config.mempool.max_age_blocks)
+        .with_rebroadcast_blocks(config.mempool.rebroadcast_blocks)
+        .with_dynamic_fees(config.mempool.dynamic_fees.clone())
+        .with_legacy_dynamic_fees(config.mempool.legacy_dynamic_fees));
         Ok(Self { config, network, storage, mempool, peers, reward_address, iroh: None, forging: None, delegate_secrets })
     }
 
@@ -111,11 +121,52 @@ impl NodeContext {
             return Ok(());
         }
         let secret = crate::p2p_iroh::load_or_create_secret(Path::new(&cfg.secret_key_file))?;
-        let bootstrap = cfg.bootstrap.iter().map(|s| crate::p2p_iroh::parse_endpoint_id(s)).collect::<Result<Vec<_>>>()?;
+        let mut bootstrap = Vec::new();
+        let mut pinned = Vec::new();
+        for s in &cfg.bootstrap {
+            let (id, addr) = crate::p2p_iroh::addrbook::parse_bootstrap(s)?;
+            bootstrap.push(id);
+            if let Some(sock) = addr {
+                pinned.push(iroh::EndpointAddr::new(id).with_ip_addr(sock));
+            }
+        }
         let gateway = Some(self.config.p2p.legacy_public_addr.trim().to_string()).filter(|g| !g.is_empty() && !self.config.p2p.legacy_listen.trim().is_empty());
-        let relay = cfg.relay.then(|| crate::p2p_iroh::RelaySetup { n0: cfg.relay_n0, extra: cfg.relays.clone() });
-        let node = IrohNode::spawn(secret, bootstrap, cfg.serve_blocks, relay, self.storage.clone(), self.mempool.clone(), self.config.sync.verify_blocks, Some(self.peers.clone()), gateway).await?;
+        let relay = cfg.relay.then(|| crate::p2p_iroh::RelaySetup { n0: cfg.relay_n0, extra: cfg.relays.clone(), guard: cfg.relay_guard.clone() });
+        let discovery = crate::p2p_iroh::DiscoveryOpts { cfg: cfg.discovery.clone(), pinned };
+        let node = IrohNode::spawn_with(secret, bootstrap, cfg.serve_blocks, relay, self.storage.clone(), self.mempool.clone(), self.config.sync.verify_blocks, Some(self.peers.clone()), gateway, Some(discovery)).await?;
         self.iroh = Some(node);
+        Ok(())
+    }
+
+    /// Legacy-style startup summary: node, database tip, milestone rules, modules, transaction types, state counters.
+    async fn log_banner(&self) -> Result<()> {
+        let st = self.storage.clone();
+        let scan = self.config.startup_scan;
+        let (tip, wallets, delegates, pq_c, pq_k) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let w = scan.then(|| st.wallet_count());
+            Ok((st.get_last_block()?, w, st.delegate_count(), st.pq_commitment_count(), st.pq_key_count()))
+        })
+        .await
+        .map_err(|e| Error::Sync(format!("banner task failed: {e}")))??;
+        let tip_height = tip.as_ref().map(|b| b.height).unwrap_or(0);
+        let facts = crate::banner::Facts {
+            tip_height,
+            tip_id: tip.as_ref().and_then(|b| b.id.clone()),
+            tip_age_secs: tip.as_ref().map(|b| i64::from(self.network.now_epoch()) - i64::from(b.timestamp)),
+            wallets,
+            delegates,
+            pq_commitments: pq_c,
+            pq_keys: pq_k,
+            pending: self.mempool.len().await,
+            legacy_peers: self.peers.len(),
+            iroh: self.iroh.as_ref().map(|n| (n.id().fmt_short().to_string(), n.connected_relays())),
+            forging_keys: self.delegate_secrets.len(),
+            min_transfer_fee: self.mempool.min_transfer_fee(),
+            legacy_min_transfer_fee: self.mempool.legacy_min_transfer_fee(),
+            legacy_dynamic_fees: self.mempool.legacy_dynamic_fees(),
+            wallet_api_url: self.iroh.as_ref().filter(|_| self.config.p2p.iroh.wallet_api.enabled).map(|n| n.wallet_api.api_url("sth-core")),
+        };
+        crate::banner::print(&self.config, &self.network, &self.network.milestone(tip_height + 1), &facts);
         Ok(())
     }
 
@@ -139,6 +190,8 @@ impl NodeContext {
                 .await
                 .map_err(|e| Error::Sync(format!("genesis task failed: {e}")))??;
         }
+        self.log_banner().await?;
+        let mut forging_keys = Vec::new();
         if !self.delegate_secrets.is_empty() {
             let mut pq_secrets = cfg.delegate.pq_secrets.clone();
             if let Ok(v) = std::env::var("STH_DELEGATE_PQ_PASSPHRASE") {
@@ -162,9 +215,12 @@ impl NodeContext {
             if let Some(iroh) = &self.iroh {
                 iroh.set_forging_keys(forger.keys(), cfg.delegate.announce);
             }
+            forging_keys = forger.public_keys();
             self.forging = Some(forger.status.clone());
             tokio::spawn(forger.run());
         }
+        // optional module: detects a delegate key running on two nodes (relays report competing blocks too)
+        crate::delegate::guard::init(&cfg.delegate.guard, forging_keys, self.storage.clone());
         if cfg.api.enabled {
             let addr: SocketAddr = format!("{}:{}", cfg.api.host, cfg.api.port)
                 .parse()
@@ -183,7 +239,23 @@ impl NodeContext {
                 "" => None,
                 s => Some(s.parse().map_err(|e| Error::Config(format!("invalid api.metrics_listen: {e}")))?),
             };
-            let state = Arc::new(state.with_metrics_page(cfg.api.page_metrics && metrics_addr.is_none()));
+            let state = Arc::new(state.with_metrics_page(cfg.api.page_metrics && metrics_addr.is_none()).with_cors_origins(cfg.api.cors_origins.clone()));
+            if let Some(iroh) = self.iroh.as_ref().filter(|_| cfg.p2p.iroh.wallet_api.enabled) {
+                let wa = &cfg.p2p.iroh.wallet_api;
+                iroh.wallet_api.attach(state.clone(), wa.clone());
+                tracing::info!(url = %iroh.wallet_api.api_url("sth-core"), max_connections = wa.max_connections, rate_limit_rps = wa.rate_limit_rps, "SHIP-44 wallet api on iroh: netfory/api/1 (REST) + sth/events/1 (push)");
+                let wb = &cfg.p2p.iroh.ws_bridge;
+                if wb.enabled {
+                    let listen: SocketAddr = wb.listen.parse().map_err(|e| Error::Config(format!("invalid p2p.iroh.ws_bridge.listen: {e}")))?;
+                    let default_node = Some(wb.default_node.trim()).filter(|s| !s.is_empty()).map(crate::p2p_iroh::parse_endpoint_id).transpose()?;
+                    let node = iroh.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::p2p_iroh::ws_bridge::serve(node, listen, default_node).await {
+                            tracing::error!(error = %e, "ws bridge stopped");
+                        }
+                    });
+                }
+            }
             if cfg.api.page_metrics {
                 match metrics_addr {
                     Some(maddr) => {
@@ -205,7 +277,7 @@ impl NodeContext {
         }
         if !cfg.p2p.legacy_listen.trim().is_empty() {
             let addr: SocketAddr = cfg.p2p.legacy_listen.trim().parse().map_err(|e| Error::Config(format!("invalid p2p.legacy_listen: {e}")))?;
-            let server = crate::p2p_legacy::LegacyServer::new(self.storage.clone(), self.mempool.clone(), self.peers.clone(), cfg.sync.verify_blocks);
+            let server = crate::p2p_legacy::LegacyServer::new(self.storage.clone(), self.mempool.clone(), self.peers.clone(), cfg.sync.verify_blocks).with_api(cfg.api.port, cfg.api.enabled);
             tokio::spawn(async move {
                 if let Err(e) = server.serve(addr).await {
                     tracing::error!(error = %e, "legacy P2P server stopped");
@@ -213,6 +285,7 @@ impl NodeContext {
             });
         }
         crate::delegate::spawn_round_tracker(self.storage.clone());
+        crate::intake::spawn_stall_watchdog(self.storage.clone(), self.peers.clone(), self.iroh.clone(), cfg.sync.verify_blocks);
         let pool = self.mempool.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(8));

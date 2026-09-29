@@ -87,6 +87,19 @@ fn serialize_type_payload(tx: &Transaction, w: &mut ByteWriter) -> Result<()> {
                 w.u64_le(a.amount.unwrap_or(0));
                 write_address(w, a.recipient_id.as_deref().ok_or_else(|| Error::Serialization("missing recipientId".into()))?)?;
             }
+            token::SELL => {
+                w.u64_le(a.amount.unwrap_or(0)).u64_le(a.price.unwrap_or(0));
+            }
+            token::BUY | token::CANCEL => {
+                let oid = hex::decode(a.order_id.as_deref().unwrap_or_default()).map_err(|e| Error::Serialization(format!("bad orderId: {e}")))?;
+                if oid.len() != 32 {
+                    return Err(Error::Serialization("orderId must be 32 bytes".into()));
+                }
+                w.bytes(&oid);
+                if tx.type_ == token::BUY {
+                    w.u64_le(a.amount.unwrap_or(0));
+                }
+            }
             token::META => {
                 let m = a.meta.as_ref().ok_or_else(|| Error::Serialization("missing token meta".into()))?;
                 let (name, desc, site) = (m.name.as_bytes(), m.description.as_deref().unwrap_or("").as_bytes(), m.website.as_deref().unwrap_or("").as_bytes());

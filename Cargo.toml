@@ -1,6 +1,6 @@
 [package]
 name = "sth-core"
-version = "0.20.0"
+version = "0.25.23"
 edition = "2021"
 authors = ["TechnoL0g"]
 description = "SmartHoldem relay node core (Rust rewrite of @smartholdem/core)"
@@ -38,8 +38,10 @@ indicatif = "0.17"
 futures = "0.3"
 flate2 = "1"
 tar = "0.4"
-rmpv = "1"
-axum = "0.7"
+rmpv = { version = "1", features = ["with-serde"] }
+axum = { version = "0.7", features = ["ws"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
 tokio-tungstenite = "0.24"
 prost = "0.13"
 serde_yaml = "0.9"
@@ -50,6 +52,9 @@ rayon = "1"
 ml-dsa = "0.1.1"
 base64 = "0.22"
 getrandom = "0.2"
+qrcode = { version = "0.14.1", default-features = false }
+iroh-mainline-address-lookup = "0.5.0"
+n0-mainline = "0.6.0"
 
 [dev-dependencies]
 iroh = "1.1.0"

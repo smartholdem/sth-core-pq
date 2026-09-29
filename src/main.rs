@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use sth_core::crypto::{verify_block, ChainObject};
 use sth_core::models::Block;
-use sth_core::node::{download_bar, resolve_snapshot, run_import, NodeContext, RunFlags};
+use sth_core::node::{download_bar, import_bar, resolve_snapshot, run_import, NodeContext, RunFlags};
 use sth_core::node_config::{NodeConfig, DEFAULT_CONFIG_FILE};
 use sth_core::node_pool::RateLimitConfig;
 use sth_core::p2p_legacy::PeerTable;
@@ -30,6 +30,10 @@ struct Cli {
     /// `network_dir` select the chain for every command (`sth-core init newnet` networks included).
     #[arg(long, global = true, value_name = "node.yaml")]
     config: Option<PathBuf>,
+    /// Colours + console highlights (forged / relayed / skipped blocks): auto = when stdout is a terminal,
+    /// always = also under pm2 (keeps ANSI), never = plain logs.
+    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "always", "never"])]
+    color: String,
     #[command(subcommand)]
     command: Command,
 }
@@ -38,12 +42,44 @@ struct Cli {
 enum Command {
     /// Show local chain height and last block id.
     Info,
+    /// Show stored blocks at the given heights (id, generator, time) — offline, to compare with a legacy node's
+    /// `/api/blocks?height=H` and find the common block before `rollback`. Also prints how far back `rollback` can go.
+    Block {
+        /// Heights, e.g. `--height 11926050 --height 11926100`.
+        #[arg(long = "height", required = true)]
+        heights: Vec<u64>,
+    },
     /// Verify a block JSON file (core `IBlockData` format, with transactions).
     VerifyBlock { file: PathBuf },
     /// Verify and apply a block JSON file to the local database.
     ImportBlock { file: PathBuf },
     /// Show a stored wallet.
     Wallet { address: String },
+    /// Compare a wallet's stored nonce / balance with the values recomputed from its transactions (state drift after
+    /// fork rollbacks). `--fix` overwrites the stored state with the recomputed one (stop the node first).
+    AuditWallet {
+        address: String,
+        #[arg(long)]
+        fix: bool,
+    },
+    /// Walk the whole chain once and compare EVERY stored wallet with the recomputed nonce / balance (nightly operator
+    /// check, node stopped or read-only copy). `--fix` repairs the drifted wallets, `--json` prints the report as JSON.
+    AuditAll {
+        #[arg(long)]
+        fix: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One health verdict: node API / sync / stall / peers / last audit (from /api/ntfry/metrics) + legacy acceptance.
+    /// Exit code 0 healthy, 1 warnings, 2 failures — cron-friendly.
+    Doctor {
+        /// Public IP of this node for the legacy acceptance check (default: p2p.legacy_public_addr).
+        #[arg(long)]
+        public_ip: Option<String>,
+        /// Node API base URL (default: http://<api.host>:<api.port>).
+        #[arg(long)]
+        api: Option<String>,
+    },
     /// Roll the local chain back to HEIGHT (needs undo records; stop the node first). Use after a private fork
     /// when automatic recovery failed; the node re-downloads the blocks from peers on next start.
     Rollback {
@@ -159,6 +195,12 @@ enum Command {
     IrohId {
         #[arg(long, default_value = "./iroh.key")]
         key_file: PathBuf,
+        /// Print the SHIP-44 wallet URL `api://<EndpointId>/<name>` instead of the bare id.
+        #[arg(long)]
+        url: bool,
+        /// Provider name segment of the URL (informational — the node serves any name).
+        #[arg(long, default_value = "sth-core")]
+        name: String,
     },
     /// Probe the legacy peer list and print the health table (latency, height, version).
     Peers {
@@ -166,6 +208,12 @@ enum Command {
         port: u16,
         #[arg(long, value_delimiter = ',')]
         peers: Option<Vec<String>>,
+        /// Ask every alive peer for its accepted peer list (`p2p.peer.getPeers`) and report which of them list this
+        /// PQ Node (its public IP from `--public-ip`, else `p2p.legacy_public_addr` in node.yaml).
+        #[arg(long)]
+        accepted: bool,
+        #[arg(long)]
+        public_ip: Option<String>,
     },
     /// Query a legacy node over its P2P port (getStatus + getPeers) — connectivity check.
     PeerStatus {
@@ -235,6 +283,15 @@ enum SnapshotCmd {
         #[arg(long, default_value = "./snapshots")]
         out: PathBuf,
     },
+    /// Write a dump `<out>/1-<end>.tgz` (legacy core-snapshots layout) from the local database — stop the node first or
+    /// use `--end` below the tip. Readable by `sth-core snapshot import` and by the legacy `snapshot:import`.
+    Dump {
+        #[arg(long, default_value = "./snapshots")]
+        out: PathBuf,
+        /// Last height to include (default: local tip; use a height below a fork point to share a clean chain).
+        #[arg(long)]
+        end: Option<u64>,
+    },
     /// Import a dump (folder or .tgz) into the local database (resumable).
     Import {
         path: PathBuf,
@@ -261,16 +318,25 @@ fn read_block(file: &PathBuf) -> anyhow::Result<Block> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
-
     let cli = Cli::parse();
-    // blue (ANSI 34) when stdout is a terminal, plain otherwise (pm2 / files)
-    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        println!("\x1b[1;34mcore version {}\x1b[0m", env!("CARGO_PKG_VERSION"));
+    // `iroh-id` is meant for `$(sth-core iroh-id)`: bare id on stdout, logs to stderr, no banner
+    let quiet = matches!(cli.command, Command::IrohId { .. } | Command::AuditAll { json: true, .. });
+    // iroh::protocol WARNs "Accepting incoming connection ended with error: timed out" without the remote address
+    // (wallet_api::accept_with_log reports it at INFO with who knocked); noq_proto WARNs "failed closing path
+    // err=LastOpenPath" when a QUIC path idles out and is the connection's only path — transport noise. n0_mainline shouts
+    // ERROR every 2 s while the DHT routing table is empty and iroh_mainline_address_lookup logs every resolve at INFO —
+    // the node reports DHT health itself (one WARN + alert `dht-unreachable`, `ntfry.discovery.dht`). RUST_LOG overrides.
+    const QUIET_TARGETS: &str = "iroh::protocol=error,noq_proto=error,n0_mainline=off,iroh_mainline_address_lookup=warn";
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(if quiet { format!("warn,{QUIET_TARGETS}") } else { format!("info,{QUIET_TARGETS}") }));
+    if quiet {
+        tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
     } else {
-        println!("core version {}", env!("CARGO_PKG_VERSION"));
+        sth_core::console::set_color(&cli.color);
+        tracing_subscriber::fmt().with_env_filter(filter).with_ansi(sth_core::console::color()).init();
+    }
+
+    if !quiet {
+        println!("{}", sth_core::console::paint(sth_core::console::BLUE, &format!("core version {}", env!("CARGO_PKG_VERSION"))));
     }
     // `init` writes the config, everything else reads it: network files + db path come from node.yaml
     let base_cfg = match &cli.command {
@@ -281,6 +347,22 @@ async fn main() -> anyhow::Result<()> {
     let db_path: PathBuf = cli.db_path.clone().unwrap_or_else(|| PathBuf::from(&base_cfg.db_path));
 
     match cli.command {
+        Command::Block { heights } => {
+            let storage = Storage::open(&db_path, network.clone())?;
+            let tip = storage.get_last_height()?;
+            let oldest = storage.oldest_undo_height();
+            println!("tip: {}  ·  rollback possible down to: {}", tip, oldest.map(|h| (h.saturating_sub(1)).to_string()).unwrap_or_else(|| "-".into()));
+            for h in heights {
+                match storage.get_block_by_height(h)? {
+                    Some(b) => {
+                        let unix = network.epoch_to_unix(b.timestamp);
+                        let t = sth_core::api::human_time(unix);
+                        println!("{h}: id {}  generator {}  {t}  {} tx  previous {}", b.id.clone().unwrap_or_default(), &b.generator_public_key[..b.generator_public_key.len().min(12)], b.transactions.len(), &b.previous_block[..b.previous_block.len().min(12)]);
+                    }
+                    None => println!("{h}: not in the local database"),
+                }
+            }
+        }
         Command::Info => {
             let storage = Storage::open(&db_path, network.clone())?;
             let last = storage.get_last_block()?;
@@ -331,6 +413,98 @@ async fn main() -> anyhow::Result<()> {
                 let reached = storage.rollback_to(to)?;
                 storage.flush()?;
                 println!("rolled back {tip} -> {reached}");
+            }
+        }
+        Command::AuditAll { fix, json } => {
+            let storage = Storage::open(&db_path, network.clone())?;
+            let started = std::time::Instant::now();
+            let report = storage.audit_all(|h| {
+                if !json {
+                    eprintln!("  scanned {} blocks…", sth_core::delegate::forger::group(h));
+                }
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "height {} · wallets {} · compared {} · skipped {} · drifted {} · {:.1}s",
+                    sth_core::delegate::forger::group(report.height),
+                    report.wallets,
+                    report.checked,
+                    report.skipped,
+                    report.drifted.len(),
+                    started.elapsed().as_secs_f64()
+                );
+                for a in &report.drifted {
+                    println!(
+                        "DRIFT {}  nonce {:?} -> {}  balance {:?} -> {}  (sent {}, received {}, forged {})",
+                        a.address, a.stored_nonce, a.computed_nonce, a.stored_balance, a.computed_balance, a.sent, a.received, a.forged
+                    );
+                }
+            }
+            if !report.drifted.is_empty() {
+                if fix {
+                    for a in &report.drifted {
+                        storage.repair_wallet(a)?;
+                    }
+                }
+            }
+            if fix {
+                // the vote index (`dv:`) drifted with the balances (double apply booked votes twice too) → rebuild from wallets
+                let before = storage.active_delegates(51)?;
+                let voters = storage.rebuild_vote_index()?;
+                let after = storage.active_delegates(51)?;
+                if !json {
+                    println!("vote index rebuilt from {voters} voting wallet(s)");
+                    for (i, (b, a)) in before.iter().zip(after.iter()).enumerate() {
+                        if b.public_key != a.public_key || b.votes != a.votes {
+                            println!("  rank {:>2}: {} {} -> {} {}", i + 1, &b.public_key[..12], b.votes, &a.public_key[..12], a.votes);
+                        }
+                    }
+                }
+            }
+            storage.save_audit_summary(&sth_core::storage::AuditSummary::from_audit(&report, fix, started.elapsed().as_secs_f64()))?;
+            storage.flush()?;
+            if !report.drifted.is_empty() {
+                sth_core::alerts::init(&base_cfg.alerts, if base_cfg.p2p.legacy_public_addr.trim().is_empty() { network.name.clone() } else { base_cfg.p2p.legacy_public_addr.trim().to_string() });
+                let msg = format!("audit-all at height {}: {} of {} wallets drifted{} — {}", report.height, report.drifted.len(), report.wallets, if fix { " (repaired)" } else { "" }, report.drifted.iter().take(5).map(|a| a.address.as_str()).collect::<Vec<_>>().join(", "));
+                if let Some(h) = sth_core::alerts::notify("audit", msg, true) {
+                    let _ = h.await;
+                }
+            }
+            if !report.drifted.is_empty() {
+                if fix {
+                    if !json {
+                        println!("repaired {} wallet(s)", report.drifted.len());
+                    }
+                } else {
+                    if !json {
+                        println!("rerun with --fix (node stopped) to overwrite the drifted states");
+                    }
+                    std::process::exit(2);
+                }
+            } else if !json {
+                println!("OK: every wallet matches the chain history");
+            }
+        }
+        Command::Doctor { public_ip, api } => {
+            let code = sth_core::doctor::run(&base_cfg, public_ip, api).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Command::AuditWallet { address, fix } => {
+            let storage = Storage::open(&db_path, network)?;
+            let a = storage.audit_wallet(&address)?;
+            println!("{}", serde_json::to_string_pretty(&a)?);
+            if a.nonce_ok && a.balance_ok {
+                println!("OK: stored state matches the transaction history");
+            } else if fix {
+                storage.repair_wallet(&a)?;
+                storage.flush()?;
+                println!("repaired: nonce {:?} -> {}, balance {:?} -> {}", a.stored_nonce, a.computed_nonce, a.stored_balance, a.computed_balance);
+            } else {
+                println!("DRIFT detected — rerun with --fix (node stopped) to overwrite the stored state");
             }
         }
         Command::Wallet { address } => {
@@ -427,11 +601,15 @@ async fn main() -> anyhow::Result<()> {
             node.run(RunFlags { quiet, force_bootstrap: from_dump.is_some() }).await?;
         }
         Command::Tx(args) => sth_core::cli::run(sth_core::cli::ChainSource::Config(base_cfg), args).await?,
-        Command::IrohId { key_file } => {
+        Command::IrohId { key_file, url, name } => {
             let secret = sth_core::p2p_iroh::load_or_create_secret(&key_file)?;
-            println!("{}", secret.public());
+            if url {
+                println!("api://{}/{}", secret.public(), name.trim_matches('/'));
+            } else {
+                println!("{}", secret.public());
+            }
         }
-        Command::Peers { port, peers } => {
+        Command::Peers { port, peers, accepted, public_ip } => {
             let seeds = match peers {
                 Some(p) => p,
                 None => sth_core::p2p_legacy::fetch_peer_list(port).await,
@@ -445,6 +623,32 @@ async fn main() -> anyhow::Result<()> {
                 println!("{:<18} {:>9} {:>8} {:<8} {}", p.ip, p.height, latency, p.version, state);
             }
             println!("alive: {alive} / {}  best height: {}", table.len(), table.best_height());
+            if accepted {
+                let me = match public_ip.or_else(|| base_cfg.p2p.legacy_public_addr.rsplit_once(':').map(|(ip, _)| ip.to_string())).filter(|s| !s.trim().is_empty()) {
+                    Some(ip) => ip.trim().to_string(),
+                    None => {
+                        return Err(sth_core::error::Error::Config("public IP unknown: pass --public-ip <ip> or set p2p.legacy_public_addr in node.yaml".into()).into());
+                    }
+                };
+                let report = sth_core::p2p_legacy::acceptance_check(&table, &me, Duration::from_secs(10)).await;
+                println!();
+                println!("acceptance check for {me}:{port} (asked {} alive peers for their accepted peer list)", report.asked);
+                println!("{:<18} {:>9} {:<8} {}", "peer", "height", "version", "lists us");
+                for (ip, height, version, lists) in &report.peers {
+                    println!("{:<18} {:>9} {:<8} {}", ip, height, version, if *lists { "yes" } else { "NO" });
+                }
+                let pct = if report.asked > 0 { report.listed * 100 / report.asked } else { 0 };
+                println!("listed by {} / {} peers ({pct}%)", report.listed, report.asked);
+                if report.asked == 0 {
+                    println!("no peer answered getPeers — network unreachable from here");
+                } else if report.listed == 0 {
+                    println!("NOT ACCEPTED: no legacy peer lists {me} — is p2p.legacy_listen open on {port}/tcp, legacy_public_addr correct, node ≥ 0.23.0 (getStatus schema)?");
+                } else if pct < 50 {
+                    println!("partially accepted: legacy peer verification takes a few minutes after start; check firewall / port {port} if it stays low");
+                } else {
+                    println!("OK: this PQ Node is an accepted legacy peer");
+                }
+            }
         }
         Command::PeerStatus { host, port, blocks, from } => {
             let mut peer = sth_core::p2p_legacy::LegacyPeer::connect(&host, port, Duration::from_secs(15)).await?;
@@ -471,6 +675,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Snapshot { cmd } => match cmd {
+            SnapshotCmd::Dump { out, end } => {
+                let storage = Storage::open(&db_path, network.clone())?;
+                let tip = storage.get_last_height()?;
+                let pb = import_bar(quiet)?;
+                pb.set_length(end.unwrap_or(tip).min(tip));
+                let tgz = tokio::task::spawn_blocking(move || snapshot::dump(&storage, &out, end, Some(&pb))).await??;
+                let size = std::fs::metadata(&tgz).map(|m| m.len() / 1_000_000).unwrap_or(0);
+                println!("snapshot written: {} ({size} MB) — serve the folder over HTTP (nginx/python3 -m http.server) and point other nodes' sync.bootstrap_snapshot at it, or copy the .tgz and run `sth-core snapshot import <file>`", tgz.display());
+            }
             SnapshotCmd::Download { base_url, out } => {
                 let pb = download_bar()?;
                 let archive = snapshot::download_latest(&base_url, &out, &pb).await?;

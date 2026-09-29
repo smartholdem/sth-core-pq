@@ -36,6 +36,9 @@ pub async fn list(State(st): State<Shared>, Query(q): Query<Params>) -> ApiResul
     if let Some(ts) = q.parse::<u32>("timestamp.to") {
         to = to.min(st.storage.height_at_or_after(ts + 1)?.saturating_sub(1));
     }
+    if q.has_range("timestamp") {
+        from = from.max(st.storage.first_height()?);
+    }
     if to < from {
         return Ok(Json(paginate("/blocks", &q, 0, vec![])));
     }

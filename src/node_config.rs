@@ -21,12 +21,58 @@ pub struct NodeConfig {
     pub db_path: String,
     /// sled page cache in MiB (default 64). Lower it (16–32) on VPS with ≤1 GB RAM; sled may use ~2× this value.
     pub db_cache_mb: u32,
+    /// Count the wallets for the startup banner (a full `w:` key scan, ~1–3 s on a mainnet database with a cold page
+    /// cache). Informational only — the state itself lives in sled and is never regenerated at start (unlike the
+    /// legacy "State Generation" steps); registered delegates are always counted (cheap `wu:` index).
+    pub startup_scan: bool,
     pub api: ApiConfig,
     pub sync: SyncSection,
     pub p2p: P2pConfig,
     pub rewards: RewardsConfig,
     pub mempool: MempoolConfig,
     pub delegate: DelegateConfig,
+    pub alerts: AlertsConfig,
+}
+
+/// Operator alerts (Telegram / JSON webhook) for CHAIN STALLED, fork rollbacks and audit drift. Off unless a target is set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AlertsConfig {
+    pub enabled: bool,
+    /// Bot token from @BotFather; the bot must be a member of the chat.
+    pub telegram_bot_token: String,
+    /// Chat / channel id (e.g. "-1001234567890"); get it from @userinfobot or the getUpdates API.
+    pub telegram_chat_id: String,
+    /// Any HTTPS endpoint receiving `POST {kind, text, at}` JSON (Slack/Discord bridges, n8n, own bot).
+    pub webhook_url: String,
+    /// Minimum seconds between two alerts of the same kind (recovery messages ignore it).
+    pub cooldown_secs: u64,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self { enabled: true, telegram_bot_token: String::new(), telegram_chat_id: String::new(), webhook_url: String::new(), cooldown_secs: 600 }
+    }
+}
+
+impl AlertsConfig {
+    pub fn active(&self) -> bool {
+        self.enabled && ((!self.telegram_bot_token.is_empty() && !self.telegram_chat_id.is_empty()) || !self.webhook_url.is_empty())
+    }
+}
+
+/// `secrets: "one passphrase"` or `secrets: [..]` — operators copy the legacy delegates.json shape in both forms.
+fn string_or_seq<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match V::deserialize(d)? {
+        V::One(s) => vec![s],
+        V::Many(v) => v,
+    })
 }
 
 /// Forging module (off unless secrets are configured). Mirrors the legacy `delegates.json`.
@@ -34,7 +80,9 @@ pub struct NodeConfig {
 #[serde(default)]
 pub struct DelegateConfig {
     pub enabled: bool,
-    /// Delegate passphrases (same meaning as `secrets` in the legacy delegates.json).
+    /// Delegate passphrases (same meaning as `secrets` in the legacy delegates.json). A single string is accepted too,
+    /// and an entry ending in `.json` is read as a legacy delegates file (same as `secrets_file`).
+    #[serde(deserialize_with = "string_or_seq")]
     pub secrets: Vec<String>,
     /// Optional path to a legacy `delegates.json`; its `secrets` are merged with the list above.
     pub secrets_file: String,
@@ -52,11 +100,40 @@ pub struct DelegateConfig {
     /// Announce over iroh gossip (signed by the delegate key) that these delegates forge on a Rust node,
     /// so every metrics page can show "N of 21 delegates on Rust". Public keys are public anyway.
     pub announce: bool,
+    /// Double-forge guard: a delegate key loaded on two nodes at once is detected and (mode yield) its slots are skipped
+    /// here so the network is not split. See `delegate::guard`.
+    pub guard: DoubleForgeGuardConfig,
 }
 
 impl Default for DelegateConfig {
     fn default() -> Self {
-        Self { enabled: false, secrets: Vec::new(), secrets_file: String::new(), pq_secrets: Vec::new(), broadcast_fanout: 6, quorum_share: 0.5, min_quorum_peers: 3, announce: true }
+        Self { enabled: false, secrets: Vec::new(), secrets_file: String::new(), pq_secrets: Vec::new(), broadcast_fanout: 6, quorum_share: 0.5, min_quorum_peers: 3, announce: true, guard: DoubleForgeGuardConfig::default() }
+    }
+}
+
+/// What the double-forge guard does when a block signed by one of OUR keys arrives from the network.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GuardMode {
+    /// Log + alert only; the forger keeps its slots (operator must act).
+    Alert,
+    /// Log + alert and skip this key's slots while foreign blocks keep coming (default).
+    Yield,
+}
+
+/// `delegate.guard` — optional module, on by default (never changes consensus, only whether THIS node forges).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DoubleForgeGuardConfig {
+    pub enabled: bool,
+    pub mode: GuardMode,
+    /// Yield window: a foreign block by our key within the last N rounds keeps the key's slots skipped (default 2).
+    pub rounds: u64,
+}
+
+impl Default for DoubleForgeGuardConfig {
+    fn default() -> Self {
+        Self { enabled: true, mode: GuardMode::Yield, rounds: 2 }
     }
 }
 
@@ -71,6 +148,8 @@ pub struct ApiConfig {
     pub page_metrics: bool,
     /// Separate bind address for the metrics page, e.g. "0.0.0.0:4888" (serves `/` + `/api/ntfry/*` only). Empty = main API.
     pub metrics_listen: String,
+    /// Browser origins allowed by CORS (both API and metrics ports). Empty = CORS off; `["*"]` = any origin.
+    pub cors_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,23 +203,135 @@ pub struct IrohConfig {
     /// Use relay servers for NAT traversal (turn off for LAN-only setups). Relays used = NETFORY n1
     /// (built in, `N1_RELAYS`) + public n0 (`relay_n0`) + `relays`.
     pub relay: bool,
-    /// Also use the public n0 relay servers (use1/usw1/euc1/aps1.relay.n0.iroh.link).
+    /// Also use the public n0 relay servers (use1/usw1/euc1/aps1.relay.n0.iroh.link). Off by default since 0.25.19:
+    /// they are rate-limited ("not for production" per n0) and win the latency race against n1, then drop wallet handshakes.
     pub relay_n0: bool,
     /// Extra relay URLs (`https://relay.example.org`), e.g. your own iroh-relay.
     pub relays: Vec<String>,
+    /// Relay guard module: removes a non-protected relay from the map after repeated handshake timeouts through it.
+    pub relay_guard: RelayGuardConfig,
+    /// sthpq address book: n0-free peer discovery (signed dial records over gossip / RPC / legacy port 4001).
+    pub discovery: DiscoveryConfig,
+    /// SHIP-44: REST-over-iroh (`netfory/api/1`) and push subscriptions (`sth/events/1`) for wallets.
+    pub wallet_api: WalletApiConfig,
+    /// SHIP-44 browser bridge: WebSocket ⇄ iroh for web wallets (any node may run it; Service Nodes typically do).
+    pub ws_bridge: WsBridgeConfig,
 }
+
+/// Mainnet PQ nodes every new node dials first (`sth-core init` writes them into node.yaml; edit for other networks).
+pub const MAINNET_IROH_BOOTSTRAP: [&str; 3] = [
+    "747a93f8d56d361ba01a56265b1f10e746d7ab1962ee01189c43fae15481d4a0",
+    "d8c32e15974a4197f16d61b7cc03e4be4338cde2deca6310589584adbc465bf6",
+    "9906e9f29cf841b8699b65ed2c27c27db90feb2ffdfa223f25925901ef79ae3f",
+];
 
 impl Default for IrohConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             secret_key_file: "./iroh.key".into(),
-            bootstrap: Vec::new(),
+            bootstrap: MAINNET_IROH_BOOTSTRAP.iter().map(|s| s.to_string()).collect(),
             serve_blocks: true,
             relay: true,
-            relay_n0: true,
+            relay_n0: false,
             relays: Vec::new(),
+            relay_guard: RelayGuardConfig::default(),
+            discovery: DiscoveryConfig::default(),
+            wallet_api: WalletApiConfig::default(),
+            ws_bridge: WsBridgeConfig::default(),
         }
+    }
+}
+
+/// `p2p.iroh.discovery` — sthpq address book module (see `p2p_iroh::addrbook`). `bootstrap` entries may carry a
+/// direct address as `<EndpointId>@<ip>:<udp port>` so the first contact needs neither n0 DNS nor a relay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DiscoveryConfig {
+    pub enabled: bool,
+    /// Fixed UDP port for the iroh endpoint (0 = random, changes on every start). Gateways should pin it (e.g. 4004).
+    pub listen_port: u16,
+    /// Public `ip:port` of this node announced in its record (empty = only the addresses iroh discovers itself).
+    pub external_addr: String,
+    /// How often the own record (+ fresh peers) is gossiped.
+    pub announce_secs: u64,
+    /// A peer silent for this many days is forgotten (Bitcoin addrman style).
+    pub expire_days: u64,
+    pub max_entries: usize,
+    /// Keep the n0 DNS service (`dns.iroh.link`) as publish/resolve fallback. `false` = preset `Minimal`: the node
+    /// never talks to n0 (address book + Mainline DHT only).
+    pub n0_dns: bool,
+    /// Publish/resolve pkarr records in the BitTorrent Mainline DHT (BEP-44, same scheme as NETFORY clients).
+    pub mainline: bool,
+    /// Extra DHT bootstrap nodes (`host:port`) added to the public routers, e.g. NETFORY seeders.
+    pub mainline_bootstrap: Vec<String>,
+    /// UDP port of the DHT socket (0 = random).
+    pub mainline_port: u16,
+    /// Run the DHT socket in server mode (answers other nodes' queries) — turns a gateway into a DHT bootstrap node for
+    /// the network (`mainline_bootstrap: ["<ip>:<mainline_port>"]` on the others). Needs `mainline_port` open (UDP).
+    pub mainline_server: bool,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self { enabled: true, listen_port: 0, external_addr: String::new(), announce_secs: 1800, expire_days: 30, max_entries: 2000, n0_dns: true, mainline: true, mainline_bootstrap: Vec::new(), mainline_port: 0, mainline_server: false }
+    }
+}
+
+/// `p2p.iroh.relay_guard` — optional module (see `p2p_iroh::relay_guard`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RelayGuardConfig {
+    pub enabled: bool,
+    /// Handshake timeouts through one relay within `window_secs` that get it removed from the relay map.
+    pub max_failures: usize,
+    pub window_secs: u64,
+}
+
+impl Default for RelayGuardConfig {
+    fn default() -> Self {
+        Self { enabled: true, max_failures: 5, window_secs: 600 }
+    }
+}
+
+/// `ws://<listen>/ws/events[/<EndpointId>]` and `/ws/api[/<EndpointId>]` — one WebSocket message = one protocol frame.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WsBridgeConfig {
+    pub enabled: bool,
+    /// Bind address; put nginx/TLS in front for `wss://` (see docs/nginx).
+    pub listen: String,
+    /// EndpointId used when the URL names no node; empty = this node.
+    pub default_node: String,
+}
+
+impl Default for WsBridgeConfig {
+    fn default() -> Self {
+        Self { enabled: false, listen: "0.0.0.0:4005".into(), default_node: String::new() }
+    }
+}
+
+/// SHIP-44 wallet protocols. Defaults are sized for a 1–2 GB RAM node: an idle QUIC connection costs ~60–100 KB,
+/// so 2000 connections stay under ~200 MB next to the sled cache. 4 GB → 5000, 8 GB → 10000.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WalletApiConfig {
+    pub enabled: bool,
+    /// Simultaneous wallet connections (requests + event sessions); 0 = unlimited.
+    pub max_connections: usize,
+    /// Addresses one event session may subscribe to.
+    pub max_addresses: usize,
+    /// API requests per second per EndpointId (burst 2×); 0 = unlimited.
+    pub rate_limit_rps: u32,
+    /// An event session without any command (`ping`) for this long is closed.
+    pub idle_timeout_secs: u64,
+    /// Print the node's `api://<EndpointId>/sth-core` URL as a QR code in the startup banner (mobile wallets pair by scanning).
+    pub startup_qr: bool,
+}
+
+impl Default for WalletApiConfig {
+    fn default() -> Self {
+        Self { enabled: true, max_connections: 2000, max_addresses: 64, rate_limit_rps: 20, idle_timeout_secs: 300, startup_qr: true }
     }
 }
 
@@ -161,6 +352,14 @@ pub struct MempoolConfig {
     pub max_bytes: usize,
     /// Fee policy of THIS node's pool — a per-node setting, not a consensus rule (blocks are never rejected for it).
     pub dynamic_fees: DynamicFeesConfig,
+    /// Legacy `transactionPool.maxTransactionAge`: a pending transaction the network has not forged within this many
+    /// blocks is dropped (2700 ≈ 6 h). 0 = keep forever (not recommended: stuck nonces block the sender).
+    pub max_age_blocks: u64,
+    /// Re-relay pending transactions to legacy peers / iroh gossip every this many blocks (0 = only once, on arrival).
+    pub rebroadcast_blocks: u64,
+    /// Do the legacy (Core 3.8.2) peers run `dynamicFees`? `false` = their pools take exactly the static fee, so a cheaper
+    /// transaction is forged only by PQ delegates — the fee advisor (`Mempool::fee_hint`) warns wallets about it.
+    pub legacy_dynamic_fees: bool,
 }
 
 /// Legacy `transactionPool.dynamicFees`: minimum fee = `(addon_bytes[type] + wire bytes) × satoshi_per_byte`.
@@ -206,19 +405,21 @@ impl Default for NodeConfig {
             network_dir: String::new(),
             db_path: "./data".into(),
             db_cache_mb: 64,
+            startup_scan: true,
             api: ApiConfig::default(),
             sync: SyncSection::default(),
             p2p: P2pConfig::default(),
             rewards: RewardsConfig::default(),
             mempool: MempoolConfig::default(),
             delegate: DelegateConfig::default(),
+            alerts: AlertsConfig::default(),
         }
     }
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
-        Self { enabled: true, host: "127.0.0.1".into(), port: 4003, page_metrics: false, metrics_listen: String::new() }
+        Self { enabled: true, host: "127.0.0.1".into(), port: 4003, page_metrics: false, metrics_listen: String::new(), cors_origins: Vec::new() }
     }
 }
 
@@ -245,7 +446,7 @@ impl Default for P2pConfig {
             legacy_listen: String::new(),
             legacy_public_addr: String::new(),
             parallel_peers: 4,
-            relay_fanout: 3,
+            relay_fanout: 20,
             refresh_secs: 60,
             iroh: IrohConfig::default(),
         }
@@ -260,7 +461,7 @@ impl Default for RewardsConfig {
 
 impl Default for MempoolConfig {
     fn default() -> Self {
-        Self { max_size: 5_000, max_bytes: 8 * 1024 * 1024, dynamic_fees: DynamicFeesConfig::default() }
+        Self { max_size: 5_000, max_bytes: 8 * 1024 * 1024, dynamic_fees: DynamicFeesConfig::default(), max_age_blocks: 2700, rebroadcast_blocks: 30, legacy_dynamic_fees: false }
     }
 }
 
@@ -363,9 +564,12 @@ impl NodeConfig {
              # network_dir: optional folder with network.json / milestones.json / exceptions.json / genesisBlock.json[.gz]\n\
              #          (crypto-networks layout, `sth-core init --network-files` exports the embedded ones).\n\
              # db_cache_mb: sled page cache (MiB). 64 is fine for 2 GB+ RAM; use 16–32 on a 1 GB VPS (process RSS ≈ 2–3× this).\n\
+             # startup_scan: count the wallets for the startup banner (full key scan, ~1–3 s on mainnet). Informational only —\n\
+             #               the state is kept in sled incrementally; integrity is checked by `sth-core audit-all`, not at start.\n\
              # api:     local REST bridge for wallets / explorers / netfory-provider (keep host 127.0.0.1).\n\
              #          page_metrics: true serves the operator dashboard at http://host:port/ — or on its own address\n\
              #          with metrics_listen: \"0.0.0.0:4888\" (page + /api/ntfry/* only, safe to expose).\n\
+             #          cors_origins: [] = CORS off (default); [\"http://localhost:3000\"] allows a browser app, [\"*\"] = any origin.\n\
              # sync:    legacy REST bootstrap nodes; bootstrap_snapshot is used only while the database is empty\n\
              #          (`latest` downloads from https://snapshots.smartholdem.io/, a path imports a local dump, empty skips).\n\
              # p2p:     legacy_enabled follows the chain through port 4001 (IP peers) with parallel_peers ranges in flight;\n\
@@ -375,8 +579,18 @@ impl NodeConfig {
              #          Rust peers over iroh; they show us with gateway: true in /api/ntfry/peers). Both must be set.\n\
              #          p2p.iroh enables the Web 4.0 layer\n\
              #          (iroh endpoint + gossip topics for blocks / transactions, GetBlocks RPC); bootstrap = EndpointIds of peers.\n\
+             #          Enabled by default with the mainnet PQ bootstrap nodes; iroh.key is created on first start (keep it — it is\n\
+             #          the node's EndpointId / api:// address). For another network replace bootstrap or set enabled: false.\n\
              #          Relays (NAT traversal): relay: true uses the NETFORY n1 relays (relay-fsn7.sth.cx, relay-ru1.sth.cx) built in,\n\
-             #          relay_n0: true adds the public n0 relays, relays: [\"https://…\"] adds your own iroh-relay servers.\n\
+             #          relay_n0: false (default) keeps the rate-limited public n0 relays out — they win the latency race and then drop\n\
+             #          wallet handshakes; relays: [\"https://…\"] adds your own iroh-relay servers. relay_guard (enabled: true) removes a\n\
+             #          non-n1 relay from the map after max_failures (5) handshake timeouts within window_secs (600).\n\
+             #          discovery (sthpq address book, enabled: true): nodes gossip signed dial records (EndpointId + public ip:port +\n\
+             #          relay) and pull them over RPC / legacy port 4001, so peers are found without n0 DNS. Dead peers are forgotten\n\
+             #          after expire_days (30). Gateways: listen_port: 4004 (fixed UDP, open it) + external_addr: \"<public ip>:4004\";\n\
+             #          bootstrap entries may pin a direct address: \"<EndpointId>@<ip>:4004\". mainline: true publishes/resolves the\n\
+             #          record in the BitTorrent Mainline DHT (BEP-44, as NETFORY clients do; mainline_bootstrap adds your seeders);\n\
+             #          n0_dns: true keeps dns.iroh.link as a fallback — set false once the DHT is confirmed to drop n0 entirely.\n\
              # rewards: RESERVED, not used yet — future relay/gateway rewards (block & snapshot distribution).\n\
              #          Not the delegate's reward: block rewards always go to the forging delegate's wallet.\n\
              # delegate: forging module. enabled: true + secrets: [passphrase] (or secrets_file: ./delegates.json, legacy format).\n\
@@ -387,10 +601,18 @@ impl NodeConfig {
              #          stage C): from milestone pq.blocks every block is version 1 with a hybrid secp256k1 + ML-DSA signature;\n\
              #          a delegate without its PQ key skips the slot once the grace window (pq.blocksGrace) has closed.\n\
              #          Finality (SHIP-35): the delegate keys also sign finality votes over iroh gossip — nothing to configure.\n\
+             #          guard: double-forge guard (enabled: true). A block signed by one of OUR keys that arrives from the network\n\
+             #          means the passphrase is loaded on another node (legacy + PQ during the transition): ERROR + alert, and with\n\
+             #          mode: yield (default) this node skips that key's slots for `rounds` (2) rounds instead of splitting the\n\
+             #          network; mode: alert only reports. Two different blocks at one height by one generator are reported too.\n\
              # mempool: max_size / max_bytes = pool limits. dynamic_fees = fee policy of THIS node only (not consensus, same as the\n\
              #          legacy transactionPool.dynamicFees): enabled: true accepts a core transaction when\n\
              #          fee >= (addon_bytes[type] + wire bytes) × min_fee_pool and relays it from min_fee_broadcast (a transfer\n\
              #          costs ≈ 0.007 STH); enabled: false demands exactly the static fee of the milestone (1 STH per transfer).\n\
+             #          legacy_dynamic_fees: false = the legacy Core 3.8.2 peers take only the static fee → the fee advisor marks\n\
+             #          cheaper transactions (feeHint in POST /api/transactions, wallet stream mempoolTx, metrics) as PQ-only.\n\
+             # alerts:  operator notifications (CHAIN STALLED / recovered, fork rollbacks, audit-all drift): telegram_bot_token +\n\
+             #          telegram_chat_id and/or webhook_url (POST JSON {{kind,text,at}}); cooldown_secs between repeats of one kind.\n\
              {body}"
         )
     }

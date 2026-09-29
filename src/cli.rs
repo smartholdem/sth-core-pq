@@ -13,7 +13,7 @@ use crate::node_config::NodeConfig;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Where the chain parameters come from.
 pub enum ChainSource {
@@ -73,7 +73,7 @@ impl ChainParams {
                     addon_bytes: d["addonBytes"].as_object().map(|m| m.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n))).collect()).unwrap_or_default(),
                 })
             },
-            token_fees: TokenFees { init: num(&tf["init"]), transfer: num(&tf["transfer"]), transfer_per_recipient: num(&tf["transferPerRecipient"]), mint: num(&tf["mint"]), burn: num(&tf["burn"]), meta: num(&tf["meta"]), init_burn_percent: tf["initBurnPercent"].as_u64().unwrap_or(50) as u8 },
+            token_fees: TokenFees { init: num(&tf["init"]), transfer: num(&tf["transfer"]), transfer_per_recipient: num(&tf["transferPerRecipient"]), mint: num(&tf["mint"]), burn: num(&tf["burn"]), meta: num(&tf["meta"]), init_burn_percent: tf["initBurnPercent"].as_u64().unwrap_or(50) as u8, sell: if tf["sell"].is_null() { 100_000_000 } else { num(&tf["sell"]) }, buy: if tf["buy"].is_null() { 10_000_000 } else { num(&tf["buy"]) }, cancel: if tf["cancel"].is_null() { 10_000_000 } else { num(&tf["cancel"]) } },
             blocktime: c["blocktime"].as_u64().unwrap_or(8),
         })
     }
@@ -84,6 +84,9 @@ pub struct TxArgs {
     /// Sender passphrase (or set STH_PASSPHRASE).
     #[arg(long, env = "STH_PASSPHRASE", hide_env_values = true)]
     passphrase: String,
+    /// node.yaml of this node — `sn-register` / `sn-update` read `p2p.iroh.secret_key_file` from it to derive the EndpointId.
+    #[arg(long)]
+    node_config: Option<PathBuf>,
     /// Local REST API (default: http://127.0.0.1:<api.port from node.yaml>).
     #[arg(long)]
     api: Option<String>,
@@ -136,6 +139,51 @@ pub enum TxCmd {
         /// Current second passphrase (legacy second signature or the PQ key being replaced) — proof of the old key.
         #[arg(long, env = "STH_OLD_SECOND_PASSPHRASE", hide_env_values = true)]
         old_second_passphrase: Option<String>,
+    },
+    /// SHIP-42: register this wallet's Service Node (sObject type 7). Collateral = balance floor from the milestone
+    /// (`masternodes.collateralAmount`, default 10 000 STH) — nothing is locked, spending below the floor deactivates the node.
+    SnRegister {
+        /// Label, unique network-wide (e.g. sn-berlin-1).
+        #[arg(long)]
+        name: String,
+        /// Iroh EndpointId of the node (64 hex, `sth-core iroh-id`). Omit to take it from `--key-file` / `node.yaml`
+        /// (`p2p.iroh.secret_key_file`) or, failing that, from the node behind `--api` (`/api/node/status`).
+        #[arg(long)]
+        node_id: Option<String>,
+        /// Iroh secret key file to derive the EndpointId from when `--node-id` is omitted.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Comma-separated roles: relay, seeder, messenger, microblog, provider.
+        #[arg(long, default_value = "relay")]
+        roles: String,
+        /// Public REST API URL of the service node, e.g. https://node-pq01.smartholdem.io (optional).
+        #[arg(long)]
+        url: Option<String>,
+        /// Advertised seeding capacity, GiB (optional).
+        #[arg(long)]
+        storage: Option<u32>,
+    },
+    /// SHIP-42: change the EndpointId / roles / API URL of your Service Node.
+    SnUpdate {
+        /// Registration id or name.
+        #[arg(long)]
+        id: String,
+        /// New EndpointId; omitted = same resolution as `sn-register`.
+        #[arg(long)]
+        node_id: Option<String>,
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        #[arg(long, default_value = "relay")]
+        roles: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        storage: Option<u32>,
+    },
+    /// SHIP-42: resign the Service Node (frees the name; the collateral was never locked).
+    SnResign {
+        #[arg(long)]
+        id: String,
     },
     /// Register a SmartObject (sObject); type 5 = token ticker.
     ObjRegister {
@@ -217,6 +265,28 @@ pub enum TxCmd {
         #[arg(long)]
         amount: String,
     },
+    /// SHIP-43: sell part of your balance — `--amount` tokens at `--price` STH per token (e.g. 1 UFO at 100 STH).
+    TokenSell {
+        #[arg(long)]
+        ticker: String,
+        #[arg(long)]
+        amount: String,
+        /// STH per whole token.
+        #[arg(long)]
+        price: String,
+    },
+    /// SHIP-43: buy `--amount` tokens from an open order (default: the whole remainder).
+    TokenBuy {
+        #[arg(long)]
+        order: String,
+        #[arg(long)]
+        amount: Option<String>,
+    },
+    /// SHIP-43: cancel your open order; the unsold remainder returns to your balance.
+    TokenCancel {
+        #[arg(long)]
+        order: String,
+    },
     /// Publish / update the on-chain manifest (name, description, website, SVG or PNG logo ≤ 8 KB).
     TokenMeta {
         #[arg(long)]
@@ -268,6 +338,52 @@ impl Ctx {
         Ok((id.to_string(), t["decimals"].as_u64().unwrap_or(0) as u8))
     }
 
+    /// EndpointId for `sn-register` / `sn-update`: explicit `--node-id`, else the iroh key file (`--key-file`,
+    /// `node.yaml` `p2p.iroh.secret_key_file`, `./iroh.key` next to it), else the node's own id from `/api/node/status`.
+    async fn resolve_node_id(&self, explicit: Option<&str>, key_file: Option<&Path>, node_config: Option<&Path>) -> Result<String> {
+        if let Some(id) = explicit {
+            return Ok(id.trim().to_ascii_lowercase());
+        }
+        let mut candidates: Vec<PathBuf> = key_file.map(|p| p.to_path_buf()).into_iter().collect();
+        if let Some(cfg) = node_config {
+            if let Ok(nc) = NodeConfig::load(cfg) {
+                let p = PathBuf::from(&nc.p2p.iroh.secret_key_file);
+                let dir = cfg.parent().filter(|d| !d.as_os_str().is_empty() && *d != Path::new("."));
+                candidates.push(match dir { Some(d) if !p.is_absolute() => d.join(p), _ => p });
+            }
+        }
+        candidates.push(PathBuf::from("./iroh.key"));
+        for p in candidates.iter().filter(|p| p.is_file()) {
+            let secret = crate::p2p_iroh::load_or_create_secret(p)?;
+            let id = secret.public().to_string();
+            println!("node id  {id}  (from {})", p.display());
+            return Ok(id);
+        }
+        let status = self.get("/api/node/status").await?;
+        if let Some(id) = status["irohEndpointId"].as_str() {
+            println!("node id  {id}  (from the node at {})", self.api);
+            return Ok(id.to_string());
+        }
+        bail!("no --node-id, no iroh key file ({:?}) and the node at {} runs without iroh — run `sth-core iroh-id` on the node and pass --node-id", candidates, self.api)
+    }
+
+    /// Service Node registration id by id / name / address / EndpointId (`/api/masternodes/:id`).
+    async fn sn_id(&self, key: &str) -> Result<String> {
+        let n = self.get(&format!("/api/masternodes/{key}")).await.map_err(|_| anyhow!("service node {key} not found"))?;
+        Ok(n["id"].as_str().ok_or_else(|| anyhow!("service node {key}: no registration id"))?.to_string())
+    }
+
+    /// SHIP-43 order by id: the node resolves it through the token it belongs to.
+    async fn order(&self, order_id: &str) -> Result<serde_json::Value> {
+        let tx = self.get(&format!("/api/transactions/{order_id}")).await.map_err(|_| anyhow!("order {order_id}: no such transaction"))?;
+        let token_id = tx["asset"]["token"]["id"].as_str().ok_or_else(|| anyhow!("{order_id} is not a token-sell transaction"))?.to_string();
+        let o = self.get(&format!("/api/tokens/{token_id}/orders/{order_id}")).await.map_err(|_| anyhow!("order {order_id} not found"))?;
+        if o["open"] != true {
+            bail!("order {order_id} is closed (height {})", o["closed"]);
+        }
+        Ok(o)
+    }
+
     async fn next_nonce(&self) -> Result<u64> {
         let w = self.get(&format!("/api/wallets/{}", self.address)).await?;
         Ok(w["nonce"].as_str().and_then(|n| n.parse::<u64>().ok()).or_else(|| w["nonce"].as_u64()).unwrap_or(0) + 1)
@@ -275,6 +391,24 @@ impl Ctx {
 }
 
 /// "12.5" with `decimals` → integer units.
+/// `iroh://<EndpointId>?roles=…[&api=…][&storage=…]` for a SHIP-42 registration, validated like the node does.
+fn sn_data(node_id: &str, roles: &str, api: Option<&str>, storage: Option<u32>) -> Result<String> {
+    let mut data = format!("iroh://{}?roles={}", node_id.trim().to_ascii_lowercase(), roles.trim().to_ascii_lowercase());
+    if let Some(a) = api {
+        data.push_str(&format!("&api={a}"));
+    }
+    if let Some(gb) = storage {
+        data.push_str(&format!("&storage={gb}"));
+    }
+    if sobj::parse_service_node(&data).is_none() {
+        bail!("invalid service node data: node id must be 64 hex, roles ⊂ {:?}", sobj::SERVICE_ROLES);
+    }
+    if data.len() > 255 {
+        bail!("service node data exceeds 255 bytes (shorten --api)");
+    }
+    Ok(data)
+}
+
 fn units(s: &str, decimals: u8) -> Result<u64> {
     let (int, frac) = s.split_once('.').unwrap_or((s, ""));
     if frac.len() > decimals as usize {
@@ -488,6 +622,26 @@ pub async fn run(source: ChainSource, args: TxArgs) -> Result<()> {
             }
             set(&mut body, json!({ "typeGroup": 2, "type": sobj::TYPE, "fee": sobj::FEE_REGISTER.to_string(), "asset": { "type": r#type, "subType": sub_type, "action": sobj::ACTION_REGISTER, "data": d } }));
         }
+        TxCmd::SnRegister { name, node_id, key_file, roles, url, storage } => {
+            let node_id = ctx.resolve_node_id(node_id.as_deref(), key_file.as_deref(), args.node_config.as_deref()).await?;
+            let data = sn_data(&node_id, roles, url.as_deref(), *storage)?;
+            let ms_now = ctx.get("/api/node/configuration").await?;
+            if ms_now["data"]["constants"]["masternodes"]["enabled"] != true {
+                bail!("Service Nodes are not enabled on this network yet (milestone masternodes.enabled)");
+            }
+            println!("service node {name}: {data}");
+            set(&mut body, json!({ "typeGroup": 2, "type": sobj::TYPE, "fee": sobj::FEE_REGISTER.to_string(), "asset": { "type": sobj::TYPE_SERVICE_NODE, "subType": 0, "action": sobj::ACTION_REGISTER, "data": { "name": name, "ntfryData": data } } }));
+        }
+        TxCmd::SnUpdate { id, node_id, key_file, roles, url, storage } => {
+            let node_id = ctx.resolve_node_id(node_id.as_deref(), key_file.as_deref(), args.node_config.as_deref()).await?;
+            let data = sn_data(&node_id, roles, url.as_deref(), *storage)?;
+            let reg = ctx.sn_id(id).await?;
+            set(&mut body, json!({ "typeGroup": 2, "type": sobj::TYPE, "fee": sobj::FEE_UPDATE.to_string(), "asset": { "type": sobj::TYPE_SERVICE_NODE, "subType": 0, "action": sobj::ACTION_UPDATE, "registrationId": reg, "data": { "ntfryData": data } } }));
+        }
+        TxCmd::SnResign { id } => {
+            let reg = ctx.sn_id(id).await?;
+            set(&mut body, json!({ "typeGroup": 2, "type": sobj::TYPE, "fee": sobj::FEE_RESIGN.to_string(), "asset": { "type": sobj::TYPE_SERVICE_NODE, "subType": 0, "action": sobj::ACTION_RESIGN, "registrationId": reg, "data": {} } }));
+        }
         TxCmd::ObjUpdate { id, data } => {
             let reg = ctx.sobj_id(id).await?;
             let e = ctx.get(&format!("/api/sobj/{reg}")).await?;
@@ -538,6 +692,35 @@ pub async fn run(source: ChainSource, args: TxArgs) -> Result<()> {
         TxCmd::TokenBurn { ticker, amount } => {
             let (id, dec) = ctx.token(ticker).await?;
             set(&mut body, json!({ "typeGroup": 3, "type": token::BURN, "fee": ms.token_fees.burn.to_string(), "asset": { "token": { "id": id, "amount": units(amount, dec)?.to_string() } } }));
+        }
+        TxCmd::TokenSell { ticker, amount, price } => {
+            let (id, dec) = ctx.token(ticker).await?;
+            let amount_u = units(amount, dec)?;
+            // price per whole token → smartoshi per unit (10^-dec token)
+            let per_token = units(price, 8)?;
+            let scale = 10u64.pow(dec as u32);
+            if per_token % scale != 0 {
+                bail!("--price {price} STH is not divisible into whole smartoshi per unit at {dec} decimals (use a multiple of {} STH)", scale as f64 / 1e8);
+            }
+            let per_unit = per_token / scale;
+            println!("ask     {amount} {} × {price} STH = {} STH total", ticker.to_uppercase(), (amount_u as u128 * per_unit as u128) as f64 / 1e8);
+            set(&mut body, json!({ "typeGroup": 3, "type": token::SELL, "fee": ms.token_fees.sell.to_string(), "asset": { "token": { "id": id, "amount": amount_u.to_string(), "price": per_unit.to_string() } } }));
+        }
+        TxCmd::TokenBuy { order, amount } => {
+            let o = ctx.order(order).await?;
+            let dec = o["decimals"].as_u64().unwrap_or(0) as u8;
+            let remaining: u64 = o["remaining"].as_str().unwrap_or("0").parse()?;
+            let amount_u = match amount { Some(a) => units(a, dec)?, None => remaining };
+            if amount_u == 0 || amount_u > remaining {
+                bail!("order has {} units remaining", remaining);
+            }
+            let price: u64 = o["price"].as_str().unwrap_or("0").parse()?;
+            println!("buy     {} units of {} at {} STH/unit = {} STH → {}", amount_u, o["symbol"].as_str().unwrap_or("?"), price as f64 / 1e8, (amount_u as u128 * price as u128) as f64 / 1e8, o["seller"].as_str().unwrap_or("?"));
+            set(&mut body, json!({ "typeGroup": 3, "type": token::BUY, "fee": ms.token_fees.buy.to_string(), "asset": { "token": { "id": o["tokenId"], "orderId": o["orderId"], "amount": amount_u.to_string() } } }));
+        }
+        TxCmd::TokenCancel { order } => {
+            let o = ctx.order(order).await?;
+            set(&mut body, json!({ "typeGroup": 3, "type": token::CANCEL, "fee": ms.token_fees.cancel.to_string(), "asset": { "token": { "id": o["tokenId"], "orderId": o["orderId"] } } }));
         }
         TxCmd::TokenMeta { ticker, name, description, website, logo } => {
             let (id, _) = ctx.token(ticker).await?;
@@ -710,7 +893,7 @@ pub async fn delegate_setup(api: String, a: DelegateSetupArgs) -> Result<()> {
         };
         let missing = need - have;
         println!("        sending {} STH from the funding wallet", coins_str(missing));
-        run(ChainSource::Api(api.clone()), TxArgs { passphrase: funder.clone(), api: None, second_passphrase: None, nonce: None, dry_run: false, fee: None, cmd: TxCmd::Transfer { to: address.clone(), amount: coins_str(missing), memo: Some(format!("delegate {}", a.username)) } }).await?;
+        run(ChainSource::Api(api.clone()), TxArgs { passphrase: funder.clone(), node_config: None, api: None, second_passphrase: None, nonce: None, dry_run: false, fee: None, cmd: TxCmd::Transfer { to: address.clone(), amount: coins_str(missing), memo: Some(format!("delegate {}", a.username)) } }).await?;
         let c = ctx.clone();
         wait_for("funding", a.timeout, move || { let c = c.clone(); Box::pin(async move { balance(c).await >= need }) }).await?;
     } else {
@@ -722,7 +905,7 @@ pub async fn delegate_setup(api: String, a: DelegateSetupArgs) -> Result<()> {
         Some(u) if u == a.username => println!("        already registered as {u}"),
         Some(u) => bail!("wallet {address} is already the delegate {u}"),
         None => {
-            run(ChainSource::Api(api.clone()), TxArgs { passphrase: phrase.clone(), api: None, second_passphrase: None, nonce: None, dry_run: false, fee: None, cmd: TxCmd::DelegateRegister { username: a.username.clone() } }).await?;
+            run(ChainSource::Api(api.clone()), TxArgs { passphrase: phrase.clone(), node_config: None, api: None, second_passphrase: None, nonce: None, dry_run: false, fee: None, cmd: TxCmd::DelegateRegister { username: a.username.clone() } }).await?;
             let c = ctx.clone();
             let u = a.username.clone();
             wait_for("registration", a.timeout, move || { let c = c.clone(); let u = u.clone(); Box::pin(async move { c.get(&format!("/api/delegates/{u}")).await.ok().is_some_and(|d| d["address"] == c.address) }) }).await?;
@@ -734,7 +917,7 @@ pub async fn delegate_setup(api: String, a: DelegateSetupArgs) -> Result<()> {
         if pq_locked {
             println!("        wallet already has a PQ key — skipped (rotate with `sth-cli tx pq-register` if needed)");
         } else {
-            run(ChainSource::Api(api.clone()), TxArgs { passphrase: phrase.clone(), api: None, second_passphrase: Some(p.clone()), nonce: None, dry_run: false, fee: None, cmd: TxCmd::PqRegister { old_second_passphrase: None } }).await?;
+            run(ChainSource::Api(api.clone()), TxArgs { passphrase: phrase.clone(), node_config: None, api: None, second_passphrase: Some(p.clone()), nonce: None, dry_run: false, fee: None, cmd: TxCmd::PqRegister { old_second_passphrase: None } }).await?;
             let c = ctx.clone();
             wait_for("PQ key", a.timeout, move || { let c = c.clone(); Box::pin(async move { c.get(&format!("/api/wallets/{}", c.address)).await.ok().is_some_and(|w| w["quantumShield"]["active"] == true) }) }).await?;
         }

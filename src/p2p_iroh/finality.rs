@@ -44,6 +44,17 @@ struct Inner {
     /// Votes received / rejected since start (for the metrics page).
     received: u64,
     rejected: u64,
+    /// Publisher health (metrics page): when we last signed votes, how many, failed gossip broadcasts, last error.
+    last_own_vote_unix: u64,
+    last_own_votes: usize,
+    broadcast_failed: u64,
+    last_error: String,
+    /// Last time the "no key in the active set" warning was logged (rate limit).
+    warned_unix: u64,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 pub struct RecordOutcome {
@@ -65,6 +76,13 @@ pub struct FinalitySnapshot {
     pub received: u64,
     pub rejected: u64,
     pub own_votes: usize,
+    /// Our keys that signed the vote for the current tip.
+    pub own_votes_at_tip: usize,
+    /// Seconds since we last signed votes (None = never since start).
+    pub last_own_vote_age: Option<u64>,
+    pub last_own_votes: usize,
+    pub broadcast_failed: u64,
+    pub last_error: String,
     pub heights: Vec<HeightVotes>,
 }
 
@@ -95,7 +113,7 @@ impl FinalityTracker {
     fn active_set(&self, height: u64) -> Vec<String> {
         let n = self.storage.network().milestone(height.max(1)).active_delegates as usize;
         let round = crate::delegate::round::round_info(height, n as u64).round;
-        crate::delegate::round::forging_order(&self.storage, round, n).map(|l| l.into_iter().map(|d| d.public_key).collect()).unwrap_or_default()
+        crate::delegate::round::forging_order_or_live(&self.storage, round, n).map(|l| l.into_iter().map(|d| d.public_key).collect()).unwrap_or_default()
     }
 
     /// Verify and record votes from the network. Returns the number accepted and the equivocation proofs discovered
@@ -218,6 +236,11 @@ impl FinalityTracker {
         }
         if !out.is_empty() {
             i.own.insert(height, block_id.to_string());
+            i.last_own_vote_unix = now_unix();
+            i.last_own_votes = out.len();
+        } else if now_unix().saturating_sub(i.warned_unix) >= 60 {
+            i.warned_unix = now_unix();
+            tracing::warn!(height, keys = keys.len(), active_set = set.len(), "finality: none of our delegate keys is in the active set of this round — no votes signed (round snapshot / ranking problem?)");
         }
         drop(i);
         self.try_certify(height, block_id);
@@ -277,6 +300,13 @@ impl FinalityTracker {
         Ok(true)
     }
 
+    /// Publisher bookkeeping for the metrics page (gossip broadcast failed / timed out).
+    pub fn note_broadcast_failed(&self, error: impl Into<String>) {
+        let mut i = self.lock();
+        i.broadcast_failed += 1;
+        i.last_error = error.into();
+    }
+
     fn prune(&self, tip: u64) {
         let mut i = self.lock();
         let cut = tip.saturating_sub(KEEP_BEHIND);
@@ -300,6 +330,7 @@ impl FinalityTracker {
         let (finalized_height, finalized_id) = self.finalized().map(|(h, id)| (h, Some(id))).unwrap_or((0, None));
         let i = self.lock();
         let tip_votes = tip_id.as_ref().and_then(|id| i.votes.get(&tip).and_then(|m| m.get(id))).map(|s| s.len()).unwrap_or(0);
+        let own_votes_at_tip = if i.own.get(&tip) == tip_id.as_ref() && tip_id.is_some() { i.last_own_votes } else { 0 };
         let heights = i
             .votes
             .iter()
@@ -318,6 +349,11 @@ impl FinalityTracker {
             received: i.received,
             rejected: i.rejected,
             own_votes: i.own.len(),
+            own_votes_at_tip,
+            last_own_vote_age: (i.last_own_vote_unix > 0).then(|| now_unix().saturating_sub(i.last_own_vote_unix)),
+            last_own_votes: i.last_own_votes,
+            broadcast_failed: i.broadcast_failed,
+            last_error: i.last_error.clone(),
             heights,
         }
     }

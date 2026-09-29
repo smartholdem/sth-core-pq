@@ -87,7 +87,7 @@ async fn n1_relays_reachable() {
     let storage = Arc::new(Storage::temporary(network.clone()).unwrap());
     sth_core::genesis::ensure_genesis(&storage, &network).unwrap();
     let pool = Arc::new(Mempool::new(storage.clone(), vec![], 10));
-    let setup = RelaySetup { n0: false, extra: vec![] };
+    let setup = RelaySetup { n0: false, extra: vec![], guard: Default::default() };
     assert_eq!(setup.relay_map().urls::<Vec<iroh::RelayUrl>>().len(), 2);
     let node = IrohNode::spawn(iroh::SecretKey::generate(), vec![], true, Some(setup), storage, pool, false, None, None).await.unwrap();
     tokio::time::timeout(Duration::from_secs(30), node.endpoint.online()).await.expect("no n1 relay connected within 30 s");
@@ -148,6 +148,82 @@ async fn rust_delegates_propagate_over_gossip() {
         assert!(tokio::time::Instant::now() < deadline, "B never learned A's delegate over gossip");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// sthpq address book: node B pulls A's fresh records over RPC `GetAddrs`; A refuses tampered / private records.
+#[tokio::test]
+async fn address_book_records_are_served_over_rpc() {
+    use sth_core::node_config::DiscoveryConfig;
+    use sth_core::p2p_iroh::addrbook::{fetch_addrs, SignedAddr};
+    use sth_core::p2p_iroh::DiscoveryOpts;
+
+    let network = Network::mainnet();
+    let a_storage = Arc::new(Storage::temporary(network.clone()).unwrap());
+    sth_core::genesis::ensure_genesis(&a_storage, &network).unwrap();
+    let a_pool = Arc::new(Mempool::new(a_storage.clone(), vec![], 10));
+    let discovery = DiscoveryOpts { cfg: DiscoveryConfig::default(), pinned: vec![] };
+    let a = IrohNode::spawn_with(iroh::SecretKey::generate(), vec![], true, None, a_storage.clone(), a_pool, false, None, None, Some(discovery)).await.unwrap();
+    let book = a.addrbook.get().cloned().expect("address book enabled");
+
+    let b_storage = Arc::new(Storage::temporary(network.clone()).unwrap());
+    let b_pool = Arc::new(Mempool::new(b_storage.clone(), vec![], 10));
+    let b = IrohNode::spawn(iroh::SecretKey::generate(), vec![a.id()], true, None, b_storage.clone(), b_pool, false, None, None).await.unwrap();
+
+    // a third node's record, learned by A "over gossip" and confirmed alive
+    let c = iroh::SecretKey::generate();
+    let now = sth_core::p2p_iroh::addrbook::now_unix();
+    let record = SignedAddr::sign(&c, &network.nethash, vec!["185.199.110.9:4004".into()], Some("https://relay-fsn7.sth.cx/".into()), now);
+    assert!(book.insert(record.clone(), "gossip").unwrap());
+    assert!(book.insert(SignedAddr::sign(&c, &network.nethash, vec!["10.0.0.9:4004".into()], None, now + 1), "gossip").is_err(), "private address refused");
+    let mut forged = record.clone();
+    forged.seq += 5;
+    assert!(book.insert(forged, "gossip").is_err(), "re-signed by nobody → rejected");
+
+    let _ = tokio::time::timeout(Duration::from_secs(15), a.endpoint.online()).await;
+    let addr = a.endpoint.addr();
+    let none = tokio::time::timeout(Duration::from_secs(30), fetch_addrs(&b.endpoint, addr.clone(), 50)).await.unwrap().unwrap();
+    assert!(none.is_empty(), "never answered → not shared yet");
+    book.mark(c.public(), true);
+    let got = fetch_addrs(&b.endpoint, addr, 50).await.unwrap();
+    assert_eq!(got, vec![record]);
+    // persisted for the next start
+    assert_eq!(a_storage.load_addr_entries().len(), 1);
+    let s = sth_core::p2p_iroh::addrbook::snapshot();
+    assert_eq!(s["entries"], 1);
+    assert_eq!(s["fresh"], 1);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// `discovery.n0_dns: false` → preset `Minimal` (no n0 DNS, no n0 relays): two such nodes still talk over RPC with a
+/// pinned `id@ip:port` bootstrap address (what gateways give the network).
+#[tokio::test]
+async fn minimal_preset_without_n0_talks_via_pinned_bootstrap() {
+    use sth_core::node_config::DiscoveryConfig;
+    use sth_core::p2p_iroh::DiscoveryOpts;
+
+    let network = Network::mainnet();
+    let cfg = DiscoveryConfig { n0_dns: false, mainline: false, ..DiscoveryConfig::default() };
+    let a_storage = Arc::new(Storage::temporary(network.clone()).unwrap());
+    sth_core::genesis::ensure_genesis(&a_storage, &network).unwrap();
+    let a_pool = Arc::new(Mempool::new(a_storage.clone(), vec![], 10));
+    let a = IrohNode::spawn_with(iroh::SecretKey::generate(), vec![], true, None, a_storage.clone(), a_pool, false, None, None, Some(DiscoveryOpts { cfg: cfg.clone(), pinned: vec![] })).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), a.endpoint.online()).await;
+    let a_addr = a.endpoint.addr();
+    let direct = a_addr.ip_addrs().next().copied().expect("node A has a local socket address");
+
+    let (id, sock) = sth_core::p2p_iroh::addrbook::parse_bootstrap(&format!("{}@{}", a.id(), direct)).unwrap();
+    let pinned = vec![iroh::EndpointAddr::new(id).with_ip_addr(sock.unwrap())];
+    let b_storage = Arc::new(Storage::temporary(network.clone()).unwrap());
+    let b_pool = Arc::new(Mempool::new(b_storage.clone(), vec![], 10));
+    let b = IrohNode::spawn_with(iroh::SecretKey::generate(), vec![a.id()], true, None, b_storage.clone(), b_pool, false, None, None, Some(DiscoveryOpts { cfg, pinned })).await.unwrap();
+
+    // B dials A by id only: the pinned address in MemoryLookup is the whole "discovery"
+    let (height, _) = tokio::time::timeout(Duration::from_secs(30), fetch_status(&b.endpoint, &b.peers, a.id())).await.unwrap().unwrap();
+    assert_eq!(height, 1);
+    assert!(a.relay_urls.is_empty(), "no relays configured → none reported");
     a.shutdown().await;
     b.shutdown().await;
 }

@@ -4,23 +4,33 @@
 //! transactions plus a tiny request/response protocol (`GetStatus`, `GetBlocks`) on our own ALPN.
 //! Runs next to the legacy port 4001 until the network has fully migrated to sth-core nodes.
 
+pub mod addrbook;
 pub mod delegates;
 pub mod finality;
 mod gossip;
+pub use gossip::fill_gap_from;
 mod peers;
 pub mod proto;
+pub mod relay_guard;
 mod rpc;
+pub mod wallet_api;
+
+/// iroh-gossip message size limit of this node (receive + send).
+pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+pub use gossip::FINALITY_VOTES_PER_MESSAGE;
+pub mod ws_bridge;
 
 pub use peers::{IrohPeerInfo, IrohPeers};
 pub use proto::{GossipMessage, Request, Response};
 pub use rpc::{fetch_blocks, fetch_finality, fetch_status, RpcHandler, ALPN};
+pub use wallet_api::WalletApi;
 
 use crate::error::{Error, Result};
 use crate::mempool::Mempool;
 use crate::storage::Storage;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gossip::{Gossip, TopicId};
 use std::path::Path;
 use std::sync::Arc;
@@ -45,6 +55,21 @@ pub struct IrohNode {
     pub rust_delegates: delegates::RustDelegates,
     /// SHIP-35 finality votes / certificates.
     pub finality: Arc<finality::FinalityTracker>,
+    /// SHIP-44 wallet protocols (`netfory/api/*`, `sth/events/1`); inert until `wallet_api.attach(...)`.
+    pub wallet_api: Arc<WalletApi>,
+    /// Nethash the node serves (binds address-book records to the network).
+    pub nethash: String,
+    /// Node key (signs sthpq address records; the same key the endpoint runs on).
+    pub secret: SecretKey,
+    /// sthpq address book (`p2p.iroh.discovery`), set when the module is enabled.
+    pub addrbook: std::sync::OnceLock<Arc<addrbook::AddrBook>>,
+}
+
+/// `p2p.iroh.discovery` runtime options: the config + bootstrap entries given as `id@ip:port`.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryOpts {
+    pub cfg: crate::node_config::DiscoveryConfig,
+    pub pinned: Vec<EndpointAddr>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,15 +77,111 @@ pub struct Topics {
     pub blocks: TopicId,
     pub transactions: TopicId,
     pub finality: TopicId,
+    /// sthpq address book announcements.
+    pub addrs: TopicId,
 }
 
 impl Topics {
     /// Topics are bound to the network by nethash so testnets never mix with mainnet.
     pub fn for_network(nethash: &str) -> Self {
         let id = |kind: &str| TopicId::from_bytes(crate::crypto::sha256(format!("sth/{nethash}/{kind}").as_bytes()));
-        Self { blocks: id("blocks"), transactions: id("transactions"), finality: id("finality") }
+        Self { blocks: id("blocks"), transactions: id("transactions"), finality: id("finality"), addrs: id("addrs") }
     }
 }
+
+/// Mainline DHT address lookup (BEP-44 mutable item keyed by the node's Ed25519 key, pkarr SignedPacket value —
+/// identical to what NETFORY clients publish/resolve). Only relay URLs and PUBLIC IPs are published so a node behind
+/// NAT never leaks its LAN addresses; the endpoint's secret key signs the packets (set by `into_address_lookup`).
+fn mainline_lookup(cfg: &crate::node_config::DiscoveryConfig, secret: &SecretKey) -> Result<iroh_mainline_address_lookup::DhtAddressLookup> {
+    let mut dht = n0_mainline::Dht::builder();
+    if !cfg.mainline_bootstrap.is_empty() {
+        dht.extra_bootstrap(&cfg.mainline_bootstrap);
+    }
+    if cfg.mainline_port > 0 {
+        dht.port(cfg.mainline_port);
+    }
+    if cfg.mainline_server {
+        dht.server_mode();
+    }
+    let public_only = iroh::address_lookup::AddrFilter::new(|addrs| {
+        std::borrow::Cow::Owned(
+            addrs
+                .iter()
+                .filter(|a| match a {
+                    iroh::TransportAddr::Relay(_) => true,
+                    iroh::TransportAddr::Ip(sa) => addrbook::is_public(sa.ip()),
+                    _ => false,
+                })
+                .cloned()
+                .collect(),
+        )
+    });
+    tracing::info!(extra_bootstrap = cfg.mainline_bootstrap.len(), port = cfg.mainline_port, server = cfg.mainline_server, "Mainline DHT address lookup enabled (pkarr / BEP-44)");
+    iroh_mainline_address_lookup::DhtAddressLookup::builder()
+        .dht_builder(dht)
+        .addr_filter(public_only)
+        .secret_key(secret.clone())
+        .build()
+        .map_err(|e| Error::Config(format!("Mainline DHT: {e}")))
+}
+
+/// Health of the Mainline DHT as seen by this node (`ntfry.discovery.dht`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DhtHealth {
+    /// `probing` | `ok` | `unreachable`
+    pub status: String,
+    pub last_ok_unix: u64,
+    pub last_probe_unix: u64,
+    pub failures: u32,
+}
+
+static DHT_HEALTH: std::sync::Mutex<Option<DhtHealth>> = std::sync::Mutex::new(None);
+
+pub fn dht_health() -> Option<DhtHealth> {
+    DHT_HEALTH.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Every 30 min (first after 90 s) resolve our own record from the DHT: success proves bootstrap + publish work.
+/// Failures produce ONE clear WARN + alert instead of n0_mainline's error every 2 s (muted in main.rs).
+async fn dht_health_loop(lookup: iroh_mainline_address_lookup::DhtAddressLookup, me: EndpointId, cfg: crate::node_config::DiscoveryConfig) {
+    use futures::StreamExt;
+    use iroh::address_lookup::AddressLookup;
+    *DHT_HEALTH.lock().unwrap_or_else(|e| e.into_inner()) = Some(DhtHealth { status: "probing".into(), ..Default::default() });
+    tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1800));
+    loop {
+        tick.tick().await;
+        let found = match lookup.resolve(me) {
+            Some(mut stream) => tokio::time::timeout(std::time::Duration::from_secs(45), async { while let Some(item) = stream.next().await { if item.is_ok() { return true; } } false }).await.unwrap_or(false),
+            None => false,
+        };
+        let now = addrbook::now_unix();
+        let mut h = DHT_HEALTH.lock().unwrap_or_else(|e| e.into_inner());
+        let st = h.get_or_insert_with(Default::default);
+        st.last_probe_unix = now;
+        if found {
+            if st.status != "ok" {
+                tracing::info!("Mainline DHT reachable: own record resolved (bootstrap + publish OK)");
+            }
+            st.status = "ok".into();
+            st.last_ok_unix = now;
+            st.failures = 0;
+        } else {
+            st.failures += 1;
+            st.status = "unreachable".into();
+            let msg = format!(
+                "Mainline DHT unreachable: own record not found after {} probe(s) — outbound UDP to the DHT bootstrap routers is blocked or throttled (ISP filtering of BitTorrent traffic is common). Discovery keeps working through the sthpq address book{}; add reachable seeders in discovery.mainline_bootstrap (e.g. a gateway with mainline_server: true) or set discovery.mainline: false",
+                st.failures,
+                if cfg.n0_dns { " and n0 DNS" } else { "" }
+            );
+            drop(h);
+            tracing::warn!("{msg}");
+            crate::alerts::notify("dht-unreachable", msg, false);
+        }
+    }
+}
+
 
 /// Load the node secret key from `path`, creating a fresh one when the file does not exist.
 pub fn load_or_create_secret(path: &Path) -> Result<SecretKey> {
@@ -90,9 +211,16 @@ pub struct RelaySetup {
     pub n0: bool,
     /// Extra relay URLs from node.yaml (`p2p.iroh.relays`).
     pub extra: Vec<String>,
+    /// Optional relay guard module (drops a misbehaving non-protected relay from the map at runtime).
+    pub guard: crate::node_config::RelayGuardConfig,
 }
 
 impl RelaySetup {
+    /// Relays that the guard never removes: n1 + node.yaml `relays`.
+    pub fn protected(&self) -> Vec<String> {
+        N1_RELAYS.iter().map(|s| s.to_string()).chain(self.extra.iter().cloned()).collect()
+    }
+
     /// n1 + optional n0 + extra, deduplicated; invalid URLs are reported and skipped.
     pub fn relay_map(&self) -> iroh::RelayMap {
         let mut urls: Vec<iroh::RelayUrl> = Vec::new();
@@ -112,7 +240,7 @@ impl RelaySetup {
 
 impl From<bool> for RelaySetup {
     fn from(n0: bool) -> Self {
-        Self { n0, extra: Vec::new() }
+        Self { n0, extra: Vec::new(), guard: Default::default() }
     }
 }
 
@@ -130,24 +258,83 @@ impl IrohNode {
         legacy_peers: Option<Arc<crate::p2p_legacy::PeerTable>>,
         gateway: Option<String>,
     ) -> Result<Arc<Self>> {
+        Self::spawn_with(secret, bootstrap, serve_blocks, relay, storage, mempool, verify, legacy_peers, gateway, None).await
+    }
+
+    /// [`IrohNode::spawn`] + the sthpq address book module (`p2p.iroh.discovery`) and pinned bootstrap addresses.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_with(
+        secret: SecretKey,
+        bootstrap: Vec<EndpointId>,
+        serve_blocks: bool,
+        relay: Option<RelaySetup>,
+        storage: Arc<Storage>,
+        mempool: Arc<Mempool>,
+        verify: bool,
+        legacy_peers: Option<Arc<crate::p2p_legacy::PeerTable>>,
+        gateway: Option<String>,
+        discovery: Option<DiscoveryOpts>,
+    ) -> Result<Arc<Self>> {
         let lookup = iroh::address_lookup::MemoryLookup::new();
-        let (builder, relay_urls) = match &relay {
-            Some(setup) => {
+        // n0 DNS (`presets::N0*`) stays a fallback unless discovery.n0_dns is off → `Minimal` = no n0 contact at all
+        let n0_dns = discovery.as_ref().map_or(true, |d| !d.cfg.enabled || d.cfg.n0_dns);
+        let (mut builder, relay_urls) = match (&relay, n0_dns) {
+            (Some(setup), true) => {
                 let map = setup.relay_map();
                 let urls: Vec<String> = map.urls::<Vec<iroh::RelayUrl>>().iter().map(|u| u.to_string()).collect();
                 (Endpoint::builder(presets::N0).relay_mode(iroh::RelayMode::Custom(map)), urls)
             }
-            None => (Endpoint::builder(presets::N0DisableRelay), Vec::new()),
+            (None, true) => (Endpoint::builder(presets::N0DisableRelay), Vec::new()),
+            (Some(setup), false) => {
+                let map = setup.relay_map();
+                let urls: Vec<String> = map.urls::<Vec<iroh::RelayUrl>>().iter().map(|u| u.to_string()).collect();
+                (Endpoint::builder(presets::Minimal).relay_mode(iroh::RelayMode::Custom(map)), urls)
+            }
+            (None, false) => (Endpoint::builder(presets::Minimal).relay_mode(iroh::RelayMode::Disabled), Vec::new()),
         };
+        if !n0_dns {
+            tracing::info!("n0 DNS address lookup OFF (discovery.n0_dns: false) — peers are found via the sthpq address book and the Mainline DHT only");
+        }
+        let mut dht_lookup = None;
+        if let Some(d) = &discovery {
+            if d.cfg.enabled && d.cfg.mainline {
+                let lookup = mainline_lookup(&d.cfg, &secret)?;
+                builder = builder.address_lookup(lookup.clone());
+                dht_lookup = Some(lookup);
+            }
+        }
+        if let Some(d) = &discovery {
+            // a fixed UDP port + announced public address = stable direct dial info for the address book
+            if d.cfg.listen_port > 0 {
+                let bind = std::net::SocketAddr::from(([0, 0, 0, 0], d.cfg.listen_port));
+                builder = builder.bind_addr(bind).map_err(|e| Error::Config(format!("p2p.iroh.discovery.listen_port: {e}")))?;
+                tracing::info!(port = d.cfg.listen_port, "iroh listens on a fixed UDP port (open it in the firewall)");
+            }
+            if !d.cfg.external_addr.trim().is_empty() {
+                let ext: std::net::SocketAddr = d.cfg.external_addr.trim().parse().map_err(|e| Error::Config(format!("p2p.iroh.discovery.external_addr `{}`: {e}", d.cfg.external_addr)))?;
+                if !addrbook::is_public(ext.ip()) {
+                    return Err(Error::Config(format!("p2p.iroh.discovery.external_addr {ext} is not a public address")));
+                }
+                builder = builder.external_addr(ext);
+            }
+        }
+        let wallet_api = WalletApi::new(secret.clone());
         let endpoint = builder
-            .secret_key(secret)
+            .secret_key(secret.clone())
             .address_lookup(lookup.clone())
             .bind()
             .await
             .map_err(|e| Error::Sync(format!("iroh bind: {e}")))?;
         let peers = Arc::new(IrohPeers::default());
-        let gossip = Gossip::builder().spawn(endpoint.clone());
-        let mut builder = Router::builder(endpoint.clone()).accept(iroh_gossip::ALPN, gossip.clone());
+        // blocks with transactions and vote batches exceed the 4 KiB iroh-gossip default; peers on older builds still
+        // receive our ≤ 4 KiB messages (votes are chunked), we accept up to 64 KiB from newer ones
+        let gossip = Gossip::builder().max_message_size(GOSSIP_MAX_MESSAGE_SIZE).spawn(endpoint.clone());
+        let mut builder = Router::builder(endpoint.clone())
+            .accept(iroh_gossip::ALPN, gossip.clone())
+            .accept(wallet_api::ALPN_API_V0, wallet_api::ApiHandler::new(wallet_api.clone(), false))
+            .accept(wallet_api::ALPN_API_V1, wallet_api::ApiHandler::new(wallet_api.clone(), true))
+            .accept(wallet_api::ALPN_API, wallet_api::ApiHandler::new(wallet_api.clone(), true))
+            .accept(wallet_api::ALPN_EVENTS, wallet_api::EventsHandler::new(wallet_api.clone()));
         if serve_blocks {
             builder = builder.accept(ALPN, RpcHandler::new(storage.clone(), peers.clone()));
         }
@@ -159,12 +346,35 @@ impl IrohNode {
         } else {
             tracing::info!(relays = relay_urls.join(", "), "iroh relays");
         }
+        if let Some(setup) = &relay {
+            if setup.n0 {
+                tracing::warn!("p2p.iroh.relay_n0: true — the public n0 relays are rate-limited and not meant for production; if one wins the latency race wallets time out through it (relay guard removes it after repeated failures). Prefer relay_n0: false (NETFORY n1 only)");
+            }
+            relay_guard::init(&setup.guard, &setup.protected(), endpoint.clone());
+        }
         for id in &bootstrap {
             peers.seen(*id, None);
         }
-        let node = Arc::new(Self { endpoint, router, gossip, peers, topics, lookup, gateway, relay_urls, forging_keys: Default::default(), announce: std::sync::atomic::AtomicBool::new(true), rust_delegates: Default::default(), finality: Arc::new(finality::FinalityTracker::new(storage.clone())) });
+        let node = Arc::new(Self { endpoint, router, gossip, peers, topics, lookup, gateway, relay_urls, forging_keys: Default::default(), announce: std::sync::atomic::AtomicBool::new(true), rust_delegates: Default::default(), finality: Arc::new(finality::FinalityTracker::new(storage.clone())), wallet_api, nethash: storage.network().nethash.clone(), secret, addrbook: std::sync::OnceLock::new() });
+        if let Some(d) = discovery {
+            for addr in d.pinned {
+                tracing::info!(peer = %addr.id.fmt_short(), addrs = ?addr.ip_addrs().collect::<Vec<_>>(), "bootstrap peer pinned with a direct address");
+                node.add_peer_addr(addr);
+            }
+            if let Some(book) = addrbook::init(&d.cfg, &node.nethash, node.id(), storage.clone(), node.lookup.clone()) {
+                let _ = node.addrbook.set(book);
+            }
+            if let Some(lookup) = dht_lookup {
+                tokio::spawn(dht_health_loop(lookup, node.id(), d.cfg.clone()));
+            }
+        }
         gossip::start(node.clone(), bootstrap, storage, mempool, verify, legacy_peers).await?;
         Ok(node)
+    }
+
+    /// Nethash of the chain this node serves (address-book records are bound to it).
+    pub fn storage_nethash(&self) -> String {
+        self.nethash.clone()
     }
 
     /// `GetStatus` every known peer concurrently (heights + latency for the download scheduler).

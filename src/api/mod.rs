@@ -11,8 +11,8 @@ mod sobj;
 pub mod tokens;
 mod locks;
 mod node;
-mod ntfry;
-mod render;
+pub mod ntfry;
+pub(crate) mod render;
 mod status_page;
 mod transactions;
 mod wallets;
@@ -24,7 +24,7 @@ use crate::error::Error;
 use crate::mempool::Mempool;
 use crate::p2p_legacy::PeerTable;
 use crate::storage::Storage;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tower_http::cors::{Any, CorsLayer};
 
 pub struct AppState {
     pub storage: Arc<Storage>,
@@ -44,13 +45,24 @@ pub struct AppState {
     pub started: Instant,
     /// Serve the metrics page at `/` of the main API (api.page_metrics without metrics_listen).
     pub page_metrics: bool,
+    /// Allowed browser origins; empty = CORS off, `["*"]` = any.
+    pub cors_origins: Vec<String>,
     delegates_cache: Mutex<Option<(u64, Vec<Value>)>>,
+    /// All wallets sorted by balance desc, keyed by `Storage::generation` (refreshed on the first request after a write).
+    wallets_cache: Mutex<Option<(u64, Arc<Vec<crate::storage::WalletState>>)>>,
+    /// Closed calendar days of `/api/node/fees?groupBy=day` (unix day start → bucket); past days never change.
+    pub(crate) fee_days_cache: Mutex<std::collections::HashMap<i64, Value>>,
 }
 
 impl AppState {
     pub fn new(storage: Arc<Storage>, mempool: Arc<Mempool>, peers: Vec<String>) -> Self {
         let network = storage.network().clone();
-        Self { storage, mempool, network, peers, peer_table: None, iroh: None, forging: None, started: Instant::now(), page_metrics: false, delegates_cache: Mutex::new(None) }
+        Self { storage, mempool, network, peers, peer_table: None, iroh: None, forging: None, started: Instant::now(), page_metrics: false, cors_origins: Vec::new(), delegates_cache: Mutex::new(None), wallets_cache: Mutex::new(None), fee_days_cache: Mutex::new(Default::default()) }
+    }
+
+    pub fn with_cors_origins(mut self, origins: Vec<String>) -> Self {
+        self.cors_origins = origins;
+        self
     }
 
     pub fn with_metrics_page(mut self, on: bool) -> Self {
@@ -72,6 +84,23 @@ impl AppState {
     pub fn with_peer_table(mut self, table: Arc<PeerTable>) -> Self {
         self.peer_table = Some(table);
         self
+    }
+}
+
+impl AppState {
+    /// Snapshot of every wallet, balance-descending; one sled scan per chain write, shared by `/wallets*` and voters.
+    pub fn wallets_snapshot(&self) -> Result<Arc<Vec<crate::storage::WalletState>>, Error> {
+        let gen = self.storage.generation();
+        if let Some((g, list)) = self.wallets_cache.lock().expect("wallets cache poisoned").as_ref() {
+            if *g == gen {
+                return Ok(list.clone());
+            }
+        }
+        let mut all = self.storage.all_wallets()?;
+        all.sort_by(|a, b| b.balance.cmp(&a.balance).then_with(|| a.address.cmp(&b.address)));
+        let list = Arc::new(all);
+        *self.wallets_cache.lock().expect("wallets cache poisoned") = Some((gen, list.clone()));
+        Ok(list)
     }
 }
 
@@ -148,8 +177,9 @@ pub type ApiResult = std::result::Result<Json<Value>, ApiError>;
 
 pub fn router(state: Shared) -> Router {
     // unknown routes answer with the legacy error envelope instead of an empty 404
+    let cors = cors_layer(&state.cors_origins);
 
-    Router::new()
+    let r = Router::new()
         .route("/", get(ntfry::root))
         .route("/status", get(status_page::page))
         .route("/api/ntfry/peers", get(ntfry::peers))
@@ -178,7 +208,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/transactions/fees", get(node::transaction_fees))
         .route("/api/transactions/types", get(node::transaction_types))
         .route("/api/transactions/schemas", get(node::transaction_schemas))
-        .route("/api/transactions/unconfirmed", get(transactions::unconfirmed))
+        .route("/api/transactions/unconfirmed", get(transactions::unconfirmed).delete(transactions::purge_unconfirmed))
         .route("/api/transactions/unconfirmed/:id", get(transactions::unconfirmed_by_id))
         .route("/api/transactions/:id", get(transactions::by_id))
         .route("/api/votes", get(transactions::votes))
@@ -187,6 +217,12 @@ pub fn router(state: Shared) -> Router {
         .route("/api/tokens/:key", get(tokens::by_id))
         .route("/api/tokens/:key/holders", get(tokens::holders))
         .route("/api/tokens/:key/logo", get(tokens::logo))
+        .route("/api/tokens/:key/orders", get(tokens::orders))
+        .route("/api/tokens/:key/orders/:order_id", get(tokens::order))
+        .route("/api/tokens/:key/trades", get(tokens::trades))
+        .route("/api/masternodes", get(sobj::masternodes))
+        .route("/api/masternodes/:id", get(sobj::masternode))
+        .route("/api/wallets/:address/orders", get(tokens::wallet_orders))
         .route("/api/wallets/:address/tokens", get(tokens::wallet_tokens))
         .route("/api/sobj", get(sobj::list))
         .route("/api/sobj/search", post(sobj::search))
@@ -196,7 +232,9 @@ pub fn router(state: Shared) -> Router {
         .route("/api/locks/:id", get(locks::by_id))
         .route("/api/wallets", get(wallets::list))
         .route("/api/wallets/top", get(wallets::top))
+        .route("/api/wallets/search", get(wallets::search))
         .route("/api/wallets/:id", get(wallets::by_id))
+        .route("/api/wallets/:id/audit", get(wallets::audit))
         .route("/api/wallets/:id/transactions", get(wallets::transactions))
         .route("/api/wallets/:id/transactions/sent", get(wallets::transactions_sent))
         .route("/api/wallets/:id/transactions/received", get(wallets::transactions_received))
@@ -206,8 +244,28 @@ pub fn router(state: Shared) -> Router {
         .route("/api/delegates/:id", get(delegates::by_id))
         .route("/api/delegates/:id/voters", get(delegates::voters))
         .route("/api/delegates/:id/blocks", get(delegates::blocks))
-        .fallback(|| async { not_found_plain() })
-        .with_state(state)
+        .fallback(|| async { not_found_plain() });
+    match cors {
+        Some(c) => r.layer(c).with_state(state),
+        None => r.with_state(state),
+    }
+}
+
+/// CORS for browser clients. Off by default (no headers); `["*"]` = any origin, otherwise only the listed origins.
+pub fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    let origins: Vec<&str> = origins.iter().map(|o| o.trim().trim_end_matches('/')).filter(|o| !o.is_empty()).collect();
+    if origins.is_empty() {
+        return None;
+    }
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::ACCEPT, header::AUTHORIZATION])
+        .max_age(std::time::Duration::from_secs(3600));
+    if origins.iter().any(|o| *o == "*") {
+        return Some(layer.allow_origin(Any));
+    }
+    let parsed: Vec<HeaderValue> = origins.iter().filter_map(|o| o.parse().ok()).collect();
+    Some(layer.allow_origin(parsed))
 }
 
 fn not_found_plain() -> ApiError {
@@ -222,7 +280,7 @@ pub async fn serve(state: Shared, addr: SocketAddr) -> std::io::Result<()> {
 }
 
 pub async fn serve_listener(state: Shared, listener: tokio::net::TcpListener) -> std::io::Result<()> {
-    axum::serve(listener, router(state)).await
+    axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await
 }
 
 /// Dedicated metrics port (`api.metrics_listen`): the page at `/` plus `/api/ntfry/*` only.
@@ -245,6 +303,11 @@ pub fn transform(q: &Params) -> bool {
 }
 
 pub fn paginate(path: &str, q: &Params, total: usize, data: Vec<Value>) -> Value {
+    paginate_with(path, q, total, false, data)
+}
+
+/// `estimate` mirrors legacy `totalCountIsEstimate`: the count was extrapolated from a bounded scan.
+pub fn paginate_with(path: &str, q: &Params, total: usize, estimate: bool, data: Vec<Value>) -> Value {
     let (page, limit) = page_params(q);
     let page_count = total.div_ceil(limit).max(1);
     // Legacy link layout: caller's params in order (page substituted), then defaults `limit`, `transform=true`,
@@ -276,7 +339,7 @@ pub fn paginate(path: &str, q: &Params, total: usize, data: Vec<Value>) -> Value
     };
     json!({
         "meta": {
-            "totalCountIsEstimate": false,
+            "totalCountIsEstimate": estimate,
             "count": data.len(),
             "pageCount": page_count,
             "totalCount": total,

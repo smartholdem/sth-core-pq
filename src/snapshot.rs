@@ -419,3 +419,74 @@ pub async fn download_latest(base_url: &str, out_dir: &Path, pb: &ProgressBar) -
     std::fs::rename(&tmp, &target).map_err(|e| Error::Sync(format!("cannot move {}: {e}", tmp.display())))?;
     Ok(target)
 }
+
+/// Write a dump `<out>/1-<end>/{meta.json, blocks, transactions, rounds}` (+ `<out>/1-<end>.tgz`) in the legacy
+/// core-snapshots layout from the local database, up to `end` (default: local tip). Both `sth-core snapshot import` and
+/// the legacy `snapshot:import` read it. Returns the `.tgz` path.
+pub fn dump(storage: &Storage, out: &Path, end: Option<u64>, progress: Option<&ProgressBar>) -> Result<PathBuf> {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let tip = storage.get_last_height()?;
+    let end = end.unwrap_or(tip).min(tip);
+    if end == 0 {
+        return Err(Error::Sync("empty database, nothing to dump".into()));
+    }
+    let name = format!("1-{end}");
+    let dir = out.join(&name);
+    std::fs::create_dir_all(&dir).map_err(|e| Error::Sync(format!("cannot create {}: {e}", dir.display())))?;
+    let io = |e: std::io::Error| Error::Sync(format!("snapshot dump: {e}"));
+    let open = |f: &str| -> Result<GzEncoder<File>> {
+        Ok(GzEncoder::new(File::create(dir.join(f)).map_err(|e| Error::Sync(format!("cannot create {f}: {e}")))?, flate2::Compression::fast()))
+    };
+    let mut blocks = open("blocks")?;
+    let mut txs = open("transactions")?;
+    let rounds = open("rounds")?;
+    let net = storage.network();
+    let mut tx_count = 0u64;
+    for height in 1..=end {
+        let block = storage.get_block_by_height(height)?.ok_or_else(|| Error::NotFound(format!("block {height}")))?;
+        let header = crate::crypto::serialize_block(&block, true)?;
+        blocks.write_all(&(header.len() as u32).to_le_bytes()).map_err(io)?;
+        blocks.write_all(&header).map_err(io)?;
+        let block_id = block.id.clone().unwrap_or_default();
+        for (seq, tx) in block.transactions.iter().enumerate() {
+            let raw = crate::crypto::serialize_transaction(tx, crate::crypto::SerializeOptions::default(), net)?;
+            let rec = Value::Array(vec![
+                Value::from(tx.id.clone().unwrap_or_default()),
+                Value::from(block_id.clone()),
+                Value::from(height),
+                Value::from(tx.sequence.map(u64::from).unwrap_or(seq as u64)),
+                Value::from(u64::from(tx.timestamp.unwrap_or(block.timestamp))),
+                Value::Binary(raw),
+            ]);
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &rec).map_err(|e| Error::Sync(format!("msgpack: {e}")))?;
+            txs.write_all(&(buf.len() as u32).to_le_bytes()).map_err(io)?;
+            txs.write_all(&buf).map_err(io)?;
+            tx_count += 1;
+        }
+        if let Some(pb) = progress {
+            pb.set_position(height);
+        }
+    }
+    blocks.finish().map_err(io)?;
+    txs.finish().map_err(io)?;
+    rounds.finish().map_err(io)?;
+    let meta = serde_json::json!({
+        "blocks": { "count": end, "start": 1, "end": end },
+        "transactions": { "count": tx_count, "start": 1, "end": end },
+        "rounds": { "count": 0, "start": 0, "end": 0 },
+        "folder": name,
+        "skipCompression": false,
+        "network": net.name,
+        "packageVersion": format!("sth-core-pq {}", env!("CARGO_PKG_VERSION")),
+        "codec": "default",
+    });
+    std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?).map_err(io)?;
+    let tgz_path = out.join(format!("{name}.tgz"));
+    let tgz = File::create(&tgz_path).map_err(|e| Error::Sync(format!("cannot create {}: {e}", tgz_path.display())))?;
+    let mut archive = tar::Builder::new(GzEncoder::new(tgz, flate2::Compression::fast()));
+    archive.append_dir_all(&name, &dir).map_err(|e| Error::Sync(format!("tar: {e}")))?;
+    archive.into_inner().map_err(|e| Error::Sync(format!("tar: {e}")))?.finish().map_err(io)?;
+    Ok(tgz_path)
+}

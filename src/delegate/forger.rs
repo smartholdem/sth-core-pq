@@ -224,6 +224,7 @@ impl Forger {
     }
 
     fn record_skip(&self, slot: u64, delegate: &str, reason: String) {
+        crate::console::event(crate::console::Kind::Skipped, &format!("slot {slot}  {delegate}"), &reason);
         let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
         if st.skipped.len() >= 20 {
             st.skipped.pop_front();
@@ -310,7 +311,17 @@ impl Forger {
         let slot = slot_number(now, blocktime);
         let next_height = tip.height + 1;
         let info = round_info(next_height, n as u64);
-        let order = forging_order(&self.storage, info.round, n)?;
+        let Some(order) = forging_order(&self.storage, info.round, n)? else {
+            if *last_slot != slot {
+                *last_slot = slot;
+                tracing::error!(
+                    "Skipping slot {slot}: no active-delegates snapshot for round {} yet (it is written when block {} is applied) — forging from live balances would take other delegates' slots",
+                    group(info.round),
+                    group(info.round_height.saturating_sub(1))
+                );
+            }
+            return Ok(());
+        };
         if order.is_empty() {
             return Ok(());
         }
@@ -332,6 +343,12 @@ impl Forger {
         let Some(keys) = self.keys.iter().find(|k| k.public_key_hex() == *expected) else { return Ok(()) };
         *last_slot = slot;
         let name = self.name_of(expected);
+        // double-forge guard (optional module): the key was seen forging on another node → give the slot up
+        if let Some(reason) = super::guard::yield_reason(expected, next_height, n as u64) {
+            tracing::error!("Skipping slot {slot} for delegate {name}: {reason}");
+            self.record_skip(slot, &name, reason);
+            return Ok(());
+        }
         tracing::info!("Slot {slot} belongs to delegate {name} on this node — checking network quorum");
         // the block must extend the tip the network agrees on; wait for the previous slot's block if needed
         let slot_end = slot_start(slot + 1, blocktime);
@@ -376,6 +393,7 @@ impl Forger {
             .await
             .map_err(|e| crate::error::Error::Sync(format!("apply task failed: {e}")))??;
         crate::intake::record(crate::intake::Source::Forged, name.clone(), block.height, block.timestamp, &block.generator_public_key, network);
+        super::guard::own_forged(block.id.as_deref().unwrap_or_default());
         tracing::info!(
             "Forged new block {} by delegate {} ({}) at height {} with {} transactions (fees {}){}",
             block.id.as_deref().unwrap_or(""),
@@ -386,6 +404,18 @@ impl Forger {
             block.total_fee,
             if block.pq_signature.is_some() { " · v1 hybrid secp256k1 + ML-DSA-44" } else { "" }
         );
+        crate::console::event(
+            crate::console::Kind::Forged,
+            &format!("#{}  {name}", group(block.height)),
+            &format!(
+                "{} tx · fees {} · reward {} · id {}…{}",
+                block.transactions.len(),
+                sth(block.total_fee),
+                sth(block.reward),
+                block.id.as_deref().map(|i| &i[..i.len().min(10)]).unwrap_or(""),
+                if block.pq_signature.is_some() { " · ML-DSA-44" } else { "" }
+            ),
+        );
         self.mempool.prune_confirmed().await;
         {
             let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
@@ -395,8 +425,10 @@ impl Forger {
         let status = self.status.clone();
 
         let height = block.height;
+        let tx_count = block.transactions.len();
         let serialized = serialize_block_with_transactions(&block, network)?;
-        let peers = self.peers.best(self.opts.broadcast_fanout);
+        // a forged block goes to every healthy legacy peer — a missed slot costs more than a few sockets
+        let peers = self.peers.best(self.opts.broadcast_fanout.max(self.peers.alive()));
         let table = self.peers.clone();
         let port = table.port();
         tokio::spawn(async move {
@@ -410,12 +442,29 @@ impl Forger {
                     }
                     .await;
                     match res {
+                        Ok(r) if r.status => {
+                            tracing::debug!(peer = ip, height = r.height, "postBlock accepted");
+                            true
+                        }
                         Ok(r) => {
-                            tracing::debug!(peer = ip, accepted = r.status, height = r.height, "postBlock");
-                            r.status
+                            // legacy answers { status: false, height: <its tip> }: a peer behind us cannot chain the block
+                            let peer_height = u64::from(r.height);
+                            if peer_height + 1 < height {
+                                tracing::info!(peer = ip, peer_height, height, behind = height - peer_height, "postBlock not accepted: the legacy peer is behind the network and cannot chain this block yet (peer problem, not ours)");
+                            } else if peer_height >= height {
+                                // status:false + its tip already at our height = the block reached it first via another relay
+                                // (a PQ peer got it over iroh gossip and pushed it) — delivered, count it as accepted
+                                tracing::debug!(peer = ip, peer_height, height, "postBlock: the legacy peer already has this height (delivered by another relay first)");
+                                return true;
+                            } else if tx_count == 0 {
+                                tracing::warn!(peer = ip, peer_height = r.height, height, "postBlock REJECTED by legacy peer at the right height for an empty block — check the peer's log (slot/generator check or block version)");
+                            } else {
+                                tracing::warn!(peer = ip, peer_height = r.height, height, "postBlock REJECTED by legacy peer (invalid transaction for the network? check `sth-core audit-wallet <sender>`)");
+                            }
+                            false
                         }
                         Err(e) => {
-                            tracing::debug!(peer = ip, error = %e, "postBlock failed");
+                            tracing::warn!(peer = ip, error = %e, height, "postBlock REJECTED / failed — the peer's reason is in `error`");
                             table.record_failure(ip);
                             false
                         }
@@ -424,13 +473,69 @@ impl Forger {
             }))
             .await;
             let accepted = results.iter().filter(|ok| **ok).count();
-            tracing::info!("Broadcasting block {} to {} peers ({accepted} accepted)", group(height), results.len());
+            if accepted == 0 && !results.is_empty() {
+                tracing::error!("Broadcasting block {} to {} peers: NONE accepted — the network will skip this slot and the block will be rolled back", group(height), results.len());
+                crate::console::event(crate::console::Kind::Rejected, &format!("#{}", group(height)), &format!("none of {} legacy peers accepted the block — it will be rolled back", results.len()));
+            } else {
+                tracing::info!("Broadcasting block {} to {} peers ({accepted} accepted)", group(height), results.len());
+                crate::console::event(crate::console::Kind::Relayed, &format!("#{}", group(height)), &format!("{accepted}/{} legacy peers accepted", results.len()));
+            }
             if let Some(last) = status.lock().unwrap_or_else(|e| e.into_inner()).last_forged.as_mut() {
                 if last.height == height {
                     last.accepted_by = accepted;
                 }
             }
         });
+        self.spawn_orphan_watchdog(block.height, block.id.clone().unwrap_or_default(), network.milestone(block.height).blocktime);
         Ok(())
     }
+
+    /// Two slots after forging, ask the healthy legacy peers which block they have at our height. If most of them serve
+    /// another block, our block was orphaned (rejected or late): roll it back right away so the follow loop resyncs
+    /// instead of sitting on a private fork — the legacy `forkBlock` behaviour.
+    fn spawn_orphan_watchdog(&self, height: u64, id: String, blocktime: u32) {
+        let (storage, table) = (self.storage.clone(), self.peers.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(u64::from(blocktime) * 2 + 2)).await;
+            if storage.get_block_by_height(height).ok().flatten().and_then(|b| b.id) != Some(id.clone()) {
+                return; // already replaced or rolled back
+            }
+            let port = table.port();
+            let checks = futures::future::join_all(table.best(5).into_iter().map(|ip| async move {
+                let res = async {
+                    let mut peer = LegacyPeer::connect(&ip, port, Duration::from_secs(8)).await?;
+                    let blocks = peer.get_blocks(height - 1, 1).await?;
+                    Ok::<_, crate::error::Error>(blocks.into_iter().next().and_then(|b| b.id))
+                }
+                .await;
+                (ip, res)
+            }))
+            .await;
+            let mut same = 0usize;
+            let mut other: Vec<(String, String)> = Vec::new();
+            for (ip, res) in checks {
+                match res {
+                    Ok(Some(their)) if their == id => same += 1,
+                    Ok(Some(their)) => other.push((ip, their)),
+                    _ => {}
+                }
+            }
+            if other.len() >= 2 && other.len() > same {
+                tracing::warn!(height, ours = &id[..16], theirs = &other[0].1[..16.min(other[0].1.len())], peers = ?other.iter().map(|(ip, _)| ip.as_str()).collect::<Vec<_>>(), "our forged block was orphaned by the network — rolling it back");
+                let st = storage.clone();
+                match tokio::task::spawn_blocking(move || st.rollback_to(height - 1)).await {
+                    Ok(Ok(h)) => tracing::warn!(to = h, "orphaned block rolled back; resyncing from peers"),
+                    Ok(Err(e)) => tracing::error!(error = %e, "orphan rollback failed"),
+                    Err(e) => tracing::error!(error = %e, "orphan rollback task failed"),
+                }
+            } else if same > 0 {
+                tracing::debug!(height, same, other = other.len(), "forged block confirmed by peers");
+            }
+        });
+    }
+}
+
+fn sth(v: u64) -> String {
+    let s = format!("{}.{:08}", v / 100_000_000, v % 100_000_000);
+    format!("{} STH", s.trim_end_matches('0').trim_end_matches('.'))
 }

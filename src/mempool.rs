@@ -32,6 +32,8 @@ pub struct PoolError {
 
 pub struct Mempool {
     txs: RwLock<HashMap<String, Transaction>>,
+    /// Entry / last-relay heights per pending id (TTL + re-broadcast); written under the `txs` lock order txs → meta.
+    meta: std::sync::Mutex<HashMap<String, PendingMeta>>,
     storage: Arc<Storage>,
     network: Network,
     relay_nodes: Vec<String>,
@@ -42,10 +44,35 @@ pub struct Mempool {
     max_bytes: usize,
     bytes: std::sync::atomic::AtomicUsize,
     dynamic_fees: crate::node_config::DynamicFeesConfig,
+    /// Whether the legacy peers' pools run dynamic fees (else they take exactly the static fee) — fee advisor only.
+    legacy_dynamic_fees: bool,
+    /// Legacy `maxTransactionAge`: a pending transaction older than this many blocks is dropped (0 = never).
+    max_age_blocks: u64,
+    /// Pending transactions are re-relayed (legacy P2P + iroh gossip) every this many blocks (0 = never).
+    rebroadcast_blocks: u64,
     /// Core transactions refused with `ERR_LOW_FEE` since start (metrics page).
     low_fee_rejected: std::sync::atomic::AtomicU64,
+    /// Pending transactions dropped by age / `expiration` since start.
+    expired: std::sync::atomic::AtomicU64,
     /// Accepted transactions, for other transports (iroh gossip) to re-publish.
     events: tokio::sync::broadcast::Sender<Vec<Transaction>>,
+    /// Pending transactions re-relayed after `rebroadcast_blocks` (gossip re-publishes them without the seen-filter).
+    rebroadcasts: tokio::sync::broadcast::Sender<Vec<Transaction>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingMeta {
+    entered: u64,
+    relayed: u64,
+}
+
+/// Why `prune` dropped a pending transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    Forged,
+    StaleNonce,
+    Expired,
+    Aged,
 }
 
 impl Mempool {
@@ -86,8 +113,95 @@ impl Mempool {
         &self.dynamic_fees
     }
 
+    /// Fee advisor: do the legacy peers run dynamic fees? (`mempool.legacy_dynamic_fees`, default false = static fee).
+    pub fn with_legacy_dynamic_fees(mut self, on: bool) -> Self {
+        self.legacy_dynamic_fees = on;
+        self
+    }
+
+    pub fn legacy_dynamic_fees(&self) -> bool {
+        self.legacy_dynamic_fees
+    }
+
+    /// Fee the legacy (Core 3.8.2) pools demand for this core transaction: exactly the static fee, or the dynamic
+    /// minimum when `legacy_dynamic_fees` is on. `None` for PQ / token / SmartObject transactions (never enter legacy pools).
+    pub fn legacy_min_fee(&self, tx: &Transaction) -> Option<u64> {
+        if tx.type_group != TYPE_GROUP_CORE || tx.is_pq() {
+            return None;
+        }
+        let tip = self.storage.get_last_height().unwrap_or(0);
+        let ms = self.storage.network().milestone(tip + 1);
+        let name = crate::config::FEE_NAMES.iter().find(|(_, t)| *t == tx.type_).map(|(n, _)| *n).unwrap_or("");
+        let min = if self.legacy_dynamic_fees {
+            let df = crate::node_config::DynamicFeesConfig::default();
+            df.min_fee(name, self.tx_size(tx), df.min_fee_pool)
+        } else {
+            ms.static_fee_for_type(tx.type_)
+        };
+        (min > 0).then_some(min)
+    }
+
+    /// Fee the legacy pools demand for a plain transfer (metrics page).
+    pub fn legacy_min_transfer_fee(&self) -> u64 {
+        let tip = self.storage.get_last_height().unwrap_or(0);
+        if self.legacy_dynamic_fees {
+            let df = crate::node_config::DynamicFeesConfig::default();
+            df.min_fee("transfer", Self::TRANSFER_WIRE_BYTES, df.min_fee_pool)
+        } else {
+            self.storage.network().milestone(tip + 1).static_fee("transfer")
+        }
+    }
+
+    /// Fee advisor: `{ fee, legacyMinFee, legacyDynamicFees, message }` when the legacy pools will refuse this fee, so
+    /// only PQ delegates forge the transaction (slower confirmation). `None` when every delegate will take it.
+    pub fn fee_hint(&self, tx: &Transaction) -> Option<serde_json::Value> {
+        let min = self.legacy_min_fee(tx)?;
+        let refused = if self.legacy_dynamic_fees { tx.fee < min } else { tx.fee != min };
+        if !refused {
+            return None;
+        }
+        let why = if tx.fee < min { format!("is below the legacy pool minimum {}", sth(min)) } else { format!("does not match the static fee {} the legacy pools demand", sth(min)) };
+        let advice = if self.legacy_dynamic_fees { format!("use a fee of at least {}", sth(min)) } else { format!("use exactly {}", sth(min)) };
+        Some(serde_json::json!({
+            "fee": tx.fee.to_string(),
+            "legacyMinFee": min.to_string(),
+            "legacyDynamicFees": self.legacy_dynamic_fees,
+            "message": format!("fee {} {why}: only PQ delegates will forge this transaction — {advice} to be forged by every delegate", sth(tx.fee)),
+        }))
+    }
+
+    /// Pending transactions the legacy pools refuse for their fee (metrics page).
+    pub async fn below_legacy_min(&self) -> usize {
+        self.txs.read().await.values().filter(|t| self.fee_hint(t).is_some()).count()
+    }
+
     pub fn low_fee_rejected(&self) -> u64 {
         self.low_fee_rejected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Legacy `transactionPool.maxTransactionAge` (blocks); 0 disables the age limit.
+    pub fn with_max_age_blocks(mut self, blocks: u64) -> Self {
+        self.max_age_blocks = blocks;
+        self
+    }
+
+    pub fn max_age_blocks(&self) -> u64 {
+        self.max_age_blocks
+    }
+
+    /// Re-relay pending transactions every `blocks` blocks (0 disables).
+    pub fn with_rebroadcast_blocks(mut self, blocks: u64) -> Self {
+        self.rebroadcast_blocks = blocks;
+        self
+    }
+
+    pub fn expired(&self) -> u64 {
+        self.expired.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stream of pending batches re-relayed after `rebroadcast_blocks` (no seen-filter on the gossip side).
+    pub fn subscribe_rebroadcast(&self) -> tokio::sync::broadcast::Receiver<Vec<Transaction>> {
+        self.rebroadcasts.subscribe()
     }
 
     /// Wire size of a plain v2 transfer without vendorField (59-byte common part + 33 payload + 64 signature).
@@ -146,7 +260,9 @@ impl Mempool {
             .build()
             .unwrap_or_default();
         let (events, _) = tokio::sync::broadcast::channel(64);
-        Self { txs: RwLock::new(HashMap::new()), storage, network, relay_nodes, peers, relay_fanout, client, max_size, max_bytes: crate::node_config::MempoolConfig::default().max_bytes, bytes: std::sync::atomic::AtomicUsize::new(0), dynamic_fees: Default::default(), low_fee_rejected: Default::default(), events }
+        let (rebroadcasts, _) = tokio::sync::broadcast::channel(16);
+        let defaults = crate::node_config::MempoolConfig::default();
+        Self { txs: RwLock::new(HashMap::new()), meta: Default::default(), storage, network, relay_nodes, peers, relay_fanout, client, max_size, max_bytes: defaults.max_bytes, bytes: std::sync::atomic::AtomicUsize::new(0), dynamic_fees: Default::default(), legacy_dynamic_fees: false, max_age_blocks: defaults.max_age_blocks, rebroadcast_blocks: defaults.rebroadcast_blocks, low_fee_rejected: Default::default(), expired: Default::default(), events, rebroadcasts }
     }
 
     pub async fn len(&self) -> usize {
@@ -157,15 +273,45 @@ impl Mempool {
         self.txs.read().await.get(id).cloned()
     }
 
-    /// Pending transactions, newest nonce first is irrelevant here — insertion order is not kept.
+    /// Pending transactions, insertion order is not kept.
     pub async fn all(&self) -> Vec<Transaction> {
         self.txs.read().await.values().cloned().collect()
+    }
+
+    /// Heights a pending transaction entered the pool and was last relayed at.
+    pub fn pending_meta(&self, id: &str) -> Option<(u64, u64)> {
+        self.meta.lock().unwrap_or_else(|e| e.into_inner()).get(id).map(|m| (m.entered, m.relayed))
+    }
+
+    /// Drop every pending transaction (or only `sender`'s); returns how many were removed. Operator action, no relay.
+    pub async fn purge(&self, sender: Option<&str>) -> usize {
+        let mut pool = self.txs.write().await;
+        let ids: Vec<String> = pool
+            .iter()
+            .filter(|(_, t)| sender.map_or(true, |s| address_from_public_key(&t.sender_public_key, self.network.pubkey_hash).ok().as_deref() == Some(s)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            self.remove_locked(&mut pool, id);
+        }
+        if !ids.is_empty() {
+            tracing::warn!(removed = ids.len(), sender = sender.unwrap_or("*"), "mempool purged by operator");
+        }
+        ids.len()
+    }
+
+    fn remove_locked(&self, pool: &mut HashMap<String, Transaction>, id: &str) -> Option<Transaction> {
+        let t = pool.remove(id)?;
+        self.bytes.fetch_sub(self.tx_size(&t).min(self.bytes()), std::sync::atomic::Ordering::Relaxed);
+        self.meta.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        Some(t)
     }
 
     /// Validate and admit transactions; returns the legacy response plus per-id errors.
     pub async fn add_many(&self, incoming: Vec<Transaction>) -> (PoolResponse, HashMap<String, PoolError>) {
         let mut resp = PoolResponse::default();
         let mut errors = HashMap::new();
+        let tip = self.storage.get_last_height().unwrap_or(0);
         for mut tx in incoming {
             let id = match transaction_id(&tx) {
                 Ok(id) => id,
@@ -183,13 +329,29 @@ impl Mempool {
                 }
             }
             tx.id = Some(id.clone());
+            if self.txs.read().await.contains_key(&id) {
+                // the same transaction echoed back by a peer we relayed it to — routine, not worth a WARN
+                tracing::debug!(%id, "transaction already in the pool (peer echo)");
+                errors.insert(id.clone(), PoolError { type_: "ERR_DUPLICATE".into(), message: format!("Transaction {id} is already in the pool") });
+                resp.invalid.push(id);
+                continue;
+            }
             let summary = describe(&tx, self.storage.network().pubkey_hash);
             match self.validate(&tx).await {
-                Ok(broadcast) => {
+                Ok((broadcast, replaces)) => {
                     tracing::info!("Received transaction {summary}");
+                    if let Some(h) = self.fee_hint(&tx) {
+                        tracing::info!(%id, fee = tx.fee, legacy_min_fee = h["legacyMinFee"].as_str().unwrap_or("?"), "fee advisor: legacy pools will refuse this fee — only PQ delegates will forge it");
+                    }
                     tracing::debug!(tx = %serde_json::to_string(&tx).unwrap_or_default(), "transaction json");
+                    let mut pool = self.txs.write().await;
+                    if let Some(old) = replaces.as_deref().and_then(|old| self.remove_locked(&mut pool, old)) {
+                        tracing::info!(old = old.id.as_deref().unwrap_or("?"), old_fee = old.fee, new = %id, new_fee = tx.fee, nonce = tx.nonce.unwrap_or(0), "pending transaction replaced by the sender (same nonce, fee not lower)");
+                    }
                     self.bytes.fetch_add(self.tx_size(&tx), std::sync::atomic::Ordering::Relaxed);
-                    self.txs.write().await.insert(id.clone(), tx);
+                    pool.insert(id.clone(), tx);
+                    self.meta.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), PendingMeta { entered: tip, relayed: tip });
+                    drop(pool);
                     resp.accept.push(id.clone());
                     if broadcast {
                         resp.broadcast.push(id);
@@ -217,7 +379,9 @@ impl Mempool {
         (resp, errors)
     }
 
-    async fn validate(&self, tx: &Transaction) -> std::result::Result<bool, (String, String)> {
+    /// `Ok((broadcast, replaces))`: whether the transaction may be relayed and, for a same-nonce resend with a fee not
+    /// lower than the pending one, the id of the pending transaction it replaces (RBF-lite, pool policy only).
+    async fn validate(&self, tx: &Transaction) -> std::result::Result<(bool, Option<String>), (String, String)> {
         let id = tx.id.clone().unwrap_or_default();
         let pool = self.txs.read().await;
         if pool.contains_key(&id) {
@@ -258,7 +422,34 @@ impl Mempool {
 
         let wallet = self.storage.get_wallet(&sender).map_err(storage_err)?;
         let (balance, nonce, second_pk) = wallet.as_ref().map(|w| (w.balance, w.nonce, w.second_public_key.clone())).unwrap_or((0, 0, None));
-        let pending: Vec<&Transaction> = pool.values().filter(|p| p.sender_public_key == tx.sender_public_key).collect();
+        let mut pending: Vec<&Transaction> = pool.values().filter(|p| p.sender_public_key == tx.sender_public_key).collect();
+        pending.sort_by_key(|p| p.nonce.unwrap_or(0));
+        // RBF-lite: the sender resends a nonce that is still pending here (stuck / fee bump) → replace when the fee is not lower
+        let replaces = match tx.nonce {
+            Some(n) => match pending.iter().find(|p| p.nonce == Some(n)) {
+                Some(old) if tx.fee < old.fee => {
+                    return Err(("ERR_BAD_NONCE".into(), format!("Sender {sender}: nonce {n} is already pending in this node's pool ({}) with fee {}; resend with a fee of at least {} to replace it", old.id.as_deref().unwrap_or("?"), old.fee, old.fee)));
+                }
+                Some(old) => old.id.clone(),
+                None => None,
+            },
+            None => None,
+        };
+        pending.retain(|p| p.nonce != tx.nonce);
+        let expected_nonce = nonce + 1 + pending.len() as u64;
+        match tx.nonce {
+            Some(_) if replaces.is_some() => {}
+            Some(n) if n == expected_nonce => {}
+            Some(n) => {
+                let detail = if pending.is_empty() {
+                    format!("chain nonce {nonce}, nothing pending")
+                } else {
+                    format!("chain nonce {nonce} + {} pending in this node's pool: {}–{}; resend a pending nonce with an equal or higher fee to replace it, see GET /api/transactions/unconfirmed?senderId={sender}", pending.len(), pending.first().and_then(|p| p.nonce).unwrap_or(0), pending.last().and_then(|p| p.nonce).unwrap_or(0))
+                };
+                return Err(("ERR_BAD_NONCE".into(), format!("Sender {sender}: nonce {n}, expected {expected_nonce} ({detail})")));
+            }
+            None => return Err(("ERR_BAD_NONCE".into(), "Transaction nonce is missing".into())),
+        }
         // a registration still waiting in the pool already binds the sender's next transactions
         let pending_second_pk = pending
             .iter()
@@ -326,47 +517,71 @@ impl Mempool {
             }
         }
         let pending_spent: i128 = pending.iter().map(|p| self.spent(p)).sum();
-        let expected_nonce = nonce + 1 + pending.len() as u64;
-        match tx.nonce {
-            Some(n) if n == expected_nonce => {}
-            Some(n) => {
-                return Err(("ERR_BAD_NONCE".into(), format!("Sender {sender}: nonce {n}, expected {expected_nonce}")));
-            }
-            None => return Err(("ERR_BAD_NONCE".into(), "Transaction nonce is missing".into())),
-        }
         if (balance as i128) - pending_spent < self.spent(tx) {
             return Err(("ERR_LOW_BALANCE".into(), format!("Sender {sender} has insufficient balance")));
         }
         if tx.type_group == crate::models::TYPE_GROUP_CORE && tx.type_ == tx_type::TRANSFER && tx.recipient_id.is_none() {
             return Err(("ERR_BAD_DATA".into(), "Transfer without recipient".into()));
         }
-        Ok(broadcast)
+        Ok((broadcast, replaces))
     }
 
-    /// Drop transactions that made it into a block or whose nonce is now stale.
+    /// Housekeeping after every block: drop forged / stale-nonce / expired (`expiration` height) / aged
+    /// (`max_age_blocks`, legacy `maxTransactionAge`) transactions and re-relay the rest every `rebroadcast_blocks`.
     pub async fn prune_confirmed(&self) {
+        let tip = self.storage.get_last_height().unwrap_or(0);
         let snapshot: Vec<(String, Transaction)> =
             self.txs.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        let mut stale = Vec::new();
-        for (id, tx) in snapshot {
-            let forged = self.storage.get_transaction(&id).ok().flatten().is_some();
+        let metas = self.meta.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut stale: Vec<(String, DropReason)> = Vec::new();
+        let mut rebroadcast: Vec<String> = Vec::new();
+        for (id, tx) in &snapshot {
+            let forged = self.storage.get_transaction(id).ok().flatten().is_some();
             let stale_nonce = address_from_public_key(&tx.sender_public_key, self.network.pubkey_hash)
                 .ok()
                 .and_then(|a| self.storage.get_wallet(&a).ok().flatten())
                 .map(|w| tx.nonce.unwrap_or(0) <= w.nonce)
                 .unwrap_or(false);
-            if forged || stale_nonce {
-                stale.push(id);
+            let entered = metas.get(id).map(|m| m.entered).unwrap_or(tip);
+            let expired = tx.expiration.is_some_and(|e| e > 0 && u64::from(e) <= tip);
+            let aged = self.max_age_blocks > 0 && tip.saturating_sub(entered) >= self.max_age_blocks;
+            let reason = if forged { Some(DropReason::Forged) } else if stale_nonce { Some(DropReason::StaleNonce) } else if expired { Some(DropReason::Expired) } else if aged { Some(DropReason::Aged) } else { None };
+            match reason {
+                Some(r) => stale.push((id.clone(), r)),
+                None if self.rebroadcast_blocks > 0 && tip.saturating_sub(metas.get(id).map(|m| m.relayed).unwrap_or(tip)) >= self.rebroadcast_blocks => rebroadcast.push(id.clone()),
+                None => {}
             }
         }
         if !stale.is_empty() {
             let mut pool = self.txs.write().await;
-            for id in &stale {
-                if let Some(t) = pool.remove(id) {
-                    self.bytes.fetch_sub(self.tx_size(&t).min(self.bytes()), std::sync::atomic::Ordering::Relaxed);
+            for (id, reason) in &stale {
+                if let Some(t) = self.remove_locked(&mut pool, id) {
+                    if matches!(reason, DropReason::Expired | DropReason::Aged) {
+                        self.expired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let entered = metas.get(id).map(|m| m.entered).unwrap_or(tip);
+                        tracing::warn!(reason = ?reason, entered_height = entered, age_blocks = tip.saturating_sub(entered), "Dropped pending transaction never forged: {}", describe(&t, self.network.pubkey_hash));
+                    }
                 }
             }
             tracing::debug!(removed = stale.len(), "mempool pruned");
+        }
+        if !rebroadcast.is_empty() {
+            {
+                let mut metas = self.meta.lock().unwrap_or_else(|e| e.into_inner());
+                for id in &rebroadcast {
+                    if let Some(m) = metas.get_mut(id) {
+                        m.relayed = tip;
+                    }
+                }
+            }
+            let txs: Vec<Transaction> = {
+                let pool = self.txs.read().await;
+                rebroadcast.iter().filter_map(|id| pool.get(id).cloned()).collect()
+            };
+            let oldest = rebroadcast.iter().filter_map(|id| metas.get(id).map(|m| m.entered)).min().unwrap_or(tip);
+            tracing::info!(count = txs.len(), oldest_age_blocks = tip.saturating_sub(oldest), "re-broadcasting pending transactions the network has not forged yet");
+            let _ = self.rebroadcasts.send(txs);
+            self.relay(&rebroadcast).await;
         }
     }
 
@@ -432,7 +647,13 @@ impl Mempool {
             .and_then(|e| self.storage.get_sobject(e.registration_id.as_deref()?).ok().flatten())
             .and_then(|(_, rec)| rec.price)
             .unwrap_or(0);
-        tx.amount as i128 + tx.fee as i128 + payments as i128 + buy_price as i128
+        let token_buy = tx
+            .token_asset()
+            .filter(|_| tx.type_group == crate::models::TYPE_GROUP_TOKEN && tx.type_ == crate::models::token::BUY)
+            .and_then(|a| Some((a.amount.unwrap_or(0), self.storage.token_order(a.order_id.as_deref()?).ok().flatten()?.price)))
+            .map(|(n, p)| n.saturating_mul(p))
+            .unwrap_or(0);
+        tx.amount as i128 + tx.fee as i128 + payments as i128 + buy_price as i128 + token_buy as i128
     }
 }
 
@@ -464,11 +685,40 @@ impl crate::rules::TokenView for PoolTokenView<'_> {
             .filter_map(|p| p.token_asset().filter(|a| a.id == id).map(|a| (p.type_, a)))
             .map(|(t, a)| match t {
                 crate::models::token::TRANSFER => a.transfers.unwrap_or_default().iter().map(|i| i.amount).sum(),
-                crate::models::token::BURN => a.amount.unwrap_or(0),
+                crate::models::token::BURN | crate::models::token::SELL => a.amount.unwrap_or(0),
                 _ => 0,
             })
             .sum();
         on_chain.saturating_sub(pending)
+    }
+    /// Storage order with every pending pool sell / buy / cancel applied (any sender).
+    fn order(&self, id: &str) -> Option<crate::storage::TokenOrder> {
+        use crate::models::token;
+        let mut order = self.storage.token_order(id).ok().flatten().or_else(|| {
+            let p = self.pool.get(id)?;
+            let a = p.token_asset().filter(|_| p.type_ == token::SELL)?;
+            let seller = crate::crypto::address_from_public_key(&p.sender_public_key, self.storage.network().pubkey_hash).ok()?;
+            Some(crate::storage::TokenOrder { id: id.to_string(), token_id: a.id, seller, amount: a.amount.unwrap_or(0), filled: 0, price: a.price.unwrap_or(0), height: 0, closed: None, fills: Vec::new() })
+        })?;
+        for p in self.pool.values() {
+            let Some(a) = p.token_asset().filter(|a| a.order_id.as_deref() == Some(id)) else { continue };
+            match p.type_ {
+                token::BUY => {
+                    order.filled = order.filled.saturating_add(a.amount.unwrap_or(0)).min(order.amount);
+                    if order.filled >= order.amount {
+                        order.closed = Some(u64::MAX);
+                    }
+                }
+                token::CANCEL => order.closed = Some(u64::MAX),
+                _ => {}
+            }
+        }
+        Some(order)
+    }
+    fn open_orders(&self, seller: &str, token_id: &str) -> usize {
+        let on_chain = self.storage.wallet_orders(seller).unwrap_or_default().into_iter().filter(|o| o.token_id == token_id).count();
+        let pending = self.pool.values().filter(|p| p.sender_public_key == self.sender_pk && p.type_group == crate::models::TYPE_GROUP_TOKEN && p.type_ == crate::models::token::SELL && p.token_asset().is_some_and(|a| a.id == token_id)).count();
+        on_chain + pending
     }
     fn ticker_sobj(&self, id: &str) -> Option<(String, String, bool)> {
         let (owner, r) = self.storage.get_sobject(id).ok().flatten()?;

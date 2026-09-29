@@ -14,10 +14,11 @@ pub mod server;
 
 pub use client::{decode_blocks, LegacyPeer};
 pub use follow::{catch_up, run as run_follow, P2pOptions};
-pub use health::{PeerStats, PeerTable};
+pub use health::{acceptance_check, AcceptanceReport, PeerStats, PeerTable};
 pub use proto::*;
 pub use relay::broadcast;
-pub use server::LegacyServer;
+pub use server::{LegacyServer, CORE_API_PLUGIN, CORE_PQ_PLUGIN};
+pub use relay::relay_coverage;
 
 use std::time::Duration;
 

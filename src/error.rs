@@ -29,6 +29,9 @@ pub enum Error {
     Http(#[from] reqwest::Error),
     #[error("sync error: {0}")]
     Sync(String),
+    /// The chain moved while a block was being applied (another intake path won the race); not a peer fault.
+    #[error("stale tip: {0}")]
+    StaleTip(String),
     #[error("config error: {0}")]
     Config(String),
 }

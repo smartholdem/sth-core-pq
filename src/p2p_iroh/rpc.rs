@@ -59,6 +59,10 @@ impl RpcHandler {
                 Ok(certificate) => Response::Finality { certificate },
                 Err(e) => Response::Error { message: e.to_string() },
             },
+            Request::GetAddrs { limit } => match super::addrbook::global() {
+                Some(book) => Response::Addrs { records: book.fresh(limit as usize) },
+                None => Response::Error { message: "address book disabled".into() },
+            },
         }
     }
 }

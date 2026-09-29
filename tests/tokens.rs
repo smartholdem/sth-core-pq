@@ -18,6 +18,20 @@ fn network_tokens() -> Network {
     let ms = MAINNET_MILESTONES_JSON.replace("\"ship11\": true", "\"ship11\": true, \"aip36\": true, \"tokens\": true");
     Network::from_json(MAINNET_NETWORK_JSON, &ms, MAINNET_EXCEPTIONS_JSON, MAINNET_GENESIS_GZ).unwrap()
 }
+/// … plus the SHIP-43 token market
+fn network_market() -> Network {
+    let ms = MAINNET_MILESTONES_JSON.replace("\"ship11\": true", "\"ship11\": true, \"aip36\": true, \"tokens\": true, \"tokenMarket\": { \"enabled\": true }");
+    Network::from_json(MAINNET_NETWORK_JSON, &ms, MAINNET_EXCEPTIONS_JSON, MAINNET_GENESIS_GZ).unwrap()
+}
+fn sell(keys: &KeyPair, nonce: u64, id: &str, amount: u64, price: u64) -> Transaction {
+    token_tx(keys, nonce, token::SELL, 100_000_000, serde_json::json!({ "id": id, "amount": amount.to_string(), "price": price.to_string() }))
+}
+fn buy(keys: &KeyPair, nonce: u64, id: &str, order: &str, amount: u64) -> Transaction {
+    token_tx(keys, nonce, token::BUY, 10_000_000, serde_json::json!({ "id": id, "orderId": order, "amount": amount.to_string() }))
+}
+fn cancel(keys: &KeyPair, nonce: u64, id: &str, order: &str) -> Transaction {
+    token_tx(keys, nonce, token::CANCEL, 10_000_000, serde_json::json!({ "id": id, "orderId": order }))
+}
 
 fn tx(keys: &KeyPair, nonce: u64, body: serde_json::Value) -> Transaction {
     let mut v = serde_json::json!({ "version": 2, "network": 63, "typeGroup": 1, "nonce": nonce.to_string(), "senderPublicKey": keys.public_key_hex(), "amount": "0", "expiration": 0 });
@@ -88,6 +102,12 @@ impl Chain {
                 Err(e.to_string())
             }
         }
+    }
+    fn rollback(&mut self) {
+        let h = self.storage.rollback_last_block().unwrap();
+        self.tip_block = self.storage.get_block_by_height(h).unwrap().unwrap();
+        self.tip = ChainTip { height: h, id: self.tip_block.id.clone() };
+        self.slot -= 1;
     }
     fn bal(&self, addr: &str, id: &str) -> u64 {
         self.storage.get_wallet(addr).unwrap().unwrap().tokens.get(id).copied().unwrap_or(0)
@@ -298,4 +318,218 @@ fn init_burn_percent_switches_by_milestone() {
     // rollback both init blocks: balances return to the pre-init state
     c.storage.rollback_to(2).unwrap();
     assert_eq!((bal_of(&c, &forger_addr), bal_of(&c, &burn_addr)), (f0, b0));
+}
+
+/// SHIP-43 stage A: TokenSell / TokenBuy / TokenCancel have a fixed wire format and fees, are rejected before the
+/// `tokenMarket` milestone and — until the order state machine lands — are refused by the wallet-aware check too.
+#[test]
+fn token_market_types_wire_format_and_activation_gate() {
+    use sth_core::rules::check_token_format;
+    let keys = KeyPair::from_passphrase("market maker").unwrap();
+    let net = network_tokens();
+    let token_id = "ab".repeat(32);
+    let order_id = "cd".repeat(32);
+    let ms = net.milestone(11_900_000);
+    assert!(!ms.token_market.enabled);
+    assert_eq!((ms.token_fees.sell, ms.token_fees.buy, ms.token_fees.cancel), (100_000_000, 10_000_000, 10_000_000));
+
+    let sell = sign(token_tx(&keys, 1, token::SELL, 100_000_000, serde_json::json!({ "id": token_id, "amount": "100", "price": "250000000" })), &keys);
+    let buy = sign(token_tx(&keys, 2, token::BUY, 10_000_000, serde_json::json!({ "id": token_id, "orderId": order_id, "amount": "40" })), &keys);
+    let cancel = sign(token_tx(&keys, 3, token::CANCEL, 10_000_000, serde_json::json!({ "id": token_id, "orderId": order_id })), &keys);
+    for t in [&sell, &buy, &cancel] {
+        assert!(t.is_token());
+        let bytes = serialize_transaction(t, SerializeOptions::default(), &net).unwrap();
+        let back = deserialize_transaction(&bytes).unwrap();
+        assert_eq!(back.token_asset(), t.token_asset(), "wire round-trip of type {}", t.type_);
+        assert_eq!(transaction_id(&back).unwrap(), t.id.clone().unwrap());
+        // not active on mainnet milestones
+        let err = check_token_format(t, ms).unwrap_err();
+        assert!(err.starts_with("TokenTypeNotActiveError"), "{err}");
+    }
+    let a = sell.token_asset().unwrap();
+    assert_eq!((a.amount, a.price), (Some(100), Some(250_000_000)));
+    assert_eq!(buy.token_asset().unwrap().order_id.as_deref(), Some(order_id.as_str()));
+
+    // enabled milestone: format + fee rules apply, wallet-aware check still refuses (stage B pending)
+    let ms_on = MAINNET_MILESTONES_JSON.replace("\"ship11\": true", "\"ship11\": true, \"aip36\": true, \"tokens\": true, \"tokenMarket\": { \"enabled\": true }");
+    let net_on = Network::from_json(MAINNET_NETWORK_JSON, &ms_on, MAINNET_EXCEPTIONS_JSON, MAINNET_GENESIS_GZ).unwrap();
+    let ms_on = net_on.milestone(11_900_000);
+    assert!(ms_on.token_market.enabled);
+    assert!(check_token_format(&sell, ms_on).is_ok());
+    assert!(check_token_format(&buy, ms_on).is_ok());
+    assert!(check_token_format(&cancel, ms_on).is_ok());
+    let bad_fee = sign(token_tx(&keys, 4, token::SELL, 1, serde_json::json!({ "id": token_id, "amount": "1", "price": "1" })), &keys);
+    assert!(check_token_format(&bad_fee, ms_on).unwrap_err().starts_with("StaticFeeMismatchError"));
+    let zero = sign(token_tx(&keys, 5, token::SELL, 100_000_000, serde_json::json!({ "id": token_id, "amount": "0", "price": "1" })), &keys);
+    assert!(check_token_format(&zero, ms_on).unwrap_err().starts_with("TokenOrderInvalidError"));
+    let overflow = sign(token_tx(&keys, 6, token::SELL, 100_000_000, serde_json::json!({ "id": token_id, "amount": "18446744073709551615", "price": "2" })), &keys);
+    assert!(check_token_format(&overflow, ms_on).unwrap_err().starts_with("TokenOrderOverflowError"));
+    // a short orderId cannot even be serialised (32 bytes on the wire); the format check rejects the JSON form too
+    let short_oid = token_tx(&keys, 7, token::CANCEL, 10_000_000, serde_json::json!({ "id": token_id, "orderId": "abcd" }));
+    assert!(serialize_transaction(&short_oid, SerializeOptions::default(), &net_on).is_err());
+    assert!(check_token_format(&short_oid, ms_on).unwrap_err().starts_with("TokenOrderInvalidError"));
+
+    struct NoView;
+    impl sth_core::rules::TokenView for NoView {
+        fn token_owner(&self, _: &str) -> Option<String> { None }
+        fn token_state(&self, _: &str) -> Option<sth_core::storage::TokenState> { None }
+        fn token_balance(&self, _: &str, _: &str) -> u64 { u64::MAX }
+        fn ticker_sobj(&self, _: &str) -> Option<(String, String, bool)> { None }
+        fn order(&self, _: &str) -> Option<sth_core::storage::TokenOrder> { None }
+        fn open_orders(&self, _: &str, _: &str) -> usize { 0 }
+    }
+    let err = sth_core::rules::check_token(&sell, sell.token_asset().as_ref().unwrap(), &keys.address(63).unwrap(), &NoView).unwrap_err();
+    assert!(err.starts_with("TokenNotFoundError"), "{err}");
+    let err = sth_core::rules::check_token(&buy, buy.token_asset().as_ref().unwrap(), &keys.address(63).unwrap(), &NoView).unwrap_err();
+    assert!(err.starts_with("TokenOrderNotFoundError"), "{err}");
+}
+
+/// SHIP-43 stage B: escrow on sell, partial fills with the STH leg, cancel returns the remainder, exact rollback,
+/// mempool sees pending fills, order book API.
+#[tokio::test]
+async fn token_market_orders_fill_cancel_and_rollback() {
+    let mut c = Chain::new(network_market());
+    let alice = KeyPair::from_passphrase("alice").unwrap();
+    let bob = KeyPair::from_passphrase("bob").unwrap();
+    let carol = KeyPair::from_passphrase("carol").unwrap();
+    let (a, b, k) = (alice.address(63).unwrap(), bob.address(63).unwrap(), carol.address(63).unwrap());
+    for addr in [&a, &b, &k] {
+        c.storage.update_wallet_state(addr, 100_000_000_000_000, 0).unwrap();
+    }
+    let reg = sign(ticker(&alice, 1, "UFO"), &alice);
+    c.try_block(vec![reg.clone()]).unwrap();
+    let id = reg.id.clone().unwrap();
+    c.try_block(vec![sign(init(&alice, 2, &id, 0, 8_000, 8_000), &alice)]).unwrap(); // 80.00 UFO (2 decimals)
+    c.storage.set_undo_enabled(true);
+    let sth = |c: &Chain, addr: &str| c.storage.get_wallet(addr).unwrap().unwrap().balance;
+    let (a0, b0) = (sth(&c, &a), sth(&c, &b));
+
+    // rules before any order
+    let e = c.try_block(vec![sign(sell(&alice, 3, &id, 9_000, 1), &alice)]).unwrap_err();
+    assert!(e.contains("TokenInsufficientBalanceError"), "{e}");
+    let e = c.try_block(vec![sign(buy(&bob, 1, &id, &"0".repeat(64), 1), &bob)]).unwrap_err();
+    assert!(e.contains("TokenOrderNotFoundError"), "{e}");
+
+    // ask: 1.00 UFO (100 units) at 1 STH per unit → escrow leaves alice's balance
+    let ask = sign(sell(&alice, 3, &id, 100, 100_000_000), &alice);
+    c.try_block(vec![ask.clone()]).unwrap();
+    let oid = ask.id.clone().unwrap();
+    assert_eq!(c.bal(&a, &id), 7_900);
+    let o = c.storage.token_order(&oid).unwrap().unwrap();
+    assert_eq!((o.remaining(), o.price, o.is_open(), o.seller.as_str()), (100, 100_000_000, true, a.as_str()));
+    assert_eq!(c.storage.token_orders(&id).unwrap().len(), 1);
+    assert_eq!(c.storage.wallet_orders(&a).unwrap().len(), 1);
+
+    // buyer rules
+    let e = c.try_block(vec![sign(buy(&alice, 4, &id, &oid, 1), &alice)]).unwrap_err();
+    assert!(e.contains("TokenOrderSelfTradeError"), "{e}");
+    let e = c.try_block(vec![sign(buy(&bob, 1, &id, &oid, 101), &bob)]).unwrap_err();
+    assert!(e.contains("TokenOrderAmountError"), "{e}");
+    let e = c.try_block(vec![sign(cancel(&bob, 1, &id, &oid), &bob)]).unwrap_err();
+    assert!(e.contains("TokenOrderNotOwnerError"), "{e}");
+    let poor = KeyPair::from_passphrase("poor").unwrap();
+    c.storage.update_wallet_state(&poor.address(63).unwrap(), 1_000_000_000, 0).unwrap(); // 10 STH: fee ok, 40 STH leg not
+    let e = c.try_block(vec![sign(buy(&poor, 1, &id, &oid, 40), &poor)]).unwrap_err();
+    assert!(e.contains("InsufficientBalanceError"), "{e}");
+
+    // partial fill: bob buys 40 units for 40 STH; two fills in one block, the second exceeding the remainder fails the block
+    c.try_block(vec![sign(buy(&bob, 1, &id, &oid, 40), &bob)]).unwrap();
+    assert_eq!(c.bal(&b, &id), 40);
+    assert_eq!(sth(&c, &b), b0 - 40 * 100_000_000 - 10_000_000);
+    assert_eq!(sth(&c, &a), a0 - 100_000_000 + 40 * 100_000_000, "seller got the STH leg minus her sell fee");
+    let o = c.storage.token_order(&oid).unwrap().unwrap();
+    assert_eq!((o.filled, o.remaining(), o.fills.len()), (40, 60, 1));
+    let e = c.try_block(vec![sign(buy(&carol, 1, &id, &oid, 50), &carol), sign(buy(&bob, 2, &id, &oid, 11), &bob)]).unwrap_err();
+    assert!(e.contains("TokenOrderAmountError"), "{e}");
+    assert_eq!(c.bal(&k, &id), 0, "failed block left no trace");
+
+    // the fill is recorded as a trade; rollback removes it
+    let trades: Vec<_> = c.storage.token_trades(&id).map(|t| t.unwrap()).collect();
+    assert_eq!(trades.len(), 1);
+    assert_eq!((trades[0].buyer.as_str(), trades[0].seller.as_str(), trades[0].amount, trades[0].price, trades[0].total), (b.as_str(), a.as_str(), 40, 100_000_000, 40 * 100_000_000));
+    assert_eq!(trades[0].order_id, oid);
+
+    // rollback of the partial fill restores balances and the order
+    c.rollback();
+    assert_eq!(c.storage.token_trades(&id).count(), 0);
+    assert_eq!((c.bal(&b, &id), sth(&c, &b)), (0, b0));
+    let o = c.storage.token_order(&oid).unwrap().unwrap();
+    assert_eq!((o.filled, o.remaining(), o.fills.len(), o.is_open()), (0, 100, 0, true));
+
+    // full fill in two buys inside one block closes the order and drops it from the book; two trades, newest first
+    c.try_block(vec![sign(buy(&carol, 1, &id, &oid, 50), &carol), sign(buy(&bob, 1, &id, &oid, 50), &bob)]).unwrap();
+    let trades: Vec<_> = c.storage.token_trades(&id).map(|t| t.unwrap()).collect();
+    assert_eq!(trades.iter().map(|t| t.buyer.as_str()).collect::<Vec<_>>(), vec![b.as_str(), k.as_str()]);
+    let o = c.storage.token_order(&oid).unwrap().unwrap();
+    assert_eq!((o.remaining(), o.is_open(), o.closed), (0, false, Some(c.tip.height)));
+    assert!(c.storage.token_orders(&id).unwrap().is_empty());
+    assert!(c.storage.wallet_orders(&a).unwrap().is_empty());
+    assert_eq!((c.bal(&k, &id), c.bal(&b, &id)), (50, 50));
+    let e = c.try_block(vec![sign(buy(&bob, 2, &id, &oid, 1), &bob)]).unwrap_err();
+    assert!(e.contains("TokenOrderClosedError"), "{e}");
+    c.rollback();
+    assert!(c.storage.token_order(&oid).unwrap().unwrap().is_open());
+    assert_eq!(c.storage.token_orders(&id).unwrap().len(), 1, "reopened order is back in the book");
+
+    // cancel: remainder returns to alice; rollback of the cancel re-escrows it; rollback of the sell removes the order
+    c.try_block(vec![sign(cancel(&alice, 4, &id, &oid), &alice)]).unwrap();
+    assert_eq!(c.bal(&a, &id), 8_000);
+    assert!(!c.storage.token_order(&oid).unwrap().unwrap().is_open());
+    let e = c.try_block(vec![sign(cancel(&alice, 5, &id, &oid), &alice)]).unwrap_err();
+    assert!(e.contains("TokenOrderClosedError"), "{e}");
+    c.rollback();
+    assert_eq!(c.bal(&a, &id), 7_900);
+    assert!(c.storage.token_order(&oid).unwrap().unwrap().is_open());
+    c.rollback();
+    assert_eq!(c.bal(&a, &id), 8_000);
+    assert!(c.storage.token_order(&oid).unwrap().is_none(), "sell rolled back → no record");
+    assert!(c.storage.token_orders(&id).unwrap().is_empty());
+
+    // mempool: a pending buy reduces what a second buyer may take; sell escrow counts as pending spend
+    let ask = sign(sell(&alice, 3, &id, 100, 100_000_000), &alice);
+    c.try_block(vec![ask.clone()]).unwrap();
+    let oid = ask.id.clone().unwrap();
+    let pool = sth_core::mempool::Mempool::new(c.storage.clone(), vec![], 100);
+    let (r, errs) = pool.add_many(vec![sign(buy(&bob, 1, &id, &oid, 70), &bob), sign(buy(&carol, 1, &id, &oid, 40), &carol)]).await;
+    assert_eq!(r.accept.len(), 1, "{errs:?}");
+    assert!(errs.values().any(|e| e.message.contains("TokenOrderAmountError")), "{errs:?}");
+    let (_, errs) = pool.add_many(vec![sign(sell(&alice, 4, &id, 7_950, 1), &alice)]).await;
+    assert!(errs.values().any(|e| e.message.contains("TokenInsufficientBalanceError")), "{errs:?}");
+
+    // API: order book + wallet orders
+    let mempool = Arc::new(sth_core::mempool::Mempool::new(c.storage.clone(), vec![], 100));
+    let state = Arc::new(sth_core::api::AppState::new(c.storage.clone(), mempool, vec![]));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { sth_core::api::serve_listener(state, listener).await.unwrap() });
+    let book: serde_json::Value = reqwest::get(format!("{base}/api/tokens/UFO/orders")).await.unwrap().json().await.unwrap();
+    assert_eq!(book["meta"]["totalCount"], 1);
+    assert_eq!(book["data"][0]["orderId"], oid);
+    assert_eq!(book["data"][0]["remaining"], "100");
+    assert_eq!(book["data"][0]["total"], (100u64 * 100_000_000).to_string());
+    assert_eq!(book["data"][0]["symbol"], "UFO");
+    let one: serde_json::Value = reqwest::get(format!("{base}/api/tokens/{id}/orders/{oid}")).await.unwrap().json().await.unwrap();
+    assert_eq!(one["data"]["open"], true);
+    let mine: serde_json::Value = reqwest::get(format!("{base}/api/wallets/{a}/orders")).await.unwrap().json().await.unwrap();
+    assert_eq!(mine["data"].as_array().unwrap().len(), 1);
+    let types: serde_json::Value = reqwest::get(format!("{base}/api/transactions/types")).await.unwrap().json().await.unwrap();
+    assert_eq!(types["data"]["3"]["TokenSell"], 5);
+
+    // trades API: a new fill at a different price → list newest first + one candle with OHLC
+    let ask2 = sign(sell(&alice, 4, &id, 10, 200_000_000), &alice);
+    c.try_block(vec![ask2.clone()]).unwrap();
+    c.try_block(vec![sign(buy(&bob, 1, &id, &oid, 30), &bob), sign(buy(&carol, 1, &id, &ask2.id.clone().unwrap(), 10), &carol)]).unwrap();
+    let list: serde_json::Value = reqwest::get(format!("{base}/api/tokens/UFO/trades?limit=1")).await.unwrap().json().await.unwrap();
+    assert_eq!(list["meta"]["totalCount"], 2);
+    assert_eq!(list["data"][0]["buyer"], k);
+    assert_eq!(list["data"][0]["price"], "200000000");
+    assert_eq!(list["data"][0]["total"], (10u64 * 200_000_000).to_string());
+    assert_eq!(list["data"][0]["symbol"], "UFO");
+    let list: serde_json::Value = reqwest::get(format!("{base}/api/tokens/UFO/trades?limit=1&page=2")).await.unwrap().json().await.unwrap();
+    assert_eq!(list["data"][0]["buyer"], b);
+    let candles: serde_json::Value = reqwest::get(format!("{base}/api/tokens/UFO/trades?groupBy=day&days=0")).await.unwrap().json().await.unwrap();
+    let cs = candles["data"].as_array().unwrap();
+    assert_eq!(cs.len(), 1, "both fills in one block → one day: {candles}");
+    assert_eq!((cs[0]["open"].as_str(), cs[0]["close"].as_str(), cs[0]["high"].as_str(), cs[0]["low"].as_str()), (Some("100000000"), Some("200000000"), Some("200000000"), Some("100000000")));
+    assert_eq!((cs[0]["volume"].as_str(), cs[0]["trades"].as_u64()), (Some("40"), Some(2)));
 }

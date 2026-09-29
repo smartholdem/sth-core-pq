@@ -19,6 +19,21 @@ const MIN_ROUND: Duration = Duration::from_millis(1_500);
 /// Health probes are short: an unreachable peer must not stall the table refresh.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_CONCURRENCY: usize = 16;
+/// The followed peer must be this many blocks behind the best peer in the table before we call it lagging.
+const LAG_BLOCKS: u64 = 2;
+/// How long a lagging block source is parked so `best_for_blocks` picks somebody else.
+const LAG_PARK: Duration = Duration::from_secs(60);
+
+/// The followed peer reports no new blocks while the rest of the table is `LAG_BLOCKS`+ ahead of our tip for longer
+/// than one slot → switch peer. `lag_since` is the moment the lag was first seen (reset when it clears).
+fn lagging_peer(peer_height: u64, tip: u64, best_height: u64, blocktime: u64, now: Instant, lag_since: &mut Option<Instant>) -> bool {
+    if peer_height > tip || best_height < tip + LAG_BLOCKS {
+        *lag_since = None;
+        return false;
+    }
+    let since = *lag_since.get_or_insert(now);
+    now.duration_since(since).as_secs() >= blocktime.max(1)
+}
 
 #[derive(Clone)]
 pub struct P2pOptions {
@@ -284,6 +299,10 @@ pub async fn catch_up(storage: Arc<Storage>, table: Arc<PeerTable>, opts: &P2pOp
     storage.set_undo_enabled(target - tip.height <= 2 * crate::storage::UNDO_DEPTH);
     let mut fork_depth = 1u64;
     let mut failures_in_row = 0u32;
+    // who gave us each recent block: when a peer proves our tip is off-branch, the supplier of that tip is serving the
+    // orphaned branch (typically a sibling PQ Node) and must stop being a block source, or the two keep re-feeding it
+    let mut supplier: std::collections::BTreeMap<u64, Source> = Default::default();
+    let mut last_fork_height = 0u64;
     let result: Result<()> = async {
         loop {
             // apply everything contiguous with the tip
@@ -293,6 +312,13 @@ pub async fn catch_up(storage: Arc<Storage>, table: Arc<PeerTable>, opts: &P2pOp
                 if forked {
                     // every peer serves another branch on top of our tip: our last blocks are orphaned
                     let target = tip.height.saturating_sub(fork_depth).max(1);
+                    if let Some(bad) = supplier.get(&tip.height) {
+                        if *bad != source {
+                            tracing::warn!(peer = %bad, height = tip.height, "peer served the orphaned branch, parking it as a block source");
+                            punish(bad);
+                        }
+                    }
+                    last_fork_height = tip.height;
                     let st = storage.clone();
                     let rolled = tokio::task::spawn_blocking(move || st.rollback_to(target)).await.map_err(|e| Error::Sync(e.to_string()))?;
                     match rolled {
@@ -313,11 +339,25 @@ pub async fn catch_up(storage: Arc<Storage>, table: Arc<PeerTable>, opts: &P2pOp
                 }
                 match apply(&storage, blocks, tip.clone(), opts.verify).await {
                     Ok(new_tip) => {
+                        for h in tip.height + 1..=new_tip.height {
+                            supplier.insert(h, source.clone());
+                        }
+                        supplier.retain(|h, _| *h + 2 * crate::storage::UNDO_DEPTH > new_tip.height);
                         applied += new_tip.height - tip.height;
                         tip = new_tip;
                         pb.set_position(tip.height);
                         failures_in_row = 0;
-                        fork_depth = 1;
+                        // a branch that just got rolled back may be re-fed by another peer: keep the depth until we are clearly past it
+                        if tip.height > last_fork_height + 10 {
+                            fork_depth = 1;
+                        }
+                    }
+                    Err(Error::StaleTip(msg)) => {
+                        // another intake path (gossip / postBlock) applied these heights meanwhile — not the peer's fault
+                        tracing::debug!(peer = %source, from, %msg, "range already applied by another path, resyncing tip");
+                        tip = tip_of(&storage)?;
+                        pb.set_position(tip.height);
+                        pending.retain(|h, _| *h >= tip.height);
                     }
                     Err(e) => {
                         tracing::warn!(peer = %source, from, error = %e, "peer blocks rejected, re-requesting range");
@@ -403,6 +443,12 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
     let mut last_ip = String::new();
     loop {
         let Some(ip) = table.best_for_blocks(1).into_iter().next() else {
+            // every alive peer parked as a block source (our own gossip/pull races count as failures) → forgive them
+            let unparked = table.unpark_blocks();
+            if unparked > 0 {
+                tracing::warn!(unparked, "all legacy peers were parked as block sources, parking lifted");
+                continue;
+            }
             tracing::warn!("no healthy legacy peers, re-probing in 5s");
             tokio::time::sleep(Duration::from_secs(5)).await;
             table.refresh(PROBE_CONCURRENCY, PROBE_TIMEOUT).await;
@@ -423,6 +469,7 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
         }
         // legacy nodes drop the socket right after a getBlocks reply → the next call fails by design
         let mut just_fetched = false;
+        let mut lag_since = None::<Instant>;
         loop {
             let tip = tip_of(storage)?;
             let status = match peer.get_status().await {
@@ -442,6 +489,15 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
             just_fetched = false;
             let peer_height = status.state.as_ref().map(|s| s.height as u64).unwrap_or(0);
             table.record_success(&ip, started.elapsed(), Some(peer_height));
+            let best = table.best_height();
+            let blocktime = u64::from(network.milestone(tip.height.max(1)).blocktime);
+            if lagging_peer(peer_height, tip.height, best, blocktime, Instant::now(), &mut lag_since) {
+                // the peer we follow is itself stuck (or is another stalled PQ Node) while the network moved on
+                tracing::warn!(peer = ip, peer_height = group(peer_height), tip = group(tip.height), network = group(best), "followed peer lags behind the network, switching block source");
+                crate::intake::note_stall_reason("lagging-peer", &ip, format!("followed peer {ip} stuck at {} while the network is at {} — switched block source", group(peer_height), group(best)), tip.height);
+                table.park_blocks_for(&ip, LAG_PARK);
+                break;
+            }
             if peer_height <= tip.height {
                 // poll fast: a forging node must see the previous slot's block within a second or two
                 tokio::time::sleep(Duration::from_millis(1_200)).await;
@@ -463,6 +519,13 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
                 continue;
             }
             let (from, to) = (blocks[0].height, blocks[blocks.len() - 1].height);
+            let current = tip_of(storage)?;
+            if current.height != tip.height {
+                // gossip / postBlock moved the tip while we were downloading: these blocks are (partly) known already
+                tracing::debug!(peer = ip, asked_from = tip.height, tip = current.height, "tip moved during getBlocks, re-polling");
+                just_fetched = true;
+                continue;
+            }
             let forked = blocks[0].height == tip.height + 1 && tip.id.as_deref().is_some_and(|id| blocks[0].previous_block != id);
             if forked {
                 // the network continued on another branch: roll back and resync from the best peer
@@ -470,7 +533,11 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
                 let st = storage.clone();
                 let rolled = tokio::task::spawn_blocking(move || st.rollback_to(target)).await.map_err(|e| Error::Sync(e.to_string()))?;
                 match rolled {
-                    Ok(h) => tracing::warn!(peer = ip, from = tip.height, to = h, "fork detected, rolled back"),
+                    Ok(h) => {
+                        tracing::warn!(peer = ip, from = tip.height, to = h, "fork detected, rolled back");
+                        crate::intake::note_stall_reason("fork", &ip, format!("peer {ip} served block {} on another branch — rolled back {} → {}", group(blocks[0].height), group(tip.height), group(h)), tip.height);
+                        crate::alerts::notify("fork", format!("fork detected via legacy peer {ip}: rolled back {} → {} (our blocks were orphaned)", group(tip.height), group(h)), false);
+                    }
                     Err(e) => tracing::error!(error = %e, "rollback failed or refused (FinalityViolation = SHIP-35 hard mode protects a final block; otherwise undo records missing — resync from snapshot may be required)"),
                 }
                 fork_depth = (fork_depth * 3).min(crate::storage::UNDO_DEPTH);
@@ -478,12 +545,15 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
             }
             let tx_count: usize = blocks.iter().map(|b| b.transactions.len()).sum();
             let newest = blocks.last().map(|b| (b.height, b.timestamp, b.generator_public_key.clone()));
+            // headers only (no transactions) for the double-forge guard — cheap even for a catch-up batch
+            let headers: Vec<Block> = blocks.iter().map(|b| Block { transactions: Vec::new(), ..b.clone() }).collect();
             match apply(storage, blocks, tip, opts.verify).await {
                 Ok(new_tip) => {
                     fork_depth = 1;
                     if let Some((h, ts, gen)) = &newest {
                         crate::intake::record(crate::intake::Source::PullLegacy, &ip, *h, *ts, gen, &network);
                     }
+                    crate::delegate::guard::on_accepted_batch(crate::intake::Source::PullLegacy, &ip, &headers, &network);
                     if from == to {
                         tracing::info!("Received new block at height {} with {} transactions from {}", group(to), tx_count, ip);
                     } else {
@@ -492,6 +562,10 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
                     if peer_height <= new_tip.height {
                         tracing::info!("Blockchain 100% in sync (height {})", group(new_tip.height));
                     }
+                }
+                Err(Error::StaleTip(msg)) => {
+                    tracing::debug!(peer = ip, %msg, "blocks already applied by another intake path");
+                    just_fetched = true;
                 }
                 Err(e) => {
                     tracing::error!(peer = ip, error = %e, "peer blocks rejected, switching peer");
@@ -535,4 +609,29 @@ pub async fn run(storage: Arc<Storage>, table: Arc<PeerTable>, opts: P2pOptions)
     .await;
     refresher.abort();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lagging_peer_switches_after_one_slot_only_when_the_network_is_ahead() {
+        let t0 = Instant::now();
+        let mut since = None;
+        // followed peer stuck at our height, table sees 3 blocks more → lag starts, but not yet a slot old
+        assert!(!lagging_peer(100, 100, 103, 8, t0, &mut since));
+        assert!(since.is_some());
+        assert!(!lagging_peer(100, 100, 103, 8, t0 + Duration::from_secs(7), &mut since));
+        assert!(lagging_peer(100, 100, 103, 8, t0 + Duration::from_secs(8), &mut since), "one slot of lag → switch");
+        // the peer has new blocks for us → never lagging, timer cleared
+        assert!(!lagging_peer(104, 100, 104, 8, t0 + Duration::from_secs(20), &mut since));
+        assert!(since.is_none());
+        // only one block ahead in the table (normal propagation jitter) → not a lag
+        assert!(!lagging_peer(100, 100, 101, 8, t0 + Duration::from_secs(30), &mut since));
+        assert!(since.is_none());
+        // peer behind us (it will catch up from us) but nobody ahead → not a lag
+        assert!(!lagging_peer(98, 100, 100, 8, t0 + Duration::from_secs(40), &mut since));
+        assert!(since.is_none());
+    }
 }

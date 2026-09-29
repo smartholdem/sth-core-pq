@@ -29,6 +29,8 @@ pub enum GossipMessage {
     Finality { votes: Vec<FinalityVote> },
     /// SHIP-35: proof that one delegate voted for two block ids at one height (verifiable from the two signatures).
     Equivocation { proof: crate::storage::EquivocationProof },
+    /// sthpq address book (topic `addrs`): signed dial records of the sender and of fresh peers it knows.
+    Addrs { records: Vec<super::addrbook::SignedAddr> },
 }
 
 /// SHIP-35 vote: Schnorr signature of the delegate key over `sha256("sth-finality-v1" || height LE || blockId bytes)`.
@@ -75,6 +77,8 @@ pub enum Request {
     },
     /// SHIP-35: the highest finality certificate the peer holds (newcomers catch up on finality without waiting for votes).
     GetFinality,
+    /// sthpq address book: up to `limit` fresh signed dial records (older nodes answer `Error: invalid request`).
+    GetAddrs { limit: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +94,7 @@ pub enum Response {
     },
     Blocks { blocks: Vec<Block> },
     Finality { certificate: Option<crate::storage::FinalityCert> },
+    Addrs { records: Vec<super::addrbook::SignedAddr> },
     Error { message: String },
 }
 

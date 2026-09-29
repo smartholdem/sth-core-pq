@@ -168,6 +168,22 @@ pub fn check_sobj(
             if name_taken(name, e.type_) {
                 return Err("SmartObjectNameAlreadyRegisteredError".into());
             }
+            if e.type_ == crate::models::sobj::TYPE_SERVICE_NODE {
+                if !ms.masternodes.enabled {
+                    return Err("SmartObjectTypeNotActiveError: Service Nodes need milestone masternodes.enabled (SHIP-42)".into());
+                }
+                if crate::models::sobj::parse_service_node(e.data.ntfry_data.as_deref().unwrap_or_default()).is_none() {
+                    return Err("ServiceNodeDataInvalidError: ntfryData must be iroh://<EndpointId 64 hex>?roles=relay,…".into());
+                }
+                let has_one = wallet.is_some_and(|w| w.sobjects.values().any(|r| r.type_ == crate::models::sobj::TYPE_SERVICE_NODE && !r.resigned))
+                    || pending.values().any(|r| r.type_ == crate::models::sobj::TYPE_SERVICE_NODE && !r.resigned);
+                if has_one {
+                    return Err("ServiceNodeAlreadyRegisteredError: one Service Node per wallet".into());
+                }
+                if wallet.map(|w| w.balance).unwrap_or(0) < ms.masternodes.collateral_amount as i64 + tx.fee as i64 {
+                    return Err(format!("ServiceNodeCollateralError: balance must stay >= {} smartoshi after the fee", ms.masternodes.collateral_amount));
+                }
+            }
             if e.type_ == crate::models::sobj::TYPE_DELEGATE {
                 match wallet.and_then(|w| w.username.as_deref()) {
                     None => return Err("SmartObjectSenderIsNotDelegateError".into()),
@@ -193,6 +209,14 @@ pub fn check_sobj(
             }
             if matches!(e.action, crate::models::sobj::ACTION_TRANSFER | crate::models::sobj::ACTION_SELL) && rec.type_ == crate::models::sobj::TYPE_DELEGATE {
                 return Err("SmartObjectDelegateNotTransferableError: delegate sObjects follow the delegate key".into());
+            }
+            if rec.type_ == crate::models::sobj::TYPE_SERVICE_NODE {
+                if matches!(e.action, crate::models::sobj::ACTION_TRANSFER | crate::models::sobj::ACTION_SELL) {
+                    return Err("ServiceNodeNotTransferableError: a Service Node object stays with its collateral wallet".into());
+                }
+                if e.action == crate::models::sobj::ACTION_UPDATE && crate::models::sobj::parse_service_node(e.data.ntfry_data.as_deref().unwrap_or_default()).is_none() {
+                    return Err("ServiceNodeDataInvalidError: ntfryData must be iroh://<EndpointId 64 hex>?roles=relay,…".into());
+                }
             }
             if rec.sub_type != e.sub_type {
                 return Err("SmartObjectWrongSubTypeError".into());
@@ -267,6 +291,39 @@ pub fn check_token_format(tx: &Transaction, ms: &crate::config::Milestone) -> Re
             check_token_meta(a.meta.as_ref().ok_or("TokenMetaInvalidError: missing asset.token.meta")?)?;
             f.meta
         }
+        token::SELL | token::BUY | token::CANCEL => {
+            if !ms.token_market.enabled {
+                return Err("TokenTypeNotActiveError: tokenMarket is not enabled at this height (SHIP-43)".into());
+            }
+            let oid_ok = a.order_id.as_deref().is_some_and(|o| o.len() == 64 && o.chars().all(|c| c.is_ascii_hexdigit()));
+            match tx.type_ {
+                token::SELL => {
+                    let (amount, price) = (a.amount.unwrap_or(0), a.price.unwrap_or(0));
+                    if amount == 0 || price == 0 {
+                        return Err("TokenOrderInvalidError: amount and price must be > 0".into());
+                    }
+                    if (amount as u128) * (price as u128) > u64::MAX as u128 {
+                        return Err("TokenOrderOverflowError: amount × price exceeds u64".into());
+                    }
+                    f.sell
+                }
+                token::BUY => {
+                    if !oid_ok {
+                        return Err("TokenOrderInvalidError: orderId must be 64 hex".into());
+                    }
+                    if a.amount.unwrap_or(0) == 0 {
+                        return Err("TokenOrderAmountError: amount must be > 0".into());
+                    }
+                    f.buy
+                }
+                _ => {
+                    if !oid_ok {
+                        return Err("TokenOrderInvalidError: orderId must be 64 hex".into());
+                    }
+                    f.cancel
+                }
+            }
+        }
         _ => {
             if a.amount.unwrap_or(0) == 0 {
                 return Err("TokenAmountInvalidError: burn amount must be > 0".into());
@@ -335,12 +392,61 @@ pub trait TokenView {
     fn token_balance(&self, address: &str, id: &str) -> u64;
     /// Ticker sObject (type 5) by registration id: (owner address, name, resigned).
     fn ticker_sobj(&self, id: &str) -> Option<(String, String, bool)>;
+    /// SHIP-43 order by id (including pending changes of the batch / pool).
+    fn order(&self, id: &str) -> Option<crate::storage::TokenOrder>;
+    /// Open SHIP-43 orders of `seller` for `token_id`.
+    fn open_orders(&self, seller: &str, token_id: &str) -> usize;
 }
+
+/// STH the buyer pays for a `TokenBuy` (0 for every other transaction / unknown order).
+pub fn token_buy_total(tx: &Transaction, view: &dyn TokenView) -> u64 {
+    if tx.type_group != crate::models::TYPE_GROUP_TOKEN || tx.type_ != crate::models::token::BUY {
+        return 0;
+    }
+    let Some(a) = tx.token_asset() else { return 0 };
+    let Some(o) = a.order_id.as_deref().and_then(|id| view.order(id)) else { return 0 };
+    a.amount.unwrap_or(0).saturating_mul(o.price)
+}
+
+/// SHIP-43 default `tokenMarket.maxOpenOrders`.
+pub const MAX_OPEN_ORDERS: usize = 64;
 
 /// Wallet-aware token checks (legacy `throwIfCannotBeApplied` analogue). `sender` is the tx sender address.
 pub fn check_token(tx: &Transaction, a: &crate::models::TokenAsset, sender: &str, view: &dyn TokenView) -> Result<(), String> {
     use crate::models::token;
     match tx.type_ {
+        token::SELL => {
+            view.token_state(&a.id).ok_or("TokenNotFoundError")?;
+            let amount = a.amount.unwrap_or(0);
+            if view.token_balance(sender, &a.id) < amount {
+                return Err("TokenInsufficientBalanceError".into());
+            }
+            if view.open_orders(sender, &a.id) >= MAX_OPEN_ORDERS {
+                return Err(format!("TokenTooManyOrdersError: at most {MAX_OPEN_ORDERS} open orders per token"));
+            }
+        }
+        token::BUY | token::CANCEL => {
+            let oid = a.order_id.as_deref().unwrap_or_default();
+            let order = view.order(oid).ok_or("TokenOrderNotFoundError")?;
+            if !order.is_open() {
+                return Err("TokenOrderClosedError".into());
+            }
+            if order.token_id != a.id {
+                return Err("TokenOrderMismatchError: order belongs to another token".into());
+            }
+            if tx.type_ == token::BUY {
+                if order.seller == sender {
+                    return Err("TokenOrderSelfTradeError".into());
+                }
+                let amount = a.amount.unwrap_or(0);
+                if amount == 0 || amount > order.remaining() {
+                    return Err(format!("TokenOrderAmountError: {} units remaining", order.remaining()));
+                }
+                // the STH leg (amount × price + fee) is checked by the balance rule of the pool / batch via token_buy_total
+            } else if order.seller != sender {
+                return Err("TokenOrderNotOwnerError".into());
+            }
+        }
         token::INIT => {
             let (owner, name, resigned) = view.ticker_sobj(&a.id).ok_or("TokenSmartObjectNotFoundError: no type-5 sObject with this id")?;
             if resigned {

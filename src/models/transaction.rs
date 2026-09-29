@@ -36,6 +36,11 @@ pub mod token {
     pub const BURN: u16 = 3;
     /// On-chain manifest (name, description, website, logo) — owner only, updatable.
     pub const META: u16 = 4;
+    /// SHIP-43 token market: fixed-price ask for part of a balance / fill / cancel (milestone `tokenMarket.enabled`).
+    pub const SELL: u16 = 5;
+    pub const BUY: u16 = 6;
+    pub const CANCEL: u16 = 7;
+    pub const LAST: u16 = CANCEL;
     pub const FLAG_MINTABLE: u8 = 1;
     pub const FLAG_BURNABLE: u8 = 2;
     pub const FLAG_FROZEN_CAP: u8 = 4;
@@ -121,6 +126,12 @@ pub struct TokenAsset {
     pub recipient_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<TokenMeta>,
+    /// SHIP-43: `TokenSell` price in smartoshi per token unit.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_u64_str")]
+    pub price: Option<u64>,
+    /// SHIP-43: `TokenBuy` / `TokenCancel` target order (= the TokenSell transaction id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -170,6 +181,34 @@ pub mod sobj {
     /// sobjV2: anyone pays the recorded price; coins go to the owner, the sObject (and token registry) to the buyer.
     pub const ACTION_BUY: u8 = 5;
     pub const TYPE_DELEGATE: u8 = 4;
+    /// SHIP-42 Service Node: `ntfryData = "iroh://<EndpointId 64 hex>[?roles=relay,seeder&api=https://…&storage=50]"`.
+    pub const TYPE_SERVICE_NODE: u8 = 7;
+
+    /// Parsed SHIP-42 `ntfryData`: (endpointId hex, roles, api url, storage GiB).
+    pub fn parse_service_node(data: &str) -> Option<(String, Vec<String>, Option<String>, Option<u32>)> {
+        let rest = data.strip_prefix("iroh://")?;
+        let (id, query) = rest.split_once('?').map(|(a, b)| (a, Some(b))).unwrap_or((rest, None));
+        if id.len() != 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut roles = Vec::new();
+        let mut api = None;
+        let mut storage = None;
+        for kv in query.unwrap_or_default().split('&').filter(|s| !s.is_empty()) {
+            let (k, v) = kv.split_once('=')?;
+            match k {
+                "roles" => roles = v.split(',').filter(|r| !r.is_empty()).map(|r| r.to_ascii_lowercase()).collect(),
+                "api" => api = Some(v.to_string()),
+                "storage" => storage = Some(v.parse().ok()?),
+                _ => return None,
+            }
+        }
+        if roles.is_empty() || roles.iter().any(|r| !SERVICE_ROLES.contains(&r.as_str())) {
+            return None;
+        }
+        Some((id.to_ascii_lowercase(), roles, api, storage))
+    }
+    pub const SERVICE_ROLES: [&str; 5] = ["relay", "seeder", "messenger", "microblog", "provider"];
     pub const FEE_REGISTER: u64 = 5_000_000_000;
     pub const FEE_UPDATE: u64 = 500_000_000;
     pub const FEE_RESIGN: u64 = 500_000_000;
@@ -297,7 +336,7 @@ impl Transaction {
     }
 
     pub fn is_token(&self) -> bool {
-        self.type_group == TYPE_GROUP_TOKEN && self.type_ <= token::META
+        self.type_group == TYPE_GROUP_TOKEN && self.type_ <= token::LAST
     }
 
     /// `asset.token` of a typeGroup-3 transaction.

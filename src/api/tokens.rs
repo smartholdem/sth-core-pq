@@ -1,6 +1,7 @@
 //! Author: TechnoL0g
 //! `/api/tokens*` — native tokens (typeGroup 3). See docs/TOKENS_RU.md.
 
+use super::render::human_time;
 use super::{not_found, paginate, slice_page, ApiResult, Params, Shared};
 use crate::storage::TokenState;
 use axum::extract::{Path, Query, State};
@@ -73,6 +74,96 @@ pub async fn holders(State(st): State<Shared>, Path(key): Path<String>, Query(q)
         .collect();
     let (total, page) = slice_page(items, &q);
     Ok(Json(paginate(&format!("/tokens/{key}/holders"), &q, total, page)))
+}
+
+/// SHIP-43 order → JSON (`total` = remaining × price in smartoshi).
+pub fn order_json(o: &crate::storage::TokenOrder, t: Option<&TokenState>) -> Value {
+    json!({
+        "orderId": o.id,
+        "tokenId": o.token_id,
+        "symbol": t.map(|t| t.symbol.clone()),
+        "decimals": t.map(|t| t.decimals),
+        "seller": o.seller,
+        "price": o.price.to_string(),
+        "amount": o.amount.to_string(),
+        "filled": o.filled.to_string(),
+        "remaining": o.remaining().to_string(),
+        "total": (o.remaining() as u128 * o.price as u128).to_string(),
+        "height": o.height,
+        "open": o.is_open(),
+        "closed": o.closed,
+        "fills": o.fills,
+    })
+}
+
+/// Open asks of a token, cheapest first.
+pub async fn orders(State(st): State<Shared>, Path(key): Path<String>, Query(q): Query<Params>) -> ApiResult {
+    let (id, t) = resolve(&st, &key)?;
+    let items: Vec<Value> = st.storage.token_orders(&id)?.iter().map(|o| order_json(o, Some(&t))).collect();
+    let (total, page) = slice_page(items, &q);
+    Ok(Json(paginate(&format!("/tokens/{key}/orders"), &q, total, page)))
+}
+
+/// One order (open or closed) with its fills.
+pub async fn order(State(st): State<Shared>, Path((key, order_id)): Path<(String, String)>) -> ApiResult {
+    let (id, t) = resolve(&st, &key)?;
+    let o = st.storage.token_order(&order_id)?.filter(|o| o.token_id == id).ok_or_else(|| not_found("Order"))?;
+    Ok(Json(json!({ "data": order_json(&o, Some(&t)) })))
+}
+
+/// Executed fills, newest first: `txId, buyer, seller, amount, price, total, height, timestamp`. With `groupBy=day`
+/// (or `hour`) — OHLCV candles oldest first over the last `days` (default 30, max 365, 0 = all) for price charts.
+pub async fn trades(State(st): State<Shared>, Path(key): Path<String>, Query(q): Query<Params>) -> ApiResult {
+    let (id, t) = resolve(&st, &key)?;
+    let group = q.get("groupBy").map(String::as_str);
+    if let Some(bucket) = match group { Some("day") => Some(86_400u32), Some("hour") => Some(3_600u32), _ => None } {
+        // days=0 → whole history
+        let days = q.parse::<u32>("days").unwrap_or(30).min(365);
+        let since = if days == 0 { 0 } else { st.network.now_epoch().saturating_sub(days * 86_400) };
+        // slot → (open, high, low, close, volume, value, trades); trades arrive newest first
+        let mut candles: std::collections::BTreeMap<u32, (u64, u64, u64, u64, u64, u64, u64)> = Default::default();
+        for tr in st.storage.token_trades(&id) {
+            let tr = tr?;
+            if tr.timestamp < since {
+                break;
+            }
+            let slot = tr.timestamp - tr.timestamp % bucket;
+            let c = candles.entry(slot).or_insert((tr.price, tr.price, tr.price, tr.price, 0, 0, 0));
+            c.0 = tr.price;
+            c.1 = c.1.max(tr.price);
+            c.2 = c.2.min(tr.price);
+            c.4 += tr.amount;
+            c.5 += tr.total;
+            c.6 += 1;
+        }
+        let data: Vec<Value> = candles
+            .iter()
+            .map(|(slot, c)| json!({ "timestamp": slot, "time": human_time(st.network.epoch_to_unix(*slot)), "open": c.0.to_string(), "high": c.1.to_string(), "low": c.2.to_string(), "close": c.3.to_string(), "volume": c.4.to_string(), "value": c.5.to_string(), "trades": c.6 }))
+            .collect();
+        return Ok(Json(json!({ "meta": { "groupBy": group, "days": days, "symbol": t.symbol, "decimals": t.decimals, "count": data.len() }, "data": data })));
+    }
+    let (page, limit) = super::page_params(&q);
+    let mut total = 0usize;
+    let mut data = Vec::with_capacity(limit);
+    for tr in st.storage.token_trades(&id) {
+        let tr = tr?;
+        total += 1;
+        if total > (page - 1) * limit && data.len() < limit {
+            data.push(json!({ "txId": tr.tx_id, "orderId": tr.order_id, "buyer": tr.buyer, "seller": tr.seller, "amount": tr.amount.to_string(), "price": tr.price.to_string(), "total": tr.total.to_string(), "height": tr.height, "timestamp": tr.timestamp, "time": human_time(st.network.epoch_to_unix(tr.timestamp)), "symbol": t.symbol, "decimals": t.decimals }));
+        }
+    }
+    Ok(Json(paginate(&format!("/tokens/{key}/trades"), &q, total, data)))
+}
+
+/// Open orders of a wallet across tokens.
+pub async fn wallet_orders(State(st): State<Shared>, Path(address): Path<String>) -> ApiResult {
+    let items: Vec<Value> = st
+        .storage
+        .wallet_orders(&address)?
+        .iter()
+        .map(|o| order_json(o, st.storage.token_state(&o.token_id).ok().flatten().as_ref()))
+        .collect();
+    Ok(Json(json!({ "data": items })))
 }
 
 /// Token balances of one wallet: `[{ id, symbol, balance, decimals }]`.

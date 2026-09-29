@@ -17,12 +17,62 @@ pub struct GetStatusRequest {
     pub headers: Option<Headers>,
 }
 
+/// `GetStatusResponse.State.BlockHeader` — the FULL header: the legacy peer verifier re-checks its signature
+/// (`Blocks.BlockFactory.fromData(header).verifySignature()`) before accepting us as a peer.
 #[derive(Clone, PartialEq, Message)]
 pub struct StatusBlockHeader {
     #[prost(string, tag = "1")]
     pub id: String,
+    #[prost(string, tag = "2")]
+    pub id_hex: String,
+    #[prost(uint32, tag = "3")]
+    pub version: u32,
+    #[prost(uint32, tag = "4")]
+    pub timestamp: u32,
+    #[prost(string, tag = "5")]
+    pub previous_block: String,
+    #[prost(string, tag = "6")]
+    pub previous_block_hex: String,
     #[prost(uint32, tag = "7")]
     pub height: u32,
+    #[prost(uint32, tag = "8")]
+    pub number_of_transactions: u32,
+    #[prost(string, tag = "9")]
+    pub total_amount: String,
+    #[prost(string, tag = "10")]
+    pub total_fee: String,
+    #[prost(string, tag = "11")]
+    pub reward: String,
+    #[prost(uint32, tag = "12")]
+    pub payload_length: u32,
+    #[prost(string, tag = "13")]
+    pub payload_hash: String,
+    #[prost(string, tag = "14")]
+    pub generator_public_key: String,
+    #[prost(string, tag = "15")]
+    pub block_signature: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetCommonBlocksRequest {
+    #[prost(string, repeated, tag = "1")]
+    pub ids: Vec<String>,
+    #[prost(message, optional, tag = "2")]
+    pub headers: Option<Headers>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CommonBlock {
+    #[prost(uint32, tag = "1")]
+    pub height: u32,
+    #[prost(string, tag = "2")]
+    pub id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetCommonBlocksResponse {
+    #[prost(message, optional, tag = "1")]
+    pub common: Option<CommonBlock>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -38,13 +88,36 @@ pub struct StatusState {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct StatusToken {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub symbol: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct StatusNetwork {
     #[prost(string, tag = "1")]
     pub name: String,
     #[prost(string, tag = "2")]
     pub nethash: String,
+    #[prost(string, tag = "3")]
+    pub explorer: String,
+    #[prost(message, optional, tag = "4")]
+    pub token: Option<StatusToken>,
     #[prost(uint32, tag = "5")]
     pub version: u32,
+}
+
+/// `Config.Plugin` — advertised service ports (`plugins["@arkecosystem/core-api"]` = public REST API).
+#[derive(Clone, PartialEq, Message)]
+pub struct StatusPlugin {
+    #[prost(uint32, tag = "1")]
+    pub port: u32,
+    #[prost(bool, tag = "2")]
+    pub enabled: bool,
+    #[prost(bool, tag = "3")]
+    pub estimate_total_count: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -53,6 +126,8 @@ pub struct StatusConfig {
     pub version: String,
     #[prost(message, optional, tag = "2")]
     pub network: Option<StatusNetwork>,
+    #[prost(map = "string, message", tag = "3")]
+    pub plugins: std::collections::HashMap<String, StatusPlugin>,
 }
 
 #[derive(Clone, PartialEq, Message)]

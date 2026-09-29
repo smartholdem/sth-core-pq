@@ -180,9 +180,10 @@ fn rollback_restores_wallets_and_indexes() {
     assert_eq!(s.balance, 1_000_000_000);
     assert_eq!(s.nonce, 10_102);
     assert!(storage.transaction_ids(None).unwrap().is_empty());
+    // bulk mode off-switch only affects batches: a single block (gossip / postBlock / forger) always keeps its undo record
     storage.set_undo_enabled(false);
     storage.apply_block(&block).unwrap();
-    assert!(storage.rollback_last_block().is_err());
+    assert_eq!(storage.rollback_last_block().unwrap(), 11704042);
 }
 
 fn fake_tx(id: &str, type_: u8, sender_pk: &str, nonce: u64, amount: u64, recipient: Option<&str>, asset: &str) -> String {

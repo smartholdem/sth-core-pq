@@ -186,6 +186,25 @@ async fn mempool_admission_rules() {
     let r = post(serde_json::json!({ "transactions": [tx.clone()] })).await;
     assert_eq!(r["errors"][&id]["type"], "ERR_DUPLICATE");
 
+    // fee advisor: 1 STH (static) → no hint; 0.25 STH is fine for our dynamic pool but legacy pools refuse it
+    assert!(r["feeHints"].is_null(), "{}", r["feeHints"]);
+    let mut cheap = tx.clone();
+    cheap.nonce = Some(2);
+    cheap.fee = 25_000_000;
+    cheap.id = None;
+    cheap.signature = Some(sign_schnorr_legacy(&transaction_signing_hash(&cheap).unwrap(), kp.private_key()).unwrap());
+    let r = post(serde_json::json!({ "transactions": [cheap] })).await;
+    let cheap_id = r["data"]["accept"][0].as_str().unwrap().to_string();
+    let hint = &r["feeHints"][&cheap_id];
+    assert_eq!(hint["legacyMinFee"], "100000000", "{r}");
+    assert!(hint["message"].as_str().unwrap().contains("only PQ delegates"), "{hint}");
+    let (_, u) = get(&base, &format!("/api/transactions/unconfirmed?senderId={}", kp.address(63).unwrap())).await;
+    let items = u["data"].as_array().unwrap();
+    assert!(items.iter().any(|t| t["id"] == cheap_id && t["pool"]["feeHint"]["legacyMinFee"] == "100000000"), "{u}");
+    assert!(items.iter().any(|t| t["id"] == id && t["pool"]["feeHint"].is_null()), "{u}");
+    let (_, m) = get(&base, "/api/ntfry/metrics").await;
+    assert_eq!(m["data"]["mempool"]["legacyPool"]["pendingRefused"], 1);
+
     // wrong nonce and bad signature
     let mut bad = tx.clone();
     bad.nonce = Some(5);
@@ -306,4 +325,131 @@ async fn status_page_is_served() {
     let body = reqwest::get(format!("{base}/status")).await.unwrap().text().await.unwrap();
     assert!(body.contains("<title>sth-core status</title>"));
     assert!(body.contains("/api/node/forging"));
+}
+
+/// Metrics feed carries the stall watchdog state and the last `audit-all` summary (metrics page cards).
+#[tokio::test]
+async fn metrics_report_stall_state_and_last_audit() {
+    let (base, storage) = spawn_api().await;
+    let (_, m) = get(&base, "/api/ntfry/metrics").await;
+    assert_eq!(m["data"]["chain"]["stall"]["stalled"], false);
+    assert!(m["data"]["node"]["lastAudit"].is_null(), "no audit yet: {}", m["data"]["node"]["lastAudit"]);
+    assert_eq!(m["data"]["node"]["implementation"], "sth-core-pq");
+    // in-process doctor verdict + relay coverage for the metrics page
+    let doc = &m["data"]["doctor"];
+    assert!(["HEALTHY", "DEGRADED", "UNHEALTHY"].contains(&doc["verdict"].as_str().unwrap()), "{doc}");
+    assert!(doc["checks"].as_array().unwrap().iter().any(|c| c["name"] == "state audit" && c["level"] == "warn"), "no audit yet → warn: {doc}");
+    assert_eq!(m["data"]["mempool"]["relay"]["relays"], 0);
+    // fee advisor + stall cause for the metrics page
+    let lp = &m["data"]["mempool"]["legacyPool"];
+    assert_eq!(lp["dynamicFees"], false);
+    assert_eq!(lp["minTransferFee"], 100_000_000);
+    assert_eq!(lp["pendingRefused"], 0);
+    assert!(m["data"]["chain"]["stall"].get("lastReason").is_some() && m["data"]["chain"]["stall"].get("lastStall").is_some(), "{}", m["data"]["chain"]["stall"]);
+    // SHIP-45 modules report their state even when iroh / the delegate module are off in this test node
+    assert_eq!(m["data"]["doubleForgeGuard"]["enabled"], false, "guard not initialised without a node → reported off");
+    assert_eq!(m["data"]["ntfry"]["enabled"], false);
+    let page = {
+        let storage2 = Arc::new(Storage::temporary(Network::mainnet()).unwrap());
+        let mempool2 = Arc::new(Mempool::new(storage2.clone(), vec![], 100));
+        let state = Arc::new(AppState::new(storage2, mempool2, vec![]).with_metrics_page(true));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { serve_listener(state, listener).await.unwrap() });
+        reqwest::get(format!("http://{addr}/")).await.unwrap().text().await.unwrap()
+    };
+    for needle in ["data-tab=\"pqmap\"", "id=\"panel-pqmap\"", "id=\"pmtab\"", "function pqmap("] {
+        assert!(page.contains(needle), "metrics page lacks {needle}");
+    }
+
+    let report = storage.audit_all(|_| {}).unwrap();
+    storage.save_audit_summary(&sth_core::storage::AuditSummary::from_audit(&report, false, 1.5)).unwrap();
+    let (_, m) = get(&base, "/api/ntfry/metrics").await;
+    let a = &m["data"]["node"]["lastAudit"];
+    assert_eq!(a["height"], report.height);
+    assert_eq!(a["wallets"], report.wallets);
+    assert_eq!(a["drifted"], report.drifted.len());
+    assert_eq!(a["fixed"], false);
+    assert_eq!(a["durationSecs"], 1.5);
+    assert_eq!(a["version"], env!("CARGO_PKG_VERSION"));
+    assert!(a["atUnix"].as_i64().unwrap() > 1_700_000_000);
+    assert_eq!(storage.last_audit().unwrap().unwrap().height, report.height);
+}
+
+/// `/wallets*` and `/delegates` serve a cached snapshot that is invalidated by every chain write (`Storage::generation`).
+#[tokio::test]
+async fn wallet_snapshot_cache_refreshes_after_writes() {
+    let (base, storage) = spawn_api().await;
+    let gen0 = storage.generation();
+
+    let (_, top) = get(&base, "/api/wallets/top?limit=2").await;
+    assert_eq!(top["meta"]["totalCount"], 3, "sender, recipient, generator");
+    assert_eq!(top["data"][0]["address"], SENDER);
+    assert_eq!(top["data"][0]["balance"], (1_000_000_000i64 - 314_159_265 - 100_000_000).to_string());
+    // same generation → served from the cache
+    let (_, again) = get(&base, "/api/wallets/top?limit=2").await;
+    assert_eq!(again["data"], top["data"]);
+    assert_eq!(storage.generation(), gen0);
+
+    // a write bumps the generation and the next request sees the new balance at once
+    storage.update_wallet_state(RECIPIENT, 5_000_000_000, 0).unwrap();
+    assert!(storage.generation() > gen0);
+    let (_, top) = get(&base, "/api/wallets/top?limit=1").await;
+    assert_eq!(top["data"][0]["address"], RECIPIENT);
+    assert_eq!(top["data"][0]["balance"], (5_000_000_000i64 + 314_159_265).to_string());
+
+    // pagination is a slice of the sorted snapshot; filters and orderBy still work on top of it
+    let (_, p2) = get(&base, "/api/wallets/top?limit=1&page=2").await;
+    assert_eq!(p2["data"][0]["address"], SENDER);
+    assert_eq!(p2["meta"]["pageCount"], 3);
+    let (_, l) = get(&base, "/api/wallets?orderBy=balance:asc&limit=1").await;
+    assert_eq!(l["data"][0]["balance"], "100000000", "generator only holds the fee");
+    let (_, l) = get(&base, "/api/wallets?balance.from=1000000000").await;
+    assert_eq!(l["meta"]["totalCount"], 1);
+    assert_eq!(l["data"][0]["address"], RECIPIENT);
+}
+
+#[tokio::test]
+async fn wallet_search_matches_address_username_and_public_key_prefixes() {
+    let (base, storage) = spawn_api().await;
+    // make the sender a delegate (registration block on top of the fixture) so the username path is covered
+    storage.update_wallet_state(SENDER, 20_000_000_000_000, 0).unwrap();
+    let reg = format!(
+        r#"{{"id":"{}","version":2,"network":63,"typeGroup":1,"type":2,"nonce":"10104","senderPublicKey":"{sender_pk}","fee":"1000000000000","amount":"0","expiration":0,"signature":"{}","asset":{{"delegate":{{"username":"genesis_node"}}}}}}"#,
+        "a".repeat(64), "1".repeat(128), sender_pk = "036560f20d578da7b8433248d0c82e68121163958d533dc74b0e7d8dbabc0606a0"
+    );
+    let block = format!(
+        r#"{{"id":"{}","version":0,"timestamp":95101464,"previousBlock":"53423dd1a74cddcc8643084c605836cb7dd5f5993455796daedfefb5e4eb070d","height":11704044,"numberOfTransactions":1,"totalAmount":"0","totalFee":"1000000000000","reward":"0","payloadLength":32,"payloadHash":"{}","generatorPublicKey":"03d67017411e92a8e93d7b0318e2748f013c130d6e4e01b1248da0ee0959ee9df8","blockSignature":"3045022100bfcfed36e8019c760490fd453cc28a2118241907d63c3ed0d3004687907107ff02200d300e64fdf5c5ca358e3266794b12b6b900004084b7fba838ceedcb1364e658","transactions":[{reg}]}}"#,
+        "b".repeat(64), "9".repeat(64)
+    );
+    storage.apply_block(&serde_json::from_str::<Block>(&block).unwrap()).unwrap();
+
+    let (st, r) = get(&base, &format!("/api/wallets/search?q={}", &RECIPIENT[..6])).await;
+    assert_eq!(st, 200);
+    assert_eq!(r["meta"]["count"], 1);
+    assert_eq!(r["data"][0]["address"], RECIPIENT);
+    assert_eq!(r["data"][0]["match"], "address");
+    assert_eq!(r["data"][0]["balance"], "314159265");
+
+    let (_, r) = get(&base, "/api/wallets/search?q=genesis").await;
+    assert_eq!(r["data"][0]["address"], SENDER);
+    assert_eq!(r["data"][0]["match"], "username");
+    assert_eq!(r["data"][0]["username"], "genesis_node");
+    assert_eq!(r["data"][0]["isDelegate"], true);
+
+    let (_, r) = get(&base, "/api/wallets/search?q=036560f2").await;
+    assert_eq!(r["data"][0]["address"], SENDER);
+    assert_eq!(r["data"][0]["match"], "publicKey");
+
+    // "S" alone is too short; richest-first ordering and limit for a broad prefix
+    let (_, r) = get(&base, "/api/wallets/search?q=S").await;
+    assert_eq!(r["meta"]["count"], 0);
+    let (_, r) = get(&base, "/api/wallets/search?q=S&limit=1").await;
+    assert_eq!(r["data"].as_array().unwrap().len(), 0);
+    let (_, r) = get(&base, "/api/wallets/search?q=SR&limit=1").await;
+    assert_eq!(r["meta"]["count"], 1);
+    assert_eq!(r["meta"]["totalCount"], 2, "sender and recipient both start with SR");
+    assert_eq!(r["data"][0]["address"], SENDER, "richest first");
+    let (_, r) = get(&base, "/api/wallets/search?q=zzzz").await;
+    assert_eq!(r["meta"]["count"], 0);
 }

@@ -48,9 +48,13 @@ fn iroh_meta(st: &Shared) -> Value {
                 "gateway": iroh.gateway,
                 "relays": iroh.relay_urls,
                 "homeRelays": iroh.connected_relays(),
+                "relayGuard": crate::p2p_iroh::relay_guard::snapshot(),
+                "discovery": crate::p2p_iroh::addrbook::snapshot(),
+                "directAddrs": iroh.endpoint.addr().ip_addrs().filter(|a| crate::p2p_iroh::addrbook::is_public(a.ip())).map(|a| a.to_string()).collect::<Vec<_>>(),
                 "neighbors": peers.iter().filter(|p| p.neighbor).count(), "known": peers.len(),
                 "gateways": peers.iter().filter(|p| p.gateway.is_some()).count(),
                 "bestHeight": iroh.peers.best_height(),
+                "walletApi": iroh.wallet_api.stats_json(),
             })
         }
         None => json!({ "enabled": false }),
@@ -223,6 +227,10 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
     let ms = st.network.milestone(tip.max(1));
     let recent = st.storage.get_blocks(0, 12)?;
     let blocks: Vec<Value> = recent.iter().map(|b| block_json(&st, b, false, tip)).collect::<Result<_, _>>()?;
+    let service_nodes_total = {
+        let sn = super::sobj::service_nodes(&st)?;
+        (sn.len(), sn.iter().filter(|n| n["active"] == true).count())
+    };
     let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let last_unix = last.as_ref().map(|b| st.network.epoch_to_unix(b.timestamp));
     let blocks_per_min = match (recent.first(), recent.last()) {
@@ -240,7 +248,7 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
                 "parked": snap.iter().filter(|p| p.is_blocks_parked(now)).count(),
                 "bestHeight": t.best_height(),
                 "peers": snap.iter().take(40).map(|p| json!({
-                    "ip": p.ip, "version": p.version, "height": p.height, "latency": p.latency_ms,
+                    "ip": p.ip, "version": p.version, "pq": p.pq, "height": p.height, "latency": p.latency_ms,
                     "blocksLatency": p.blocks_latency_ms, "blocksLimit": p.blocks_limit(),
                     "state": if p.is_banned(now) { "banned" } else if p.is_blocks_parked(now) { "parked" } else if p.successes == 0 { "unknown" } else { "ok" },
                 })).collect::<Vec<_>>(),
@@ -265,13 +273,14 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
         }
         None => json!({ "enabled": false }),
     };
-    Ok(Json(json!({ "data": {
+    let mut data = json!({
         "node": {
-            "version": env!("CARGO_PKG_VERSION"), "implementation": "sth-core-rust",
+            "version": env!("CARGO_PKG_VERSION"), "implementation": "sth-core-pq",
             "uptime": st.started.elapsed().as_secs(), "nethash": st.network.nethash, "now": now_unix,
             "rssBytes": crate::mem::rss_bytes(),
             "pqCommitments": st.storage.pq_commitment_count(), "pqActive": st.storage.pq_key_count(), "pqStage": if ms.pq.blocks { "C" } else if st.network.milestone(tip + 1).pq.active { "B" } else { "A" },
             "pqBlocks": ms.pq.blocks, "lastBlockVersion": last.as_ref().map(|b| b.version),
+            "lastAudit": st.storage.last_audit()?,
         },
         "chain": {
             "height": tip, "id": last.as_ref().and_then(|b| b.id.clone()),
@@ -279,19 +288,26 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
             "networkHeight": network_height, "behind": network_height.saturating_sub(tip),
             "syncing": network_height.saturating_sub(tip) > 1, "blocksPerMin": blocks_per_min,
             "blockTime": ms.blocktime,
+            "stall": crate::intake::stall(),
             "multiPaymentLimit": ms.multi_payment_limit,
             "fees": { "transfer": ms.static_fee("transfer"), "multiPayment": ms.static_fee("multiPayment") },
         },
         "finality": finality_json(&st)?,
+        "serviceNodes": { "enabled": ms.masternodes.enabled, "collateral": ms.masternodes.collateral_amount.to_string(), "total": service_nodes_total.0, "active": service_nodes_total.1 },
         "mempool": { "count": st.mempool.len().await, "max": st.mempool.max_size(), "bytes": st.mempool.bytes(), "maxBytes": st.mempool.max_bytes(),
+            "relay": crate::p2p_legacy::relay_coverage(),
+            "legacyPool": { "dynamicFees": st.mempool.legacy_dynamic_fees(), "minTransferFee": st.mempool.legacy_min_transfer_fee(), "pendingRefused": st.mempool.below_legacy_min().await },
             "dynamicFees": { "enabled": df.enabled, "minFeePool": df.min_fee_pool, "minFeeBroadcast": df.min_fee_broadcast, "addonBytes": df.addon_bytes, "minTransferFee": st.mempool.min_transfer_fee(), "transferBytes": crate::mempool::Mempool::TRANSFER_WIRE_BYTES, "lowFeeRejected": st.mempool.low_fee_rejected() } },
         "intake": crate::intake::snapshot(),
+        "doubleForgeGuard": crate::delegate::guard::snapshot(tip + 1, u64::from(ms.active_delegates)),
         "legacy": legacy,
         "ntfry": iroh,
         "forging": forging,
         "blocks": blocks,
         "delegates": delegates_json(&st)?,
-    } })))
+    });
+    data["doctor"] = crate::doctor::summary(&data, now_unix);
+    Ok(Json(json!({ "data": data })))
 }
 
 /// Router for the dedicated metrics port: the page plus the two `ntfry` endpoints only.
@@ -325,7 +341,8 @@ pub async fn tokens(State(st): State<Shared>) -> ApiResult {
 }
 
 pub fn metrics_router(state: Shared) -> Router {
-    Router::new()
+    let cors = super::cors_layer(&state.cors_origins);
+    let r = Router::new()
         .route("/", get(page))
         .route("/api/ntfry/peers", get(peers))
         .route("/api/ntfry/delegates", get(delegates))
@@ -334,8 +351,11 @@ pub fn metrics_router(state: Shared) -> Router {
         .route("/api/ntfry/tokens", get(tokens))
         .route("/api/ntfry/market", get(market))
         .route("/api/tokens/:key/logo", get(super::tokens::logo))
-        .fallback(|| async { super::not_found_plain() })
-        .with_state(state)
+        .fallback(|| async { super::not_found_plain() });
+    match cors {
+        Some(c) => r.layer(c).with_state(state),
+        None => r.with_state(state),
+    }
 }
 
 #[cfg(test)]

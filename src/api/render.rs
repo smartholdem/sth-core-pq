@@ -3,7 +3,7 @@
 //! Legacy "transformed" JSON renderers: block, transaction, wallet, delegate, lock.
 
 use super::{AppState, ApiError};
-use crate::config::{Network, TOTAL_SUPPLY};
+use crate::config::Network;
 use crate::error::Error;
 use crate::models::{Block, Transaction};
 use crate::storage::{LockRecord, WalletState};
@@ -236,7 +236,8 @@ pub fn wallet_json(st: &AppState, w: &WalletState, rank: Option<usize>, votes: O
 }
 
 pub fn delegate_json(st: &AppState, w: &WalletState, votes: u64, rank: usize) -> Value {
-    let approval = (votes as f64 / TOTAL_SUPPLY as f64 * 10_000.0).round() / 100.0;
+    let supply = st.network.supply(st.storage.get_last_height().unwrap_or(0)).max(1);
+    let approval = (votes as f64 / supply as f64 * 10_000.0).round() / 100.0;
     let last = w.last_block.as_ref().map(|lb| json!({ "id": lb.id, "height": lb.height, "timestamp": timestamp_json(&st.network, lb.timestamp) }));
     json!({
         "username": w.username,

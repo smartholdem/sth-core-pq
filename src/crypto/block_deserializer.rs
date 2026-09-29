@@ -11,7 +11,7 @@ use crate::models::Block;
 
 /// Parse a serialised header (with signature). Transactions are not part of the header.
 /// The genesis id is taken from the network config (core applies the same fix).
-pub fn deserialize_block_header(bytes: &[u8], network: &Network) -> Result<Block> {
+fn parse_header(bytes: &[u8], network: &Network, strict: bool) -> Result<(Block, usize)> {
     let mut r = ByteReader::new(bytes);
     let version = r.u32_le()?;
     let timestamp = r.u32_le()?;
@@ -42,12 +42,13 @@ pub fn deserialize_block_header(bytes: &[u8], network: &Network) -> Result<Block
     } else {
         None
     };
-    if r.remaining() > 0 {
+    if strict && r.remaining() > 0 {
         return Err(Error::Serialization(format!(
             "block {height}: {} unexpected trailing bytes after header",
             r.remaining()
         )));
     }
+    let consumed = bytes.len() - r.remaining();
 
     let mut block = Block {
         id: None,
@@ -67,5 +68,17 @@ pub fn deserialize_block_header(bytes: &[u8], network: &Network) -> Result<Block
         transactions: Vec::new(),
     };
     block.id = Some(if height == 1 { network.genesis_block_id.to_string() } else { block_id(&block)? });
-    Ok(block)
+    Ok((block, consumed))
+}
+
+/// Header-only buffer (storage, snapshots): trailing bytes are an error.
+pub fn deserialize_block_header(bytes: &[u8], network: &Network) -> Result<Block> {
+    parse_header(bytes, network, true).map(|(b, _)| b)
+}
+
+/// Header at the start of a full block (`postBlock`: header ‖ u32-LE lengths ‖ transactions). Returns the header and how
+/// many bytes it took, so the caller can continue with the transaction section (PQ Nodes rejected every block with
+/// transactions pushed by another PQ Node before: "N unexpected trailing bytes after header").
+pub fn deserialize_block_header_prefix(bytes: &[u8], network: &Network) -> Result<(Block, usize)> {
+    parse_header(bytes, network, false)
 }

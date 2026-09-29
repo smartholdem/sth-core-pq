@@ -90,6 +90,13 @@ impl Chain {
         }
         r
     }
+    /// Roll the last block back and resync the cached tip (storage refuses blocks built on a stale tip).
+    fn rollback(&mut self) {
+        let h = self.storage.rollback_last_block().unwrap();
+        self.tip_block = self.storage.get_block_by_height(h).unwrap().unwrap();
+        self.tip = ChainTip { height: h, id: self.tip_block.id.clone() };
+        self.slot -= 1;
+    }
 }
 
 #[test]
@@ -166,9 +173,9 @@ fn sobj_lifecycle_rules_state_and_rollback() {
     assert!(c.try_block(vec![sign(resign(&alice, 4, 0, &reg_id), &alice)]).unwrap_err().contains("SmartObjectAlreadyResignedError"));
 
     // rollback the resign block → sObject active again; rollback the registration → name index gone
-    c.storage.rollback_last_block().unwrap();
+    c.rollback();
     assert!(!c.storage.get_sobject(&reg_id).unwrap().unwrap().1.resigned);
-    c.storage.rollback_last_block().unwrap();
+    c.rollback();
     assert_eq!(c.storage.get_sobject(&reg_id).unwrap().unwrap().1.data.ntfry_data.as_deref(), Some("QmV1a2b3c4d5e6f7g8h9"));
     assert_eq!(c.storage.all_sobjects().unwrap().len(), 1);
 }
@@ -311,8 +318,8 @@ fn sobj_transfer_moves_object_and_token() {
     assert_eq!(c.storage.token_state(&id).unwrap().unwrap().supply, 1010);
 
     // rollback both blocks → alice owns again
-    c.storage.rollback_last_block().unwrap();
-    c.storage.rollback_last_block().unwrap();
+    c.rollback();
+    c.rollback();
     assert_eq!(c.storage.get_sobject(&id).unwrap().unwrap().0, a);
     assert_eq!(c.storage.token_owner(&id).unwrap().as_deref(), Some(a.as_str()));
     assert_eq!(c.storage.token_state(&id).unwrap().unwrap().owner, a);
@@ -326,7 +333,7 @@ fn sobj_transfer_moves_object_and_token() {
     // and alice acting after handing over inside the same block is rejected
     let e = c.try_block(vec![transfer_tx(&carol, 1, &id, &a), transfer_tx(&carol, 2, &id, &b)]).unwrap_err();
     assert!(e.contains("SmartObjectNotRegisteredError"), "{e}");
-    c.storage.rollback_last_block().unwrap();
+    c.rollback();
     assert_eq!(c.storage.get_sobject(&id).unwrap().unwrap().0, a);
     assert_eq!(c.storage.token_owner(&id).unwrap().as_deref(), Some(a.as_str()));
 
@@ -408,8 +415,8 @@ fn sobj_sell_and_buy() {
     assert!(c.try_block(vec![sell(&alice, 6, &id, 1)]).unwrap_err().contains("SmartObjectNotRegisteredError"));
 
     // rollback mint + purchase → alice owns, order open again, balances back
-    c.storage.rollback_last_block().unwrap();
-    c.storage.rollback_last_block().unwrap();
+    c.rollback();
+    c.rollback();
     assert_eq!((bal(&c, &a), bal(&c, &b)), (a0, b0));
     let (owner, rec) = c.storage.get_sobject(&id).unwrap().unwrap();
     assert_eq!((owner.as_str(), rec.price), (a.as_str(), Some(200_000_000_000)));
@@ -501,4 +508,87 @@ async fn pool_counts_buy_price_for_later_transactions() {
     // a transfer that only spends the fee still goes through
     let (_, errors) = pool.add_many(vec![sign(transfer(&bob, 2, &a, 0), &bob)]).await;
     assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// SHIP-42 stage 1: Service Node = sObject type 7 with `iroh://<EndpointId>?roles=…`; collateral is a balance floor,
+/// one per wallet, never transferable; `/api/masternodes` derives `active` from the live balance.
+#[tokio::test]
+async fn service_node_registry_collateral_floor_and_api() {
+    let ms = MAINNET_MILESTONES_JSON.replace("\"ship11\": true", "\"ship11\": true, \"aip36\": true, \"sobjV2\": true, \"masternodes\": { \"enabled\": true, \"collateralAmount\": \"1000000000000\" }");
+    let network = Network::from_json(MAINNET_NETWORK_JSON, &ms, MAINNET_EXCEPTIONS_JSON, MAINNET_GENESIS_GZ).unwrap();
+    let mut c = Chain::new(network.clone());
+    let op = KeyPair::from_passphrase("operator").unwrap();
+    let op2 = KeyPair::from_passphrase("operator two").unwrap();
+    let (a1, a2) = (op.address(63).unwrap(), op2.address(63).unwrap());
+    c.storage.update_wallet_state(&a1, 1_100_000_000_000, 0).unwrap(); // 11 000 STH
+    c.storage.update_wallet_state(&a2, 1_100_000_000_000, 0).unwrap();
+    let ep = "7".repeat(64);
+    let sn = |keys: &KeyPair, nonce, name: &str, data: &str| sign(sobj_tx(keys, nonce, sobj::FEE_REGISTER, serde_json::json!({ "type": 7, "subType": 0, "action": 0, "data": { "name": name, "ntfryData": data } })), keys);
+
+    assert!(sobj::parse_service_node(&format!("iroh://{ep}?roles=relay,seeder&api=https://sn1.example&storage=50")).is_some());
+    assert!(sobj::parse_service_node(&format!("iroh://{ep}")).is_none(), "roles are required");
+    assert!(sobj::parse_service_node("sth://dapp/page").is_none());
+
+    let e = c.try_block(vec![sn(&op, 1, "sn-1", "iroh://abcd?roles=relay")]).unwrap_err();
+    assert!(e.contains("ServiceNodeDataInvalidError"), "{e}");
+    let e = c.try_block(vec![sn(&op, 1, "sn-1", &format!("iroh://{ep}?roles=pirate"))]).unwrap_err();
+    assert!(e.contains("ServiceNodeDataInvalidError"), "{e}");
+    let poor = KeyPair::from_passphrase("poor operator").unwrap();
+    c.storage.update_wallet_state(&poor.address(63).unwrap(), 900_000_000_000, 0).unwrap();
+    let e = c.try_block(vec![sn(&poor, 1, "sn-poor", &format!("iroh://{ep}?roles=relay"))]).unwrap_err();
+    assert!(e.contains("ServiceNodeCollateralError"), "{e}");
+
+    let reg = sn(&op, 1, "sn-1", &format!("iroh://{ep}?roles=relay,seeder&api=https://sn1.example&storage=50"));
+    c.try_block(vec![reg.clone()]).unwrap();
+    let id = reg.id.clone().unwrap();
+    let e = c.try_block(vec![sn(&op, 2, "sn-1b", &format!("iroh://{}?roles=relay", "8".repeat(64)))]).unwrap_err();
+    assert!(e.contains("ServiceNodeAlreadyRegisteredError"), "{e}");
+    let e = c.try_block(vec![sign(sobj_tx(&op, 2, sobj::FEE_TRANSFER, serde_json::json!({ "type": 7, "subType": 0, "action": 3, "registrationId": id, "recipientId": a2, "data": {} })), &op)]).unwrap_err();
+    assert!(e.contains("ServiceNodeNotTransferableError"), "{e}");
+    let e = c.try_block(vec![sign(sobj_tx(&op, 2, sobj::FEE_UPDATE, serde_json::json!({ "type": 7, "subType": 0, "action": 1, "registrationId": id, "data": { "ntfryData": "sn://pages" } })), &op)]).unwrap_err();
+    assert!(e.contains("ServiceNodeDataInvalidError"), "{e}");
+    // second operator claims the same EndpointId: valid on-chain, flagged by the API (first registration wins)
+    let dup = sn(&op2, 1, "sn-2", &format!("iroh://{ep}?roles=messenger"));
+    c.try_block(vec![dup.clone()]).unwrap();
+
+    let mempool = Arc::new(Mempool::new(c.storage.clone(), vec![], 100));
+    let state = Arc::new(sth_core::api::AppState::new(c.storage.clone(), mempool, vec![]));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { sth_core::api::serve_listener(state, listener).await.unwrap() });
+    let get = |p: String| {
+        let base = base.clone();
+        async move { reqwest::get(format!("{base}{p}")).await.unwrap().json::<serde_json::Value>().await.unwrap() }
+    };
+    let list = get("/api/masternodes".into()).await;
+    assert_eq!(list["meta"]["totalCount"], 2);
+    let n1 = &list["data"][0];
+    assert_eq!((n1["name"].as_str(), n1["address"].as_str(), n1["endpointId"].as_str()), (Some("sn-1"), Some(a1.as_str()), Some(ep.as_str())));
+    assert_eq!(n1["roles"], serde_json::json!(["relay", "seeder"]));
+    assert_eq!((n1["api"].as_str(), n1["storageGb"].as_u64(), n1["active"].as_bool()), (Some("https://sn1.example"), Some(50), Some(true)));
+    assert_eq!(n1["collateral"], "1000000000000");
+    assert!(n1["since"].as_u64().unwrap() >= 2, "{n1}");
+    let n2 = &list["data"][1];
+    assert_eq!((n2["active"].as_bool(), n2["inactiveReason"].as_str()), (Some(false), Some("endpointTaken")));
+    assert_eq!(get("/api/masternodes?active=true".into()).await["meta"]["totalCount"], 1);
+    assert_eq!(get("/api/masternodes?role=messenger".into()).await["data"][0]["name"], "sn-2");
+    assert_eq!(get(format!("/api/masternodes/{ep}")).await["data"]["name"], "sn-1");
+    assert_eq!(get("/api/masternodes/SN-1".into()).await["data"]["id"], id);
+
+    // DASH-style exit: spend below the floor → inactive at once, nothing burned; top up → active again
+    c.try_block(vec![sign(transfer(&op, 2, &a2, 200_000_000_000), &op)]).unwrap();
+    let n = get(format!("/api/masternodes/{id}")).await;
+    assert_eq!((n["data"]["active"].as_bool(), n["data"]["inactiveReason"].as_str()), (Some(false), Some("collateral")));
+    let m = get("/api/ntfry/metrics".into()).await;
+    let sn = &m["data"]["serviceNodes"];
+    assert_eq!((sn["total"].as_u64(), sn["active"].as_u64(), sn["enabled"].as_bool()), (Some(2), Some(0), Some(true)));
+    c.storage.update_wallet_state(&a1, 300_000_000_000, 0).unwrap();
+    assert_eq!(get(format!("/api/masternodes/{id}")).await["data"]["active"], true);
+
+    // resign frees the name and the EndpointId for the second operator
+    c.try_block(vec![sign(resign(&op, 3, 7, &id), &op)]).unwrap();
+    let list = get("/api/masternodes".into()).await;
+    assert_eq!(list["data"][0]["inactiveReason"], "resigned");
+    assert_eq!(list["data"][1]["active"], true, "{list}");
+    assert_eq!(get("/api/node/configuration".into()).await["data"]["constants"]["masternodes"]["enabled"], true);
 }

@@ -248,6 +248,12 @@ impl Syncer {
             if !self.cfg.follow {
                 break;
             }
+            // other paths (iroh gossip, forger) move the tip between polls
+            if let Ok(local) = self.local_tip() {
+                if local.height > tip.height {
+                    tip = local;
+                }
+            }
             let blocktime = self.network.milestone(tip.height.max(1)).blocktime as u64;
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => { interrupted = true; break; }
@@ -316,6 +322,13 @@ impl Syncer {
                         return Err(e);
                     }
                     Some(Ok(blocks)) => {
+                        // the chain may have advanced through another path meanwhile (iroh gossip, legacy push, our own
+                        // forger): re-anchor on the local tip and drop the blocks we already have instead of failing
+                        let local = self.local_tip()?;
+                        if local.height > tip.height {
+                            tip = local;
+                        }
+                        let blocks: Vec<Block> = blocks.into_iter().filter(|b| b.height > tip.height).collect();
                         if blocks.is_empty() {
                             continue;
                         }
@@ -343,8 +356,18 @@ impl Syncer {
         let from = blocks.first().map(|b| b.height).unwrap_or(tip.height + 1);
         let to = blocks.last().map(|b| b.height).unwrap_or(from);
 
-        match self.apply_blocking(tip.clone(), blocks).await {
+        match self.apply_blocking(tip.clone(), blocks.clone()).await {
             Ok(t) => Ok(t),
+            Err(Error::StaleTip(_)) => {
+                // a block of this batch arrived through another path while we were applying: keep what is still new
+                let local = self.local_tip()?;
+                let rest: Vec<Block> = blocks.into_iter().filter(|b| b.height > local.height).collect();
+                if rest.is_empty() {
+                    self.info(format!("batch {from}-{to} already applied through another path (tip {})", local.height));
+                    return Ok(local);
+                }
+                self.apply_blocking(local, rest).await
+            }
             Err(e) => {
                 self.warn(format!("batch {from}-{to} rejected ({e}); re-fetching from another node"));
                 let retry = self.fetch_range(from, to).await?;
@@ -585,13 +608,17 @@ struct BatchTokenView<'a> {
     storage: &'a Storage,
     states: HashMap<String, crate::storage::TokenState>,
     balances: HashMap<(String, String), u64>,
+    /// SHIP-43 orders touched inside the batch.
+    orders: HashMap<String, crate::storage::TokenOrder>,
     /// Pending sObject registrations of the batch (sender → id → record); raw pointer because the map is mutated between calls.
     sobjects: *const HashMap<String, BTreeMap<String, crate::storage::SmartObject>>,
 }
 
 impl BatchTokenView<'_> {
-    fn apply(&mut self, type_: u16, a: &crate::models::TokenAsset, sender: &str, height: u64) {
+    fn apply(&mut self, type_: u16, a: &crate::models::TokenAsset, sender: &str, height: u64, tx_id: &str) {
         use crate::models::token;
+        // resolved before the balance closure borrows `self`
+        let pending_order = a.order_id.as_deref().and_then(|oid| crate::rules::TokenView::order(self, oid));
         let mut bump = |addr: &str, delta: i128| {
             let e = self.balances.entry((addr.to_string(), a.id.clone())).or_insert_with(|| {
                 self.storage.get_wallet(addr).ok().flatten().and_then(|w| w.tokens.get(&a.id).copied()).unwrap_or(0)
@@ -622,6 +649,28 @@ impl BatchTokenView<'_> {
                 if let Some(st) = self.state_mut(&a.id) {
                     st.meta = a.meta.clone();
                 }
+            }
+            token::SELL => {
+                let amount = a.amount.unwrap_or(0);
+                bump(sender, -(amount as i128));
+                self.orders.insert(tx_id.to_string(), crate::storage::TokenOrder { id: tx_id.to_string(), token_id: a.id.clone(), seller: sender.to_string(), amount, filled: 0, price: a.price.unwrap_or(0), height, closed: None, fills: Vec::new() });
+            }
+            token::BUY | token::CANCEL => {
+                let oid = a.order_id.clone().unwrap_or_default();
+                let Some(mut o) = pending_order else { return };
+                if type_ == token::BUY {
+                    let amount = a.amount.unwrap_or(0);
+                    bump(sender, amount as i128);
+                    o.filled += amount;
+                    if o.filled >= o.amount {
+                        o.closed = Some(height);
+                    }
+                } else {
+                    let seller = o.seller.clone();
+                    bump(&seller, o.remaining() as i128);
+                    o.closed = Some(height);
+                }
+                self.orders.insert(oid, o);
             }
             _ => {
                 let amount = a.amount.unwrap_or(0);
@@ -661,6 +710,18 @@ impl crate::rules::TokenView for BatchTokenView<'_> {
             .copied()
             .unwrap_or_else(|| self.storage.get_wallet(address).ok().flatten().and_then(|w| w.tokens.get(id).copied()).unwrap_or(0))
     }
+    fn order(&self, id: &str) -> Option<crate::storage::TokenOrder> {
+        self.orders.get(id).cloned().or_else(|| self.storage.token_order(id).ok().flatten())
+    }
+    fn open_orders(&self, seller: &str, token_id: &str) -> usize {
+        let mut ids: std::collections::HashSet<String> = self.storage.wallet_orders(seller).unwrap_or_default().into_iter().filter(|o| o.token_id == token_id).map(|o| o.id).collect();
+        for o in self.orders.values() {
+            if o.seller == seller && o.token_id == token_id {
+                if o.is_open() { ids.insert(o.id.clone()); } else { ids.remove(&o.id); }
+            }
+        }
+        ids.len()
+    }
     fn ticker_sobj(&self, id: &str) -> Option<(String, String, bool)> {
         // SAFETY: the pointer is refreshed before every use and the map outlives this view within check_stateful_rules.
         let pending = unsafe { &*self.sobjects };
@@ -690,7 +751,7 @@ pub fn check_stateful_rules(storage: &Storage, network: &Network, blocks: &[Bloc
     let mut sth_delta: HashMap<String, i128> = HashMap::new();
     // HTLC locks opened inside the batch: lock id → (lock sender, recipient, amount)
     let mut pending_locks: HashMap<String, (String, String, u64)> = HashMap::new();
-    let mut tokens = BatchTokenView { storage, states: HashMap::new(), balances: HashMap::new(), sobjects: &sobjects as *const _ };
+    let mut tokens = BatchTokenView { storage, states: HashMap::new(), balances: HashMap::new(), orders: HashMap::new(), sobjects: &sobjects as *const _ };
     for block in blocks {
         // stage C: the hybrid block signature is checked against the delegate's PQ key as of the state BEFORE this block
         if block.version == crate::models::BLOCK_VERSION_PQ {
@@ -716,7 +777,7 @@ pub fn check_stateful_rules(storage: &Storage, network: &Network, blocks: &[Bloc
                 use crate::models::{tx_type, TYPE_GROUP_CORE};
                 let core = tx.type_group == TYPE_GROUP_CORE;
                 let payments: i128 = tx.asset.as_ref().and_then(|a| a.payments.as_ref()).map(|p| p.iter().map(|x| x.amount as i128).sum()).unwrap_or(0);
-                let spent = tx.amount as i128 + tx.fee as i128 + payments;
+                let spent = tx.amount as i128 + tx.fee as i128 + payments + crate::rules::token_buy_total(tx, &tokens) as i128;
                 let available = wallet.as_ref().map(|w| w.balance as i128).unwrap_or(0);
                 if block.height > 1 && available < spent {
                     let msg = format!("InsufficientBalanceError: sender {sender} has {available}, needs {spent}");
@@ -788,7 +849,19 @@ pub fn check_stateful_rules(storage: &Storage, network: &Network, blocks: &[Bloc
                 let a = crate::rules::check_token_format(tx, storage.network().milestone(block.height)).map_err(fail)?;
                 tokens.sobjects = &sobjects as *const _;
                 crate::rules::check_token(tx, &a, &sender, &tokens).map_err(fail)?;
-                tokens.apply(tx.type_, &a, &sender, block.height);
+                if tx.type_ == crate::models::token::BUY {
+                    // STH leg of a fill: buyer → seller, on top of the fee already subtracted above.
+                    // Always strict (unlike legacy core transfers): tokens must never be bought with coins the buyer lacks.
+                    let total = crate::rules::token_buy_total(tx, &tokens) as i128;
+                    let have = wallet.as_ref().map(|w| w.balance as i128).unwrap_or(0);
+                    if have < total + tx.fee as i128 {
+                        return Err(fail(format!("TokenBuyInsufficientBalanceError: buyer has {have}, needs {}", total + tx.fee as i128)));
+                    }
+                    let seller = crate::rules::TokenView::order(&tokens, a.order_id.as_deref().unwrap_or_default()).map(|o| o.seller).unwrap_or_default();
+                    *sth_delta.entry(sender.clone()).or_default() -= total;
+                    *sth_delta.entry(seller).or_default() += total;
+                }
+                tokens.apply(tx.type_, &a, &sender, block.height, tx.id.as_deref().unwrap_or_default());
                 continue;
             }
             if tx.is_sobj() {
