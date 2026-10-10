@@ -25,6 +25,9 @@ pub struct NodeConfig {
     /// cache). Informational only — the state itself lives in sled and is never regenerated at start (unlike the
     /// legacy "State Generation" steps); registered delegates are always counted (cheap `wu:` index).
     pub startup_scan: bool,
+    /// Runtime freeze watchdog: abort (→ systemd restart) when the async runtime has not ticked for this many seconds
+    /// (deadlock, swap thrash, disk stall — a frozen delegate misses every slot). 0 = never abort. Default 120.
+    pub freeze_abort_secs: u64,
     pub api: ApiConfig,
     pub sync: SyncSection,
     pub p2p: P2pConfig,
@@ -47,11 +50,13 @@ pub struct AlertsConfig {
     pub webhook_url: String,
     /// Minimum seconds between two alerts of the same kind (recovery messages ignore it).
     pub cooldown_secs: u64,
+    /// Name of THIS server in every message, e.g. "fsn-sth-01" (several nodes → one chat). Empty = hostname of the machine.
+    pub node_name: String,
 }
 
 impl Default for AlertsConfig {
     fn default() -> Self {
-        Self { enabled: true, telegram_bot_token: String::new(), telegram_chat_id: String::new(), webhook_url: String::new(), cooldown_secs: 600 }
+        Self { enabled: true, telegram_bot_token: String::new(), telegram_chat_id: String::new(), webhook_url: String::new(), cooldown_secs: 600, node_name: String::new() }
     }
 }
 
@@ -360,6 +365,8 @@ pub struct MempoolConfig {
     /// Do the legacy (Core 3.8.2) peers run `dynamicFees`? `false` = their pools take exactly the static fee, so a cheaper
     /// transaction is forged only by PQ delegates — the fee advisor (`Mempool::fee_hint`) warns wallets about it.
     pub legacy_dynamic_fees: bool,
+    /// Flood policy of THIS node's pool (per-sender caps, per-peer budgets / bans, replace-by-fee) — not consensus.
+    pub antispam: crate::antispam::AntiSpamConfig,
 }
 
 /// Legacy `transactionPool.dynamicFees`: minimum fee = `(addon_bytes[type] + wire bytes) × satoshi_per_byte`.
@@ -379,9 +386,23 @@ pub struct DynamicFeesConfig {
 impl DynamicFeesConfig {
     /// Minimum fee for a transaction of `type_name` weighing `bytes` at `satoshi_per_byte`.
     pub fn min_fee(&self, type_name: &str, bytes: usize, satoshi_per_byte: u64) -> u64 {
-        // type 5 is the Netfory pointer; `ipfs` is the legacy JSON key wallets know, `ntfry` is accepted in node.yaml
-        let addon = self.addon_bytes.get(type_name).or_else(|| (type_name == "ipfs").then(|| self.addon_bytes.get("ntfry")).flatten()).copied().unwrap_or(0);
-        addon.saturating_add(bytes as u64).saturating_mul(satoshi_per_byte.max(1))
+        self.addon(type_name).saturating_add(bytes as u64).saturating_mul(satoshi_per_byte.max(1))
+    }
+
+    /// Addon bytes of a fee type. Type 5 is the Netfory content pointer: node.yaml spells it `ntfry` (default), the
+    /// legacy key `ipfs` (old configs, legacy API JSON) is still accepted.
+    pub fn addon(&self, type_name: &str) -> u64 {
+        let legacy = |k: &str| if k == "ipfs" { Some("ntfry") } else if k == "ntfry" { Some("ipfs") } else { None };
+        self.addon_bytes.get(type_name).or_else(|| legacy(type_name).and_then(|k| self.addon_bytes.get(k))).copied().unwrap_or(0)
+    }
+
+    /// `addonBytes` for the legacy API JSON: `ntfry` published under both names so old wallets keep reading `ipfs`.
+    pub fn addon_bytes_api(&self) -> std::collections::BTreeMap<String, u64> {
+        let mut m = self.addon_bytes.clone();
+        let ntfry = self.addon("ntfry");
+        m.insert("ntfry".into(), ntfry);
+        m.insert("ipfs".into(), ntfry);
+        m
     }
 }
 
@@ -389,7 +410,7 @@ impl Default for DynamicFeesConfig {
     fn default() -> Self {
         let addon_bytes = [
             ("transfer", 100), ("secondSignature", 250), ("delegateRegistration", 400_000), ("vote", 100), ("multiSignature", 500),
-            ("ipfs", 250), ("multiPayment", 500), ("delegateResignation", 100), ("htlcLock", 100), ("htlcClaim", 0), ("htlcRefund", 0),
+            ("ntfry", 250), ("multiPayment", 500), ("delegateResignation", 100), ("htlcLock", 100), ("htlcClaim", 0), ("htlcRefund", 0),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -403,6 +424,7 @@ impl Default for NodeConfig {
         Self {
             network: "mainnet".into(),
             network_dir: String::new(),
+            freeze_abort_secs: 120,
             db_path: "./data".into(),
             db_cache_mb: 64,
             startup_scan: true,
@@ -461,7 +483,7 @@ impl Default for RewardsConfig {
 
 impl Default for MempoolConfig {
     fn default() -> Self {
-        Self { max_size: 5_000, max_bytes: 8 * 1024 * 1024, dynamic_fees: DynamicFeesConfig::default(), max_age_blocks: 2700, rebroadcast_blocks: 30, legacy_dynamic_fees: false }
+        Self { max_size: 5_000, max_bytes: 8 * 1024 * 1024, dynamic_fees: DynamicFeesConfig::default(), max_age_blocks: 2700, rebroadcast_blocks: 30, legacy_dynamic_fees: false, antispam: Default::default() }
     }
 }
 
@@ -566,6 +588,8 @@ impl NodeConfig {
              # db_cache_mb: sled page cache (MiB). 64 is fine for 2 GB+ RAM; use 16–32 on a 1 GB VPS (process RSS ≈ 2–3× this).\n\
              # startup_scan: count the wallets for the startup banner (full key scan, ~1–3 s on mainnet). Informational only —\n\
              #               the state is kept in sled incrementally; integrity is checked by `sth-core audit-all`, not at start.\n\
+             # freeze_abort_secs: runtime freeze watchdog — an OS thread aborts the process (systemd restarts it) when the async\n\
+             #          runtime has not ticked for this long (deadlock / swap thrash / disk stall). 0 = log only. Default 120.\n\
              # api:     local REST bridge for wallets / explorers / netfory-provider (keep host 127.0.0.1).\n\
              #          page_metrics: true serves the operator dashboard at http://host:port/ — or on its own address\n\
              #          with metrics_listen: \"0.0.0.0:4888\" (page + /api/ntfry/* only, safe to expose).\n\
@@ -611,8 +635,14 @@ impl NodeConfig {
              #          costs ≈ 0.007 STH); enabled: false demands exactly the static fee of the milestone (1 STH per transfer).\n\
              #          legacy_dynamic_fees: false = the legacy Core 3.8.2 peers take only the static fee → the fee advisor marks\n\
              #          cheaper transactions (feeHint in POST /api/transactions, wallet stream mempoolTx, metrics) as PQ-only.\n\
+             #          antispam (pool policy, not consensus): max_per_sender / max_bytes_per_sender = pending per address;\n\
+             #          peer_tx_per_min = budget per legacy IP / iroh EndpointId (rest of a batch dropped); peer_invalid_per_min\n\
+             #          bad signatures / bytes (not nonces) before the peer is banned for ban_secs; replace_by_fee = on a full pool a higher\n\
+             #          fee-per-byte evicts the cheapest pending; deny_peers = IPs / EndpointIds always dropped;\n\
+             #          alert_drops_per_min → alert `spam-wave`. Metrics: mempool.antispam {{dropped, banned[], topSenders[]}}.\n\
              # alerts:  operator notifications (CHAIN STALLED / recovered, fork rollbacks, audit-all drift): telegram_bot_token +\n\
-             #          telegram_chat_id and/or webhook_url (POST JSON {{kind,text,at}}); cooldown_secs between repeats of one kind.\n\
+             #          telegram_chat_id and/or webhook_url (POST JSON {{kind,text,at}}); cooldown_secs between repeats of one kind;\n\
+             #          node_name = this server's name in every message (default: hostname) — tells nodes apart in one chat.\n\
              {body}"
         )
     }

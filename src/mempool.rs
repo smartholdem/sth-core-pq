@@ -3,6 +3,7 @@
 //! In-memory transaction pool with legacy-compatible admission checks and best-effort
 //! relaying to the legacy node pool (until iroh gossip takes over in Phase 5).
 
+use crate::antispam::{AntiSpam, AntiSpamConfig, Gate, TxOrigin};
 use crate::config::Network;
 use crate::crypto::{address_from_public_key, transaction_id, validate_address, verify_transaction_signature};
 use crate::models::{tx_type, Transaction, TYPE_GROUP_CORE};
@@ -58,6 +59,15 @@ pub struct Mempool {
     events: tokio::sync::broadcast::Sender<Vec<Transaction>>,
     /// Pending transactions re-relayed after `rebroadcast_blocks` (gossip re-publishes them without the seen-filter).
     rebroadcasts: tokio::sync::broadcast::Sender<Vec<Transaction>>,
+    /// Flood policy (`mempool.antispam`): per-sender caps, per-peer budgets / bans, replace-by-fee.
+    antispam: AntiSpam,
+}
+
+/// `Mempool::validate` verdict: relay or keep local, the same-nonce pending id it replaces, the ids it evicts (RBF).
+struct Admit {
+    broadcast: bool,
+    replaces: Option<String>,
+    evicts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +131,35 @@ impl Mempool {
 
     pub fn legacy_dynamic_fees(&self) -> bool {
         self.legacy_dynamic_fees
+    }
+
+    pub fn with_antispam(mut self, cfg: AntiSpamConfig) -> Self {
+        self.antispam = AntiSpam::new(cfg);
+        self
+    }
+
+    pub fn antispam(&self) -> &AntiSpam {
+        &self.antispam
+    }
+
+    /// Senders with the most pending transactions (metrics page `antispam.topSenders`).
+    pub async fn top_senders(&self, n: usize) -> Vec<serde_json::Value> {
+        let pool = self.txs.read().await;
+        let mut by_sender: HashMap<&str, (usize, usize)> = HashMap::new();
+        for t in pool.values() {
+            let e = by_sender.entry(t.sender_public_key.as_str()).or_default();
+            e.0 += 1;
+            e.1 += self.tx_size(t);
+        }
+        let mut v: Vec<(&str, (usize, usize))> = by_sender.into_iter().collect();
+        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| b.1 .1.cmp(&a.1 .1)));
+        v.into_iter()
+            .take(n)
+            .map(|(pk, (count, bytes))| {
+                let address = address_from_public_key(pk, self.network.pubkey_hash).unwrap_or_else(|_| pk.to_string());
+                serde_json::json!({ "address": address, "pending": count, "bytes": bytes })
+            })
+            .collect()
     }
 
     /// Fee the legacy (Core 3.8.2) pools demand for this core transaction: exactly the static fee, or the dynamic
@@ -234,7 +273,7 @@ impl Mempool {
         }
         let min_pool = df.min_fee(name, size, df.min_fee_pool);
         if tx.fee < min_pool {
-            let addon = df.addon_bytes.get(name).copied().unwrap_or(0);
+            let addon = df.addon(name);
             return Err(("ERR_LOW_FEE".into(), format!("The fee {} is too low to enter the pool: minimum ({addon} + {size} bytes) × {} = {min_pool}", tx.fee, df.min_fee_pool)));
         }
         Ok(tx.fee >= df.min_fee(name, size, df.min_fee_broadcast))
@@ -262,7 +301,7 @@ impl Mempool {
         let (events, _) = tokio::sync::broadcast::channel(64);
         let (rebroadcasts, _) = tokio::sync::broadcast::channel(16);
         let defaults = crate::node_config::MempoolConfig::default();
-        Self { txs: RwLock::new(HashMap::new()), meta: Default::default(), storage, network, relay_nodes, peers, relay_fanout, client, max_size, max_bytes: defaults.max_bytes, bytes: std::sync::atomic::AtomicUsize::new(0), dynamic_fees: Default::default(), legacy_dynamic_fees: false, max_age_blocks: defaults.max_age_blocks, rebroadcast_blocks: defaults.rebroadcast_blocks, low_fee_rejected: Default::default(), expired: Default::default(), events, rebroadcasts }
+        Self { txs: RwLock::new(HashMap::new()), meta: Default::default(), storage, network, relay_nodes, peers, relay_fanout, client, max_size, max_bytes: defaults.max_bytes, bytes: std::sync::atomic::AtomicUsize::new(0), dynamic_fees: Default::default(), legacy_dynamic_fees: false, max_age_blocks: defaults.max_age_blocks, rebroadcast_blocks: defaults.rebroadcast_blocks, low_fee_rejected: Default::default(), expired: Default::default(), events, rebroadcasts, antispam: AntiSpam::new(AntiSpamConfig::default()) }
     }
 
     pub async fn len(&self) -> usize {
@@ -307,10 +346,23 @@ impl Mempool {
         Some(t)
     }
 
-    /// Validate and admit transactions; returns the legacy response plus per-id errors.
+    /// Validate and admit transactions from the node's own clients; returns the legacy response plus per-id errors.
     pub async fn add_many(&self, incoming: Vec<Transaction>) -> (PoolResponse, HashMap<String, PoolError>) {
+        self.add_many_from(incoming, &TxOrigin::Local).await
+    }
+
+    /// `add_many` with the peer the batch came from: the antispam gate (deny list, ban, per-minute budget) runs first
+    /// and invalid transactions count against the peer.
+    pub async fn add_many_from(&self, mut incoming: Vec<Transaction>, origin: &TxOrigin) -> (PoolResponse, HashMap<String, PoolError>) {
         let mut resp = PoolResponse::default();
         let mut errors = HashMap::new();
+        match self.antispam.gate(origin, incoming.len()) {
+            Gate::Allow(n) => incoming.truncate(n),
+            Gate::Denied | Gate::Banned => {
+                tracing::debug!(peer = origin.peer().unwrap_or("?"), dropped = incoming.len(), "antispam: batch dropped (denied / banned peer)");
+                return (resp, errors);
+            }
+        }
         let tip = self.storage.get_last_height().unwrap_or(0);
         for mut tx in incoming {
             let id = match transaction_id(&tx) {
@@ -338,7 +390,7 @@ impl Mempool {
             }
             let summary = describe(&tx, self.storage.network().pubkey_hash);
             match self.validate(&tx).await {
-                Ok((broadcast, replaces)) => {
+                Ok(Admit { broadcast, replaces, evicts }) => {
                     tracing::info!("Received transaction {summary}");
                     if let Some(h) = self.fee_hint(&tx) {
                         tracing::info!(%id, fee = tx.fee, legacy_min_fee = h["legacyMinFee"].as_str().unwrap_or("?"), "fee advisor: legacy pools will refuse this fee — only PQ delegates will forge it");
@@ -347,6 +399,12 @@ impl Mempool {
                     let mut pool = self.txs.write().await;
                     if let Some(old) = replaces.as_deref().and_then(|old| self.remove_locked(&mut pool, old)) {
                         tracing::info!(old = old.id.as_deref().unwrap_or("?"), old_fee = old.fee, new = %id, new_fee = tx.fee, nonce = tx.nonce.unwrap_or(0), "pending transaction replaced by the sender (same nonce, fee not lower)");
+                    }
+                    for victim in &evicts {
+                        if let Some(old) = self.remove_locked(&mut pool, victim) {
+                            self.antispam.note_evicted();
+                            tracing::info!(evicted = %victim, evicted_fee = old.fee, new = %id, new_fee = tx.fee, "pool full: cheaper pending transaction evicted (replace-by-fee)");
+                        }
                     }
                     self.bytes.fetch_add(self.tx_size(&tx), std::sync::atomic::Ordering::Relaxed);
                     pool.insert(id.clone(), tx);
@@ -369,6 +427,8 @@ impl Mempool {
                 }
             }
         }
+        let invalid = errors.values().filter(|e| AntiSpam::counts_as_invalid(&e.type_)).count() as u32;
+        self.antispam.note_invalid(origin, invalid);
         if !resp.broadcast.is_empty() {
             let pool = self.txs.read().await;
             let accepted: Vec<Transaction> = resp.broadcast.iter().filter_map(|id| pool.get(id).cloned()).collect();
@@ -379,21 +439,25 @@ impl Mempool {
         (resp, errors)
     }
 
-    /// `Ok((broadcast, replaces))`: whether the transaction may be relayed and, for a same-nonce resend with a fee not
-    /// lower than the pending one, the id of the pending transaction it replaces (RBF-lite, pool policy only).
-    async fn validate(&self, tx: &Transaction) -> std::result::Result<(bool, Option<String>), (String, String)> {
+    /// Whether the transaction may be relayed, the same-nonce pending id it replaces (a resend with a fee not lower than
+    /// the pending one — RBF-lite) and, when the pool is full, the cheaper pending ids it evicts (replace-by-fee). Pool policy only.
+    async fn validate(&self, tx: &Transaction) -> std::result::Result<Admit, (String, String)> {
         let id = tx.id.clone().unwrap_or_default();
         let pool = self.txs.read().await;
         if pool.contains_key(&id) {
             return Err(("ERR_DUPLICATE".into(), format!("Transaction {id} is already in the pool")));
         }
-        if pool.len() >= self.max_size {
-            return Err(("ERR_POOL_FULL".into(), "Transaction pool is full".into()));
-        }
         let size = self.tx_size(tx);
-        if self.bytes() + size > self.max_bytes {
-            return Err(("ERR_POOL_FULL".into(), format!("Transaction pool byte budget exhausted ({} of {} bytes used, {size} needed)", self.bytes(), self.max_bytes)));
-        }
+        let need_slots = usize::from(pool.len() >= self.max_size);
+        let need_bytes = (self.bytes() + size).saturating_sub(self.max_bytes);
+        let evicts = if need_slots > 0 || need_bytes > 0 {
+            if !self.antispam.replace_by_fee() {
+                return Err(("ERR_POOL_FULL".into(), format!("Transaction pool is full ({} of {} transactions, {} of {} bytes)", pool.len(), self.max_size, self.bytes(), self.max_bytes)));
+            }
+            self.eviction_candidates(&pool, tx, size, need_slots, need_bytes)?
+        } else {
+            Vec::new()
+        };
         if self.storage.get_transaction(&id).map_err(storage_err)?.is_some() {
             return Err(("ERR_FORGED".into(), format!("Transaction {id} is already forged")));
         }
@@ -424,6 +488,10 @@ impl Mempool {
         let (balance, nonce, second_pk) = wallet.as_ref().map(|w| (w.balance, w.nonce, w.second_public_key.clone())).unwrap_or((0, 0, None));
         let mut pending: Vec<&Transaction> = pool.values().filter(|p| p.sender_public_key == tx.sender_public_key).collect();
         pending.sort_by_key(|p| p.nonce.unwrap_or(0));
+        // antispam: one address may not hoard the pool (a same-nonce replacement does not add to its count)
+        if !pending.iter().any(|p| p.nonce == tx.nonce) {
+            self.antispam.check_sender(&sender, pending.len(), pending.iter().map(|p| self.tx_size(p)).sum(), size)?;
+        }
         // RBF-lite: the sender resends a nonce that is still pending here (stuck / fee bump) → replace when the fee is not lower
         let replaces = match tx.nonce {
             Some(n) => match pending.iter().find(|p| p.nonce == Some(n)) {
@@ -523,12 +591,50 @@ impl Mempool {
         if tx.type_group == crate::models::TYPE_GROUP_CORE && tx.type_ == tx_type::TRANSFER && tx.recipient_id.is_none() {
             return Err(("ERR_BAD_DATA".into(), "Transfer without recipient".into()));
         }
-        Ok((broadcast, replaces))
+        Ok(Admit { broadcast, replaces, evicts })
+    }
+
+    /// Replace-by-fee on a full pool: the cheapest pending transactions (fee per byte) that are their sender's LAST
+    /// nonce (evicting a middle nonce would strand the rest) and not the new sender's own, until `need_slots` slots and
+    /// `need_bytes` bytes are freed. Every victim must pay strictly less per byte than the newcomer.
+    fn eviction_candidates(&self, pool: &HashMap<String, Transaction>, tx: &Transaction, size: usize, need_slots: usize, need_bytes: usize) -> std::result::Result<Vec<String>, (String, String)> {
+        let rate = |fee: u64, bytes: usize| fee as f64 / bytes.max(1) as f64;
+        let new_rate = rate(tx.fee, size);
+        let mut last_nonce: HashMap<&str, u64> = HashMap::new();
+        for p in pool.values() {
+            let e = last_nonce.entry(p.sender_public_key.as_str()).or_default();
+            *e = (*e).max(p.nonce.unwrap_or(0));
+        }
+        let mut candidates: Vec<(f64, usize, &String)> = pool
+            .iter()
+            .filter(|(_, p)| p.sender_public_key != tx.sender_public_key && last_nonce.get(p.sender_public_key.as_str()) == Some(&p.nonce.unwrap_or(0)))
+            .map(|(id, p)| {
+                let bytes = self.tx_size(p);
+                (rate(p.fee, bytes), bytes, id)
+            })
+            .filter(|(r, _, _)| *r < new_rate)
+            .collect();
+        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let (mut slots, mut bytes, mut out) = (0usize, 0usize, Vec::new());
+        for (_, b, id) in candidates {
+            if slots >= need_slots && bytes >= need_bytes {
+                break;
+            }
+            slots += 1;
+            bytes += b;
+            out.push(id.clone());
+        }
+        if slots >= need_slots && bytes >= need_bytes {
+            Ok(out)
+        } else {
+            Err(("ERR_POOL_FULL".into(), format!("Transaction pool is full and the fee {} ({new_rate:.2} per byte) does not beat the cheapest pending transactions (replace-by-fee)", tx.fee)))
+        }
     }
 
     /// Housekeeping after every block: drop forged / stale-nonce / expired (`expiration` height) / aged
     /// (`max_age_blocks`, legacy `maxTransactionAge`) transactions and re-relay the rest every `rebroadcast_blocks`.
     pub async fn prune_confirmed(&self) {
+        self.antispam.gc();
         let tip = self.storage.get_last_height().unwrap_or(0);
         let snapshot: Vec<(String, Transaction)> =
             self.txs.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();

@@ -570,6 +570,8 @@ impl ActiveRelayActor {
             pong_pending: None,
             established: false,
             rate_limited: false,
+            dropped_recv: 0,
+            last_drop_log: None,
             #[cfg(test)]
             test_pong: None,
         };
@@ -731,7 +733,14 @@ impl ActiveRelayActor {
                     src: remote_endpoint_id,
                     datagrams,
                 }) {
-                    warn!("Dropping received relay packet: {err:#}");
+                    // sth-core patch: one line per 5 s with a count — per-packet warnings (hundreds per second,
+                    // synchronous stdout writes on the runtime) made the overload worse
+                    state.dropped_recv += 1;
+                    if state.last_drop_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+                        warn!(dropped = state.dropped_recv, "Dropping received relay packets: {err:#} (count since last report)");
+                        state.last_drop_log = Some(Instant::now());
+                        state.dropped_recv = 0;
+                    }
                 }
             }
             RelayToClientMsg::EndpointGone(endpoint_id) => {
@@ -876,6 +885,9 @@ struct ConnectedRelayState {
     ///
     /// Used to count each affected connection only once.
     rate_limited: bool,
+    /// sth-core patch: received datagrams dropped since `last_drop_log` (queue full).
+    dropped_recv: u64,
+    last_drop_log: Option<Instant>,
     #[cfg(test)]
     test_pong: Option<([u8; 8], oneshot::Sender<()>)>,
 }

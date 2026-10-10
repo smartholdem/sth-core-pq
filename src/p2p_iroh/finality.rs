@@ -307,6 +307,11 @@ impl FinalityTracker {
         i.last_error = error.into();
     }
 
+    /// Votes held in memory (memory line gauge).
+    pub fn votes_in_memory(&self) -> usize {
+        self.lock().votes.values().map(|by_block| by_block.values().map(|v| v.len()).sum::<usize>()).sum()
+    }
+
     fn prune(&self, tip: u64) {
         let mut i = self.lock();
         let cut = tip.saturating_sub(KEEP_BEHIND);

@@ -63,13 +63,20 @@ enum Command {
         fix: bool,
     },
     /// Walk the whole chain once and compare EVERY stored wallet with the recomputed nonce / balance (nightly operator
-    /// check, node stopped or read-only copy). `--fix` repairs the drifted wallets, `--json` prints the report as JSON.
+    /// check). Works on a stopped node (opens the database) AND on a running one (the node audits itself through its
+    /// local API, forging is not interrupted). `--fix` repairs the drifted wallets, `--json` prints the report as JSON.
     AuditAll {
         #[arg(long)]
         fix: bool,
         #[arg(long)]
         json: bool,
+        /// Running node's API base URL (default: http://<api.host>:<api.port>).
+        #[arg(long)]
+        api: Option<String>,
     },
+    /// Check the `alerts:` section: with an empty telegram_chat_id lists the chats the bot has seen (copy the id into
+    /// node.yaml), otherwise sends a test message to Telegram / the webhook and prints the delivery result.
+    AlertsTest,
     /// One health verdict: node API / sync / stall / peers / last audit (from /api/ntfry/metrics) + legacy acceptance.
     /// Exit code 0 healthy, 1 warnings, 2 failures — cron-friendly.
     Doctor {
@@ -192,7 +199,9 @@ enum Command {
     /// Build, sign and post a transaction through the local REST API (transfer, sObject, tokens).
     Tx(sth_core::cli::TxArgs),
     /// Print (creating if needed) the iroh EndpointId of this node — share it as `p2p.iroh.bootstrap` on other nodes.
-    IrohId {
+    /// (`iroh-id` is still accepted as an alias.)
+    #[command(alias = "iroh-id")]
+    Id {
         #[arg(long, default_value = "./iroh.key")]
         key_file: PathBuf,
         /// Print the SHIP-44 wallet URL `api://<EndpointId>/<name>` instead of the bare id.
@@ -316,11 +325,22 @@ fn read_block(file: &PathBuf) -> anyhow::Result<Block> {
     Ok(serde_json::from_value(inner)?)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// mimalloc instead of glibc malloc: with sled + the blocking thread pool glibc keeps one arena per thread and never
+/// returns fragmented memory — RSS crept from 0.9 to 3.1 GB in two days on mainnet (open fds flat, no data growth).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+fn main() -> anyhow::Result<()> {
+    // at least 4 runtime workers even on 1–2 vCPU hosts: a single blocking call (sled read on a cold page cache, swap-in)
+    // must not stall every async task — with 2 workers two such calls freeze the node (seen on a 2 vCPU / 2 GB node)
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).max(4);
+    tokio::runtime::Builder::new_multi_thread().worker_threads(workers).thread_name("sth-worker").enable_all().build()?.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // `iroh-id` is meant for `$(sth-core iroh-id)`: bare id on stdout, logs to stderr, no banner
-    let quiet = matches!(cli.command, Command::IrohId { .. } | Command::AuditAll { json: true, .. });
+    // `id` is meant for `$(sth-core id)`: bare id on stdout, logs to stderr, no banner
+    let quiet = matches!(cli.command, Command::Id { .. } | Command::AuditAll { json: true, .. });
     // iroh::protocol WARNs "Accepting incoming connection ended with error: timed out" without the remote address
     // (wallet_api::accept_with_log reports it at INFO with who knocked); noq_proto WARNs "failed closing path
     // err=LastOpenPath" when a QUIC path idles out and is the connection's only path — transport noise. n0_mainline shouts
@@ -415,8 +435,22 @@ async fn main() -> anyhow::Result<()> {
                 println!("rolled back {tip} -> {reached}");
             }
         }
-        Command::AuditAll { fix, json } => {
-            let storage = Storage::open(&db_path, network.clone())?;
+        Command::AuditAll { fix, json, api } => {
+            let storage = match Storage::open(&db_path, network.clone()) {
+                Ok(s) => s,
+                Err(open_err) => {
+                    // the node holds the sled lock → let it audit itself (delegates keep forging)
+                    let url = match sth_core::audit_client::api_url(&base_cfg, api) {
+                        Some(u) if sth_core::audit_client::reachable(&u).await => u,
+                        _ => return Err(anyhow!("{open_err} (no running node found at the local API either — is db_path right?)")),
+                    };
+                    let code = sth_core::audit_client::run(&url, fix, json).await?;
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    return Ok(());
+                }
+            };
             let started = std::time::Instant::now();
             let report = storage.audit_all(|h| {
                 if !json {
@@ -466,7 +500,7 @@ async fn main() -> anyhow::Result<()> {
             storage.save_audit_summary(&sth_core::storage::AuditSummary::from_audit(&report, fix, started.elapsed().as_secs_f64()))?;
             storage.flush()?;
             if !report.drifted.is_empty() {
-                sth_core::alerts::init(&base_cfg.alerts, if base_cfg.p2p.legacy_public_addr.trim().is_empty() { network.name.clone() } else { base_cfg.p2p.legacy_public_addr.trim().to_string() });
+                sth_core::alerts::init(&base_cfg.alerts, sth_core::alerts::node_label(&base_cfg, &network.name));
                 let msg = format!("audit-all at height {}: {} of {} wallets drifted{} — {}", report.height, report.drifted.len(), report.wallets, if fix { " (repaired)" } else { "" }, report.drifted.iter().take(5).map(|a| a.address.as_str()).collect::<Vec<_>>().join(", "));
                 if let Some(h) = sth_core::alerts::notify("audit", msg, true) {
                     let _ = h.await;
@@ -479,12 +513,24 @@ async fn main() -> anyhow::Result<()> {
                     }
                 } else {
                     if !json {
-                        println!("rerun with --fix (node stopped) to overwrite the drifted states");
+                        println!("rerun with --fix to overwrite the drifted states");
                     }
                     std::process::exit(2);
                 }
             } else if !json {
                 println!("OK: every wallet matches the chain history");
+            }
+        }
+        Command::AlertsTest => {
+            let node = sth_core::alerts::node_label(&base_cfg, &network.name);
+            println!("messages are tagged [sth-core-pq {node}] (alerts.node_name, default: hostname)");
+            let lines = sth_core::alerts::test_delivery(&base_cfg.alerts, &node).await;
+            let failed = lines.iter().any(|(ok, _)| !ok);
+            for (ok, line) in lines {
+                println!("{} {line}", if ok { "[ OK ]" } else { "[FAIL]" });
+            }
+            if failed {
+                std::process::exit(1);
             }
         }
         Command::Doctor { public_ip, api } => {
@@ -601,7 +647,7 @@ async fn main() -> anyhow::Result<()> {
             node.run(RunFlags { quiet, force_bootstrap: from_dump.is_some() }).await?;
         }
         Command::Tx(args) => sth_core::cli::run(sth_core::cli::ChainSource::Config(base_cfg), args).await?,
-        Command::IrohId { key_file, url, name } => {
+        Command::Id { key_file, url, name } => {
             let secret = sth_core::p2p_iroh::load_or_create_secret(&key_file)?;
             if url {
                 println!("api://{}/{}", secret.public(), name.trim_matches('/'));

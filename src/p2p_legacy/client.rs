@@ -246,7 +246,7 @@ pub fn decode_blocks(payload: &[u8]) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
     for raw in be_frames(payload)? {
         let h = BlockHeaderProto::decode(raw).map_err(|e| Error::Sync(format!("block header decode: {e}")))?;
-        let mut transactions = Vec::with_capacity(h.number_of_transactions as usize);
+        let mut transactions = Vec::new();
         for (seq, tx_bytes) in be_frames(&h.transactions)?.into_iter().enumerate() {
             let mut tx = deserialize_transaction(tx_bytes)?;
             tx.block_id = Some(h.id.clone());

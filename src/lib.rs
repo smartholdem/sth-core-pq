@@ -5,7 +5,9 @@
 //! Rust rewrite of the `@smartholdem/core` data structures, cryptography and state storage.
 
 pub mod alerts;
+pub mod antispam;
 pub mod api;
+pub mod audit_client;
 pub mod banner;
 pub mod console;
 pub mod cli;

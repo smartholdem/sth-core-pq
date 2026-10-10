@@ -615,7 +615,7 @@ pub const FEE_NAMES: [(&str, u16); 11] = [
     ("delegateRegistration", 2),
     ("vote", 3),
     ("multiSignature", 4),
-    // type 5 = Netfory content pointer; `ipfs` is the legacy JSON key of staticFees / addonBytes that wallets rely on
+    // type 5 = Netfory content pointer; `ipfs` is the legacy JSON key of staticFees / addonBytes that old wallets rely on (node.yaml: `ntfry`)
     ("ipfs", 5),
     ("multiPayment", 6),
     ("delegateResignation", 7),

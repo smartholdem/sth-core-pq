@@ -146,7 +146,7 @@ pub enum TxCmd {
         /// Label, unique network-wide (e.g. sn-berlin-1).
         #[arg(long)]
         name: String,
-        /// Iroh EndpointId of the node (64 hex, `sth-core iroh-id`). Omit to take it from `--key-file` / `node.yaml`
+        /// Iroh EndpointId of the node (64 hex, `sth-core id`). Omit to take it from `--key-file` / `node.yaml`
         /// (`p2p.iroh.secret_key_file`) or, failing that, from the node behind `--api` (`/api/node/status`).
         #[arg(long)]
         node_id: Option<String>,
@@ -364,7 +364,7 @@ impl Ctx {
             println!("node id  {id}  (from the node at {})", self.api);
             return Ok(id.to_string());
         }
-        bail!("no --node-id, no iroh key file ({:?}) and the node at {} runs without iroh — run `sth-core iroh-id` on the node and pass --node-id", candidates, self.api)
+        bail!("no --node-id, no iroh key file ({:?}) and the node at {} runs without iroh — run `sth-core id` on the node and pass --node-id", candidates, self.api)
     }
 
     /// Service Node registration id by id / name / address / EndpointId (`/api/masternodes/:id`).
@@ -759,7 +759,7 @@ pub async fn run(source: ChainSource, args: TxArgs) -> Result<()> {
         let bytes = crate::crypto::serialize_transaction(&probe, crate::crypto::SerializeOptions::default(), crate::config::Network::mainnet_ref()).map(|b| b.len())?;
         let type_name = crate::config::FEE_NAMES.iter().find(|(_, t)| *t as u64 == body["type"].as_u64().unwrap_or(0)).map(|(n, _)| *n).unwrap_or("");
         let fee = dynamic_fee(df, type_name, bytes);
-        let addon = df.addon_bytes.get(type_name).copied().unwrap_or(0);
+        let addon = df.addon(type_name);
         println!("fee     {} STH (dynamic, SHIP-41: ({addon} + {bytes} B) × {} → min {} STH, rounded up)", coins_str(fee), df.min_fee_pool.max(df.min_fee_broadcast), coins_str(df.min_fee(type_name, bytes, df.min_fee_pool.max(df.min_fee_broadcast))));
         body["fee"] = json!(fee.to_string());
     } else if core_v2 {

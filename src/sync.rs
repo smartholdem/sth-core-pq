@@ -449,7 +449,7 @@ impl Syncer {
             .as_deref()
             .ok_or_else(|| RequestError::Transient(Error::Sync(format!("block {} has no id", block.height))))?;
         let expected = block.number_of_transactions as usize;
-        let mut all: Vec<Transaction> = Vec::with_capacity(expected);
+        let mut all: Vec<Transaction> = Vec::with_capacity(expected.min(1_000));
         let mut page = 1u32;
         loop {
             let lease = self.pool.acquire().await;

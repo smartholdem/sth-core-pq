@@ -20,6 +20,8 @@ pub struct IrohPeerInfo {
     pub neighbor_topics: [bool; 3],
     /// Public `ip:4001` announced by a gateway node.
     pub gateway: Option<String>,
+    /// "direct" / "relay" — path of the last RPC connection (holepunching succeeded or not).
+    pub path: Option<&'static str>,
 }
 
 /// Gossip topic index for [`IrohPeers::set_neighbor`].
@@ -42,6 +44,7 @@ impl IrohPeers {
             id,
             height: 0,
             latency_ms: None,
+            path: None,
             last_seen: Instant::now(),
             messages: 0,
             failures: 0,
@@ -85,6 +88,11 @@ impl IrohPeers {
         if let Some(h) = height {
             p.height = p.height.max(h);
         }
+    }
+
+    pub fn set_path(&self, id: EndpointId, kind: &'static str) {
+        let mut map = self.lock();
+        Self::entry(&mut map, id).path = Some(kind);
     }
 
     pub fn set_gateway(&self, id: EndpointId, addr: Option<String>) {

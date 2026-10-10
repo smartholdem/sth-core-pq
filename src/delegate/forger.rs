@@ -143,37 +143,44 @@ impl Forger {
         self.keys.iter().map(|k| k.public_key_hex()).collect()
     }
 
-    /// Ask the best legacy peers for their tip (height + block id) concurrently.
-    async fn network_view(&self, count: usize) -> Vec<PeerView> {
+    /// Ask the best legacy peers and the iroh neighbours for their tip (height + block id) concurrently. Returns as soon
+    /// as `enough(&views)` holds — one unreachable peer must not cost the full 4 s timeout — or when every probe answered.
+    async fn network_view(&self, count: usize, enough: impl Fn(&[PeerView], usize) -> bool) -> Vec<PeerView> {
+        use futures::StreamExt;
         let port = self.peers.port();
-        let ips = self.peers.best(count);
-        let views = futures::future::join_all(ips.into_iter().map(|ip| async move {
-            let res = tokio::time::timeout(Duration::from_secs(4), async {
-                let mut peer = LegacyPeer::connect(&ip, port, Duration::from_secs(4)).await?;
-                peer.get_status().await
-            })
-            .await;
-            match res {
-                Ok(Ok(status)) => status.state.map(|st| PeerView {
-                    ip,
-                    height: st.height as u64,
-                    id: st.header.map(|h| h.id).unwrap_or_default(),
-                }),
-                _ => None,
-            }
-        }))
-        .await;
-        let mut views: Vec<PeerView> = views.into_iter().flatten().collect();
-        if let Some(node) = &self.opts.iroh {
-            let ids: Vec<_> = node.peers.snapshot().into_iter().filter(|p| p.failures < 3).map(|p| p.id).take(count).collect();
-            let iroh_views = futures::future::join_all(ids.into_iter().map(|id| async move {
-                match tokio::time::timeout(Duration::from_secs(4), crate::p2p_iroh::fetch_status(&node.endpoint, &node.peers, id)).await {
-                    Ok(Ok((height, block_id))) => Some(PeerView { ip: format!("iroh:{}", id.fmt_short()), height, id: block_id.unwrap_or_default() }),
+        let mut probes: futures::stream::FuturesUnordered<futures::future::BoxFuture<'_, Option<PeerView>>> = futures::stream::FuturesUnordered::new();
+        for ip in self.peers.best(count) {
+            probes.push(Box::pin(async move {
+                let res = tokio::time::timeout(Duration::from_secs(4), async {
+                    let mut peer = LegacyPeer::connect(&ip, port, Duration::from_secs(4)).await?;
+                    peer.get_status().await
+                })
+                .await;
+                match res {
+                    Ok(Ok(status)) => status.state.map(|st| PeerView { ip, height: st.height as u64, id: st.header.map(|h| h.id).unwrap_or_default() }),
                     _ => None,
                 }
-            }))
-            .await;
-            views.extend(iroh_views.into_iter().flatten());
+            }));
+        }
+        if let Some(node) = &self.opts.iroh {
+            for id in node.peers.snapshot().into_iter().filter(|p| p.failures < 3).map(|p| p.id).take(count) {
+                probes.push(Box::pin(async move {
+                    match tokio::time::timeout(Duration::from_secs(4), crate::p2p_iroh::fetch_status(&node.endpoint, &node.peers, id)).await {
+                        Ok(Ok((height, block_id))) => Some(PeerView { ip: format!("iroh:{}", id.fmt_short()), height, id: block_id.unwrap_or_default() }),
+                        _ => None,
+                    }
+                }));
+            }
+        }
+        let asked = probes.len();
+        let mut views: Vec<PeerView> = Vec::new();
+        while let Some(v) = probes.next().await {
+            if let Some(v) = v {
+                views.push(v);
+                if enough(&views, asked) {
+                    break;
+                }
+            }
         }
         views
     }
@@ -182,7 +189,18 @@ impl Forger {
     async fn wait_for_quorum(&self, deadline: Instant) -> std::result::Result<crate::models::Block, String> {
         loop {
             let tip = self.storage.get_last_block().ok().flatten().ok_or("empty database")?;
-            let views = self.network_view(8).await;
+            // early exit: enough peers (counted against everyone we asked, so silent peers never relax the bar) agree
+            // with our tip and nobody is ahead — the slot is used within ~0.5 s instead of ~4–5 s
+            let share = self.opts.quorum_share.clamp(0.0, 1.0);
+            let min_peers = self.opts.min_quorum_peers.max(1);
+            let (tip_h, tip_id) = (tip.height, tip.id.clone().unwrap_or_default());
+            let views = self
+                .network_view(8, |views, asked| {
+                    let needed = ((asked as f64 * share).ceil() as usize).max(min_peers);
+                    let same = views.iter().filter(|v| v.height == tip_h && v.id == tip_id).count();
+                    same >= needed && views.iter().all(|v| v.height <= tip_h)
+                })
+                .await;
             if views.is_empty() {
                 // quorum_share 0 = private / single-node network (`init newnet`): forge without peers
                 if self.opts.quorum_share <= 0.0 {
@@ -212,7 +230,7 @@ impl Forger {
                 return Err(format!(
                     "local tip {} ({}) vs peers [{}]: {} of {} peers agree with us (need {})",
                     tip.height,
-                    tip.id.as_deref().map(|i| &i[..8]).unwrap_or("?"),
+                    tip.id.as_deref().and_then(|i| i.get(..8)).unwrap_or("?"),
                     heights.join(", "),
                     same,
                     views.len(),
@@ -288,10 +306,13 @@ impl Forger {
         let mut last_slot = 0u64;
         let mut announced_slot = 0u64;
         tracing::info!("Forger Manager started.");
-        let mut tick = tokio::time::interval(Duration::from_millis(500));
         let mut ticks = 0u64;
         loop {
-            tick.tick().await;
+            // slots start on whole epoch seconds: wake 25 ms after each second boundary (and once mid-second) instead of
+            // on a free-running 500 ms interval that noticed a new slot up to 0.5 s late
+            let sub = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_millis()).unwrap_or(0);
+            let wait = if sub < 25 { 25 - sub } else if sub < 525 { 525 - sub } else { 1025 - sub };
+            tokio::time::sleep(Duration::from_millis(u64::from(wait))).await;
             ticks += 1;
             // keys unknown at start (empty / syncing DB): re-read name & rank from the chain every 30 s
             if ticks % 60 == 0 && self.has_unresolved_delegate() {

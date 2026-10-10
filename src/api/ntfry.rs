@@ -32,7 +32,7 @@ pub async fn page() -> Html<&'static str> {
 
 fn iroh_peer_json(p: &crate::p2p_iroh::IrohPeerInfo, now: Instant) -> Value {
     json!({
-        "nodeId": p.id.to_string(), "height": p.height, "latency": p.latency_ms,
+        "nodeId": p.id.to_string(), "height": p.height, "latency": p.latency_ms, "path": p.path,
         "neighbor": p.neighbor, "gateway": p.gateway.is_some(), "messages": p.messages, "failures": p.failures,
         "lastSeen": now.saturating_duration_since(p.last_seen).as_secs(),
         "state": if p.neighbor { "neighbor" } else { "known" },
@@ -278,6 +278,8 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
             "version": env!("CARGO_PKG_VERSION"), "implementation": "sth-core-pq",
             "uptime": st.started.elapsed().as_secs(), "nethash": st.network.nethash, "now": now_unix,
             "rssBytes": crate::mem::rss_bytes(),
+            "runtimeLagSecs": crate::mem::runtime_lag_secs(),
+            "openFds": crate::mem::open_fds(), "fdLimit": crate::mem::fd_limit(), "swapBytes": crate::mem::swap_bytes(),
             "pqCommitments": st.storage.pq_commitment_count(), "pqActive": st.storage.pq_key_count(), "pqStage": if ms.pq.blocks { "C" } else if st.network.milestone(tip + 1).pq.active { "B" } else { "A" },
             "pqBlocks": ms.pq.blocks, "lastBlockVersion": last.as_ref().map(|b| b.version),
             "lastAudit": st.storage.last_audit()?,
@@ -296,8 +298,9 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
         "serviceNodes": { "enabled": ms.masternodes.enabled, "collateral": ms.masternodes.collateral_amount.to_string(), "total": service_nodes_total.0, "active": service_nodes_total.1 },
         "mempool": { "count": st.mempool.len().await, "max": st.mempool.max_size(), "bytes": st.mempool.bytes(), "maxBytes": st.mempool.max_bytes(),
             "relay": crate::p2p_legacy::relay_coverage(),
+            "antispam": { "enabled": st.mempool.antispam().enabled(), "config": st.mempool.antispam().config(), "counters": st.mempool.antispam().counters(), "banned": st.mempool.antispam().banned(), "topSenders": st.mempool.top_senders(5).await },
             "legacyPool": { "dynamicFees": st.mempool.legacy_dynamic_fees(), "minTransferFee": st.mempool.legacy_min_transfer_fee(), "pendingRefused": st.mempool.below_legacy_min().await },
-            "dynamicFees": { "enabled": df.enabled, "minFeePool": df.min_fee_pool, "minFeeBroadcast": df.min_fee_broadcast, "addonBytes": df.addon_bytes, "minTransferFee": st.mempool.min_transfer_fee(), "transferBytes": crate::mempool::Mempool::TRANSFER_WIRE_BYTES, "lowFeeRejected": st.mempool.low_fee_rejected() } },
+            "dynamicFees": { "enabled": df.enabled, "minFeePool": df.min_fee_pool, "minFeeBroadcast": df.min_fee_broadcast, "addonBytes": df.addon_bytes_api(), "minTransferFee": st.mempool.min_transfer_fee(), "transferBytes": crate::mempool::Mempool::TRANSFER_WIRE_BYTES, "lowFeeRejected": st.mempool.low_fee_rejected() } },
         "intake": crate::intake::snapshot(),
         "doubleForgeGuard": crate::delegate::guard::snapshot(tip + 1, u64::from(ms.active_delegates)),
         "legacy": legacy,

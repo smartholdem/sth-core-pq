@@ -253,9 +253,11 @@ pub fn spawn_stall_watchdog(storage: std::sync::Arc<crate::storage::Storage>, pe
         let mut split_since = None::<std::time::Instant>;
         let mut split_alerted = None::<std::time::Instant>;
         loop {
-            let tip = storage.get_last_height().unwrap_or(0);
-            let blocktime = u64::from(storage.network().milestone(tip.max(1)).blocktime);
+            let blocktime = u64::from(storage.network().milestone(storage.get_last_height().unwrap_or(0).max(1)).blocktime);
             tokio::time::sleep(std::time::Duration::from_secs(blocktime.max(1))).await;
+            // read the tip AFTER the sleep: compared with a tip read a slot earlier, peers that just served us the block
+            // we applied in between looked "ahead" → false CHAIN STALLED + recovered pairs every time the network skipped slots
+            let tip = storage.get_last_height().unwrap_or(0);
             let now = std::time::Instant::now();
             let legacy_ahead = peers.snapshot().iter().filter(|p| !p.is_banned(now) && p.height > tip).count();
             let iroh_ahead = iroh.as_ref().map(|n| n.peers.snapshot().iter().filter(|p| p.height > tip).count()).unwrap_or(0);

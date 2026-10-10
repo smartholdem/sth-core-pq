@@ -12,7 +12,7 @@ pub use gossip::fill_gap_from;
 mod peers;
 pub mod proto;
 pub mod relay_guard;
-mod rpc;
+pub mod rpc;
 pub mod wallet_api;
 
 /// iroh-gossip message size limit of this node (receive + send).
@@ -142,16 +142,20 @@ pub fn dht_health() -> Option<DhtHealth> {
     DHT_HEALTH.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Every 30 min (first after 90 s) resolve our own record from the DHT: success proves bootstrap + publish work.
-/// Failures produce ONE clear WARN + alert instead of n0_mainline's error every 2 s (muted in main.rs).
+/// Consecutive failed probes before the `dht-unreachable` alert: a fresh record takes minutes to spread through the
+/// DHT, so the first probes after a (re)start fail on perfectly reachable hosts.
+const DHT_ALERT_AFTER_FAILURES: u32 = 3;
+
+/// Resolve our own record from the DHT (first after 90 s, then 5 min / 15 min while failing, every 30 min once ok):
+/// success proves bootstrap + publish work. Failures produce ONE clear WARN each and the alert only after
+/// `DHT_ALERT_AFTER_FAILURES` in a row, instead of n0_mainline's error every 2 s (muted in main.rs).
 async fn dht_health_loop(lookup: iroh_mainline_address_lookup::DhtAddressLookup, me: EndpointId, cfg: crate::node_config::DiscoveryConfig) {
     use futures::StreamExt;
     use iroh::address_lookup::AddressLookup;
     *DHT_HEALTH.lock().unwrap_or_else(|e| e.into_inner()) = Some(DhtHealth { status: "probing".into(), ..Default::default() });
-    tokio::time::sleep(std::time::Duration::from_secs(90)).await;
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1800));
+    let mut wait = std::time::Duration::from_secs(90);
     loop {
-        tick.tick().await;
+        tokio::time::sleep(wait).await;
         let found = match lookup.resolve(me) {
             Some(mut stream) => tokio::time::timeout(std::time::Duration::from_secs(45), async { while let Some(item) = stream.next().await { if item.is_ok() { return true; } } false }).await.unwrap_or(false),
             None => false,
@@ -167,17 +171,24 @@ async fn dht_health_loop(lookup: iroh_mainline_address_lookup::DhtAddressLookup,
             st.status = "ok".into();
             st.last_ok_unix = now;
             st.failures = 0;
+            wait = std::time::Duration::from_secs(1800);
         } else {
             st.failures += 1;
-            st.status = "unreachable".into();
+            st.status = if st.failures >= DHT_ALERT_AFTER_FAILURES { "unreachable".into() } else { "probing".into() };
+            wait = std::time::Duration::from_secs(if st.failures < DHT_ALERT_AFTER_FAILURES { 300 } else { 900 });
+            let (alert, failures) = (st.failures >= DHT_ALERT_AFTER_FAILURES, st.failures);
             let msg = format!(
                 "Mainline DHT unreachable: own record not found after {} probe(s) — outbound UDP to the DHT bootstrap routers is blocked or throttled (ISP filtering of BitTorrent traffic is common). Discovery keeps working through the sthpq address book{}; add reachable seeders in discovery.mainline_bootstrap (e.g. a gateway with mainline_server: true) or set discovery.mainline: false",
                 st.failures,
                 if cfg.n0_dns { " and n0 DNS" } else { "" }
             );
             drop(h);
-            tracing::warn!("{msg}");
-            crate::alerts::notify("dht-unreachable", msg, false);
+            if alert {
+                tracing::warn!("{msg}");
+                crate::alerts::notify("dht-unreachable", msg, false);
+            } else {
+                tracing::info!("Mainline DHT: own record not found yet (probe {failures} of {DHT_ALERT_AFTER_FAILURES} before the alert; a fresh record needs minutes to spread)");
+            }
         }
     }
 }

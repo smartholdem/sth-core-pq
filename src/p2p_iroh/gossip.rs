@@ -179,7 +179,7 @@ pub async fn start(
                             s.tx_ids.extend(transactions.iter().filter_map(|t| t.id.clone()));
                             s.trim();
                         }
-                        let (resp, _) = mempool.add_many(transactions).await;
+                        let (resp, _) = mempool.add_many_from(transactions, &crate::antispam::TxOrigin::IrohPeer(msg.delivered_from.to_string())).await;
                         tracing::debug!(accepted = resp.accept.len(), invalid = resp.invalid.len(), "gossip transactions processed");
                     }
                     Ok(Event::NeighborUp(id)) => {
@@ -200,10 +200,10 @@ pub async fn start(
         });
     }
     // publishers
-    if let Some(table) = legacy_peers {
+    if let Some(table) = legacy_peers.clone() {
         tokio::spawn(publish_peers([block_sender.clone(), tx_sender.clone()], table, node.gateway.clone()));
     }
-    tokio::spawn(rejoin_watchdog(node.clone(), [block_sender.clone(), tx_sender.clone(), fin_sender.clone()], bootstrap_for_watchdog));
+    tokio::spawn(rejoin_watchdog(node.clone(), [block_sender.clone(), tx_sender.clone(), fin_sender.clone()], bootstrap_for_watchdog, legacy_peers.clone()));
     tokio::spawn(publish_finality(node.clone(), fin_sender, storage.clone()));
     tokio::spawn(sync_finality(node.clone(), storage.clone()));
     tokio::spawn(publish_delegates(node.clone(), [block_sender.clone(), tx_sender.clone()]));
@@ -326,11 +326,64 @@ fn on_peers(
 
 /// A topic whose neighbours all dropped never re-bootstraps by itself: re-join the configured
 /// bootstrap peers (and any peer we still talk to over RPC) whenever a topic has no neighbour.
-async fn rejoin_watchdog(node: Arc<super::IrohNode>, senders: [GossipSender; 3], bootstrap: Vec<EndpointId>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(60));
+/// Seconds without any connected home relay before relay-down mode kicks in.
+const RELAY_DOWN_AFTER: Duration = Duration::from_secs(60);
+
+async fn rejoin_watchdog(node: Arc<super::IrohNode>, senders: [GossipSender; 3], bootstrap: Vec<EndpointId>, legacy: Option<Arc<crate::p2p_legacy::PeerTable>>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(30));
     tick.tick().await;
+    let mut relay_down_since: Option<std::time::Instant> = None;
+    let mut relay_down_mode = false;
     loop {
         tick.tick().await;
+        // relay-down mode: every configured relay unreachable → the network must keep working on direct addresses.
+        // Pull fresh sthpq records over the legacy TCP port (peers.json seeds, no relay / DNS / DHT involved), pin
+        // them with direct addresses only, and re-join gossip with those peers whenever neighbours run low.
+        let relays_configured = !node.relay_urls.is_empty();
+        let connected = node.connected_relays();
+        if relays_configured && connected.is_empty() {
+            let since = *relay_down_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= RELAY_DOWN_AFTER {
+                if !relay_down_mode {
+                    relay_down_mode = true;
+                    let msg = format!("ALL RELAYS DOWN for {}s ({}) — running on direct addresses: pulling sthpq records over the legacy port and re-joining gossip with pinned peers", since.elapsed().as_secs(), node.relay_urls.join(", "));
+                    tracing::warn!("{msg}");
+                    crate::alerts::notify("relay-down", msg, false);
+                }
+                let mut pinned = 0usize;
+                if let Some(book) = node.addrbook.get() {
+                    if let Some(table) = &legacy {
+                        super::addrbook::pull_over_legacy(book, table, 6).await;
+                    }
+                    for rec in book.fresh(super::addrbook::MAX_RECORDS) {
+                        if let Some(addr) = super::addrbook::direct_only_addr(&rec).filter(|a| a.id != node.id()) {
+                            node.add_peer_addr(addr);
+                            pinned += 1;
+                        }
+                    }
+                }
+                let low = (0..3).filter(|t| node.peers.neighbors_on(*t) < 2).count();
+                tracing::info!(pinned, topics_low = low, "relay-down mode: direct dial info refreshed");
+                if low > 0 {
+                    let targets: Vec<EndpointId> = node.peers.snapshot().into_iter().filter(|p| p.failures < 3 && p.id != node.id()).map(|p| p.id).collect();
+                    for (topic, sender) in senders.iter().enumerate() {
+                        if node.peers.neighbors_on(topic) < 2 && !targets.is_empty() {
+                            if let Err(e) = sender.join_peers(targets.clone()).await {
+                                tracing::debug!(topic, error = %e, "relay-down re-join failed");
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            if relay_down_mode {
+                let msg = format!("relay back: {} connected after {}s on direct addresses", connected.join(", "), relay_down_since.map(|t| t.elapsed().as_secs()).unwrap_or(0));
+                tracing::info!("{msg}");
+                crate::alerts::notify("relay-down", msg, true);
+            }
+            relay_down_since = None;
+            relay_down_mode = false;
+        }
         for (topic, sender) in senders.iter().enumerate() {
             if node.peers.neighbors_on(topic) > 0 {
                 continue;
@@ -417,10 +470,20 @@ pub const FINALITY_VOTES_PER_MESSAGE: usize = 8;
 /// SHIP-35: vote for every new tip with our active delegate keys (any source: forged, gossip, legacy port); the vote is
 /// re-sent once a slot later while the block is not yet certified, so late neighbours still collect it.
 async fn publish_finality(node: Arc<super::IrohNode>, sender: GossipSender, storage: Arc<Storage>) {
+    // event-driven like `publish_blocks`: the vote leaves within milliseconds of the block being applied; the 500 ms tick
+    // remains for the one-slot-later resend and as a safety net
+    let mut events = storage.subscribe_chain();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     let mut voted: Option<(u64, String, std::time::Instant, bool)> = None;
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            ev = events.recv() => {
+                if matches!(ev, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                    return;
+                }
+            }
+        }
         let Ok(Some(tip)) = storage.get_last_block() else { continue };
         let Some(id) = tip.id.clone() else { continue };
         let keys = node.forging_keys.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -491,9 +554,22 @@ async fn sync_finality(node: Arc<super::IrohNode>, storage: Arc<Storage>) {
 /// Publish blocks that advanced our tip from non-gossip sources (legacy port, own forging).
 async fn publish_blocks(sender: GossipSender, storage: Arc<Storage>, peers: Arc<super::IrohPeers>, seen: Arc<Mutex<Seen>>) {
     let mut last = storage.get_last_height().unwrap_or(0);
+    // event-driven: a block applied here (forged, legacy push/pull) is on the wire within milliseconds instead of
+    // waiting for the next 2 s poll (the poll stays as a safety net)
+    let mut events = storage.subscribe_chain();
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            ev = events.recv() => {
+                match ev {
+                    Ok(crate::storage::ChainEvent::Applied(_)) => {}
+                    Ok(crate::storage::ChainEvent::RolledBack { height }) => { last = last.min(height); continue; }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
         let tip = storage.get_last_height().unwrap_or(last);
         if tip <= last {
             continue;

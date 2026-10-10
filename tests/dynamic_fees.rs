@@ -56,12 +56,14 @@ fn defaults_match_the_legacy_mainnet_policy() {
     assert_eq!(df.min_fee("transfer", 153, 3_000), 759_000);
     // unknown type = no addon; rate 0 behaves as 1 (legacy guard)
     assert_eq!(df.min_fee("nope", 10, 0), 10);
-    // type 5 (Netfory pointer): legacy key `ipfs`, node.yaml may spell it `ntfry`
+    // type 5 (Netfory pointer): node.yaml spells it `ntfry` (default), old configs `ipfs`; the pool asks by the legacy name
+    assert!(df.addon_bytes.contains_key("ntfry") && !df.addon_bytes.contains_key("ipfs"), "{:?}", df.addon_bytes);
     assert_eq!(df.min_fee("ipfs", 100, 3_000), (250 + 100) * 3_000);
-    let mut ntfry = df.clone();
-    ntfry.addon_bytes.remove("ipfs");
-    ntfry.addon_bytes.insert("ntfry".into(), 300);
-    assert_eq!(ntfry.min_fee("ipfs", 100, 3_000), (300 + 100) * 3_000);
+    let mut old = df.clone();
+    old.addon_bytes.remove("ntfry");
+    old.addon_bytes.insert("ipfs".into(), 300);
+    assert_eq!(old.min_fee("ipfs", 100, 3_000), (300 + 100) * 3_000);
+    assert_eq!((old.addon("ntfry"), old.addon_bytes_api()["ipfs"], old.addon_bytes_api()["ntfry"]), (300, 300, 300));
 }
 
 #[test]

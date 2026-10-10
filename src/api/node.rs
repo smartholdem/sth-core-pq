@@ -60,7 +60,7 @@ pub async fn configuration(State(st): State<Shared>) -> ApiResult {
     }
     let df = st.mempool.dynamic_fees();
     let dynamic_fees = if df.enabled {
-        json!({ "enabled": true, "minFeePool": df.min_fee_pool, "minFeeBroadcast": df.min_fee_broadcast, "addonBytes": df.addon_bytes })
+        json!({ "enabled": true, "minFeePool": df.min_fee_pool, "minFeeBroadcast": df.min_fee_broadcast, "addonBytes": df.addon_bytes_api() })
     } else {
         json!({ "enabled": false })
     };

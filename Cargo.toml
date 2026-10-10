@@ -1,6 +1,6 @@
 [package]
 name = "sth-core"
-version = "0.25.23"
+version = "0.25.41"
 edition = "2021"
 authors = ["TechnoL0g"]
 description = "SmartHoldem relay node core (Rust rewrite of @smartholdem/core)"
@@ -55,6 +55,7 @@ getrandom = "0.2"
 qrcode = { version = "0.14.1", default-features = false }
 iroh-mainline-address-lookup = "0.5.0"
 n0-mainline = "0.6.0"
+mimalloc = "0.1.52"
 
 [dev-dependencies]
 iroh = "1.1.0"
@@ -78,3 +79,4 @@ opt-level = 3
 # n0-computer/iroh#4509: unbounded pending_open_paths growth -> OOM on long-running nodes (still present in 1.2.0)
 [patch.crates-io]
 iroh = { path = "vendor/iroh" }
+iroh-gossip = { path = "vendor/iroh-gossip" }

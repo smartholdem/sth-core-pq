@@ -82,7 +82,7 @@ impl NodeContext {
         config.validate()?;
         let network = config.load_network()?;
         {
-            let label = if config.p2p.legacy_public_addr.trim().is_empty() { network.name.clone() } else { config.p2p.legacy_public_addr.trim().to_string() };
+            let label = crate::alerts::node_label(&config, &network.name);
             crate::alerts::init(&config.alerts, label);
             if crate::alerts::enabled() {
                 tracing::info!(telegram = !config.alerts.telegram_chat_id.is_empty(), webhook = !config.alerts.webhook_url.is_empty(), "operator alerts enabled");
@@ -111,7 +111,8 @@ impl NodeContext {
         .with_max_age_blocks(config.mempool.max_age_blocks)
         .with_rebroadcast_blocks(config.mempool.rebroadcast_blocks)
         .with_dynamic_fees(config.mempool.dynamic_fees.clone())
-        .with_legacy_dynamic_fees(config.mempool.legacy_dynamic_fees));
+        .with_legacy_dynamic_fees(config.mempool.legacy_dynamic_fees)
+        .with_antispam(config.mempool.antispam.clone()));
         Ok(Self { config, network, storage, mempool, peers, reward_address, iroh: None, forging: None, delegate_secrets })
     }
 
@@ -166,7 +167,11 @@ impl NodeContext {
             legacy_dynamic_fees: self.mempool.legacy_dynamic_fees(),
             wallet_api_url: self.iroh.as_ref().filter(|_| self.config.p2p.iroh.wallet_api.enabled).map(|n| n.wallet_api.api_url("sth-core")),
         };
-        crate::banner::print(&self.config, &self.network, &self.network.milestone(tip_height + 1), &facts);
+        let ms = self.network.milestone(tip_height + 1);
+        crate::banner::print(&self.config, &self.network, ms, &facts);
+        if crate::alerts::enabled() {
+            crate::alerts::notify("node-started", crate::banner::plain(&crate::banner::rows(&self.config, &self.network, ms, &facts)), true);
+        }
         Ok(())
     }
 
@@ -174,7 +179,16 @@ impl NodeContext {
     pub async fn run(mut self, flags: RunFlags) -> Result<()> {
         tokio::spawn(crate::ntp::check_clock("pool.ntp.org"));
         tokio::spawn(crate::mem::watchdog(std::time::Duration::from_secs(600)));
+        crate::mem::spawn_freeze_watchdog(self.config.freeze_abort_secs, self.config.alerts.clone(), crate::alerts::node_label(&self.config, &self.network.name));
         self.start_iroh().await?;
+        if let Some(iroh) = self.iroh.clone() {
+            let (p, f) = (iroh.peers.clone(), iroh.finality.clone());
+            crate::mem::gauge("iroh peers", move || p.len());
+            crate::mem::gauge("finality votes", move || f.votes_in_memory());
+            crate::mem::gauge("rpc pool", crate::p2p_iroh::rpc::pool_len);
+        }
+        let mp = self.mempool.clone();
+        crate::mem::gauge("mempool banned peers", move || mp.antispam().banned().len());
         let cfg = self.config.clone();
         let source = cfg.sync.bootstrap_snapshot.trim();
         if !source.is_empty() && (flags.force_bootstrap || self.storage.get_last_height()? == 0) {

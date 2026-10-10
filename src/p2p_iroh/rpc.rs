@@ -86,13 +86,56 @@ impl ProtocolHandler for RpcHandler {
     }
 }
 
-async fn call(endpoint: &Endpoint, peer: impl Into<EndpointAddr>, req: &Request) -> Result<Response> {
+/// Outgoing RPC connections, one per peer, reused across calls (a QUIC stream per request). Before, every call opened
+/// and closed a fresh connection: handshake + holepunching each time, the first packets always through the relay —
+/// forger probes every slot and the 60 s refresh kept the relays busy ("Dropping received relay packet").
+fn pool() -> &'static std::sync::Mutex<std::collections::HashMap<iroh::EndpointId, Connection>> {
+    static POOL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<iroh::EndpointId, Connection>>> = std::sync::OnceLock::new();
+    POOL.get_or_init(Default::default)
+}
+
+/// Pooled RPC connections (memory line gauge); closed ones are dropped here.
+pub fn pool_len() -> usize {
+    let mut p = pool().lock().unwrap_or_else(|e| e.into_inner());
+    p.retain(|_, c| c.close_reason().is_none());
+    p.len()
+}
+
+async fn connection(endpoint: &Endpoint, peer: EndpointAddr) -> Result<Connection> {
+    let id = peer.id;
+    let cached = pool().lock().unwrap_or_else(|e| e.into_inner()).get(&id).filter(|c| c.close_reason().is_none()).cloned();
+    if let Some(c) = cached {
+        return Ok(c);
+    }
     let conn = endpoint.connect(peer, ALPN).await.map_err(|e| Error::Sync(format!("iroh connect: {e}")))?;
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| Error::Sync(format!("iroh open_bi: {e}")))?;
+    pool().lock().unwrap_or_else(|e| e.into_inner()).insert(id, conn.clone());
+    Ok(conn)
+}
+
+/// "direct" / "relay" for the path a connection currently uses (metrics `peers[].path`).
+pub fn path_kind(conn: &Connection) -> Option<&'static str> {
+    let paths = conn.paths();
+    let selected = paths.iter().find(|p| p.is_selected()).or_else(|| paths.iter().next())?;
+    Some(if selected.is_relay() { "relay" } else { "direct" })
+}
+
+async fn call(endpoint: &Endpoint, peer: impl Into<EndpointAddr>, req: &Request) -> Result<Response> {
+    let peer: EndpointAddr = peer.into();
+    let id = peer.id;
+    let mut conn = connection(endpoint, peer.clone()).await?;
+    let streams = match conn.open_bi().await {
+        Ok(s) => s,
+        Err(_) => {
+            // stale pooled connection (idle timeout, peer restarted) → one fresh attempt
+            pool().lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            conn = connection(endpoint, peer).await?;
+            conn.open_bi().await.map_err(|e| Error::Sync(format!("iroh open_bi: {e}")))?
+        }
+    };
+    let (mut send, mut recv) = streams;
     send.write_all(&serde_json::to_vec(req)?).await.map_err(|e| Error::Sync(format!("iroh write: {e}")))?;
     send.finish().map_err(|e| Error::Sync(format!("iroh finish: {e}")))?;
     let raw = recv.read_to_end(MAX_RESPONSE_BYTES).await.map_err(|e| Error::Sync(format!("iroh read: {e}")))?;
-    conn.close(0u32.into(), b"done");
     let resp: Response = serde_json::from_slice(&raw)?;
     if let Response::Error { message } = &resp {
         return Err(Error::Sync(format!("iroh peer error: {message}")));
@@ -108,6 +151,9 @@ pub async fn fetch_status(endpoint: &Endpoint, peers: &IrohPeers, peer: impl Int
     match call(endpoint, peer, &Request::GetStatus).await {
         Ok(Response::Status { height, id: block_id, .. }) => {
             peers.record_rpc(id, Some(started.elapsed().as_millis() as u64), Some(height));
+            if let Some(kind) = pool().lock().unwrap_or_else(|e| e.into_inner()).get(&id).and_then(path_kind) {
+                peers.set_path(id, kind);
+            }
             Ok((height, block_id))
         }
         Ok(_) => Err(Error::Sync("unexpected iroh response".into())),

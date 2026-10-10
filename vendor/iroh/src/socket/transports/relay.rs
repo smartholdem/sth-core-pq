@@ -51,7 +51,9 @@ impl RelayTransport {
     pub(crate) fn new(config: RelayActorConfig, cancel_token: CancellationToken) -> Self {
         let (relay_datagram_send_tx, relay_datagram_send_rx) = mpsc::channel(256);
 
-        let (relay_datagram_recv_tx, relay_datagram_recv_rx) = mpsc::channel(512);
+        // sth-core patch: 512 overflowed in bursts on busy relays (hundreds of "no available capacity" drops per second,
+        // each a QUIC loss + retransmit through the relay); 4096 datagrams ≈ 6 MB worst case
+        let (relay_datagram_recv_tx, relay_datagram_recv_rx) = mpsc::channel(4096);
 
         let (actor_sender, actor_receiver) = mpsc::channel(256);
 

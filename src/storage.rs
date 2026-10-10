@@ -641,7 +641,7 @@ pub struct Storage {
 }
 
 /// `Storage::audit_all` result: every stored wallet compared with the state recomputed from the whole chain.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainAudit {
     pub height: u64,
@@ -697,7 +697,7 @@ pub enum ChainEvent {
 }
 
 /// `Storage::audit_wallet` result.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WalletAudit {
     pub address: String,
@@ -1910,7 +1910,7 @@ impl Storage {
             self.audit_tx(&mut acc, &tx, Some(address))?;
         }
         let mut a = acc.remove(address).unwrap_or_default();
-        self.audit_finish(&mut a, address, tip, false)?;
+        self.audit_finish(&mut a, address, tip, false, self.get_wallet(address)?);
         Ok(a)
     }
 
@@ -1918,10 +1918,73 @@ impl Storage {
     /// (`sth-core audit-all`). Generator fees / rewards and TokenInit burns are reconstructed, so delegates are compared
     /// too. `progress(height)` is called every 10 000 blocks.
     pub fn audit_all(&self, mut progress: impl FnMut(u64)) -> Result<ChainAudit> {
-        let net = self.network.pubkey_hash;
         let tip = self.get_last_height()?;
         let mut acc: HashMap<String, WalletAudit> = HashMap::new();
-        for item in self.tree.scan_prefix(PREFIX_BLOCK) {
+        self.audit_scan(&mut acc, 0, tip, &mut progress)?;
+        self.audit_compare(acc, tip)
+    }
+
+    /// `audit_all` on a RUNNING node: the long chain walk happens without any lock (blocks keep being applied), then
+    /// `apply_lock` is held only for a short tail: the full wallet comparison runs unlocked too (blocks applied meanwhile
+    /// can only produce false positives), then under the lock the blocks applied since the anchor are booked and ONLY the
+    /// candidates (unlocked drift + wallets touched by those blocks) are re-compared; with `fix` they are repaired there
+    /// (`repair_wallet_locked` keeps `dv:` in step; the full index rebuild runs only when something was repaired).
+    /// Aborts when the anchor block changed under us (fork rollback during the scan). Returns the report and the number
+    /// of repaired wallets.
+    pub fn audit_all_live(&self, fix: bool, mut progress: impl FnMut(u64)) -> Result<(ChainAudit, usize)> {
+        let anchor_height = self.get_last_height()?;
+        let anchor_id = self.get_block_by_height(anchor_height)?.and_then(|b| b.id);
+        let mut acc: HashMap<String, WalletAudit> = HashMap::new();
+        self.audit_scan(&mut acc, 0, anchor_height, &mut progress)?;
+        let unlocked = self.audit_compare(acc.clone(), anchor_height)?;
+        let mut candidates: Vec<String> = unlocked.drifted.iter().map(|a| a.address.clone()).collect();
+
+        let _guard = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.get_block_by_height(anchor_height)?.and_then(|b| b.id) != anchor_id {
+            return Err(Error::Sync(format!("chain reorganized during the audit (block {anchor_height} changed) — run it again")));
+        }
+        let tip = self.get_last_height()?;
+        let mut tail: HashMap<String, WalletAudit> = HashMap::new();
+        self.audit_scan(&mut tail, anchor_height + 1, tip, &mut progress)?;
+        for (address, t) in tail {
+            if !candidates.contains(&address) {
+                candidates.push(address.clone());
+            }
+            let a = acc.entry(address).or_default();
+            a.computed_nonce = a.computed_nonce.max(t.computed_nonce);
+            a.computed_balance += t.computed_balance;
+            a.sent += t.sent;
+            a.received += t.received;
+            a.forged += t.forged;
+            a.skipped += t.skipped;
+        }
+        let mut out = ChainAudit { height: tip, wallets: unlocked.wallets, checked: unlocked.checked, skipped: unlocked.skipped, drifted: Vec::new() };
+        for address in candidates {
+            let Some(stored) = self.get_wallet(&address)? else { continue };
+            let mut a = acc.remove(&address).unwrap_or_default();
+            self.audit_finish(&mut a, &address, tip, true, Some(stored));
+            if a.skipped == 0 && (!a.nonce_ok || !a.balance_ok) {
+                out.drifted.push(a);
+            }
+        }
+        let mut repaired = 0;
+        if fix && !out.drifted.is_empty() {
+            for a in &out.drifted {
+                self.repair_wallet_locked(a)?;
+                repaired += 1;
+            }
+            self.rebuild_vote_index()?;
+        }
+        Ok((out, repaired))
+    }
+
+    /// Book blocks `from..=to` (by height) into the audit accumulator; `progress(height)` every 10 000 blocks.
+    fn audit_scan(&self, acc: &mut HashMap<String, WalletAudit>, from: u64, to: u64, progress: &mut impl FnMut(u64)) -> Result<()> {
+        if from > to {
+            return Ok(());
+        }
+        let net = self.network.pubkey_hash;
+        for item in self.tree.range(height_key(from)..=height_key(to)) {
             let (_, v) = item?;
             let block = self.decode(&v)?;
             let ms = self.network.milestone(block.height);
@@ -1935,17 +1998,25 @@ impl Storage {
             g.computed_balance += i128::from(block.reward) + i128::from(block.total_fee) - i128::from(burned);
             g.forged += 1;
             for tx in &block.transactions {
-                self.audit_tx(&mut acc, tx, None)?;
+                self.audit_tx(acc, tx, None)?;
             }
             if block.height % 10_000 == 0 {
                 progress(block.height);
             }
         }
+        Ok(())
+    }
+
+    /// Compare every stored wallet with the accumulator (one pass over `w:`).
+    fn audit_compare(&self, mut acc: HashMap<String, WalletAudit>, tip: u64) -> Result<ChainAudit> {
         let mut out = ChainAudit { height: tip, ..Default::default() };
-        for w in self.all_wallets()? {
+        for item in self.tree.scan_prefix(PREFIX_WALLET) {
+            let (_, v) = item?;
+            let w: WalletState = serde_json::from_slice(&v)?;
             out.wallets += 1;
             let mut a = acc.remove(&w.address).unwrap_or_default();
-            self.audit_finish(&mut a, &w.address, tip, true)?;
+            let address = w.address.clone();
+            self.audit_finish(&mut a, &address, tip, true, Some(w));
             if a.skipped > 0 {
                 out.skipped += 1;
                 continue;
@@ -2036,8 +2107,7 @@ impl Storage {
         Ok(())
     }
 
-    fn audit_finish(&self, a: &mut WalletAudit, address: &str, tip: u64, full_chain: bool) -> Result<()> {
-        let stored = self.get_wallet(address)?;
+    fn audit_finish(&self, a: &mut WalletAudit, address: &str, tip: u64, full_chain: bool, stored: Option<WalletState>) {
         a.address = address.to_string();
         a.height = tip;
         a.stored_nonce = stored.as_ref().map(|w| w.nonce);
@@ -2047,7 +2117,6 @@ impl Storage {
         let comparable = (full_chain || !a.delegate) && a.skipped == 0;
         a.nonce_ok = a.stored_nonce.unwrap_or(0) == a.computed_nonce;
         a.balance_ok = !comparable || i128::from(a.stored_balance.unwrap_or(0)) == a.computed_balance;
-        Ok(())
     }
 
     /// Persist the outcome of an `audit-all` run / read the last one (metrics page "state audit" card).
@@ -2066,9 +2135,13 @@ impl Storage {
     /// Overwrite nonce / balance with the audited values (operator repair after `audit_wallet` reports drift). The vote
     /// index of the wallet's delegate follows the balance change.
     pub fn repair_wallet(&self, audit: &WalletAudit) -> Result<()> {
+        let _guard = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.repair_wallet_locked(audit)
+    }
+
+    fn repair_wallet_locked(&self, audit: &WalletAudit) -> Result<()> {
         let balance = i64::try_from(audit.computed_balance).map_err(|_| Error::Sync(format!("audited balance {} out of range", audit.computed_balance)))?;
         let key = prefixed(PREFIX_WALLET, &audit.address);
-        let _guard = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.tree
             .transaction(|t| {
                 let previous: Option<WalletState> = match t.get(&key)? {

@@ -34,6 +34,8 @@ pub struct LegacyServer {
 
 /// Plugin key legacy peers use for the public REST API port.
 pub const CORE_API_PLUGIN: &str = "@arkecosystem/core-api";
+/// Legacy `transactionPool.maxTransactionsPerRequest`.
+const MAX_POST_TRANSACTIONS: usize = 40;
 /// Marker plugin: lets PQ Nodes recognise each other in `getStatus` (legacy ignores unknown plugin keys).
 pub const CORE_PQ_PLUGIN: &str = "@smartholdem/core-pq";
 
@@ -82,7 +84,9 @@ impl LegacyServer {
     }
 
     async fn handle_connection(&self, stream: tokio::net::TcpStream, remote: SocketAddr) -> Result<()> {
-        let mut ws = tokio_tungstenite::accept_async(stream).await.map_err(|e| Error::Sync(format!("ws accept: {e}")))?;
+        // legacy core-p2p `maxPayload` = 20 MiB; tungstenite's default 64 MiB would let one peer pin that much memory
+        let ws_cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig { max_message_size: Some(20 << 20), max_frame_size: Some(20 << 20), ..Default::default() };
+        let mut ws = tokio_tungstenite::accept_async_with_config(stream, Some(ws_cfg)).await.map_err(|e| Error::Sync(format!("ws accept: {e}")))?;
         tracing::debug!(peer = %remote, "legacy inbound connection");
         while let Some(msg) = ws.next().await {
             let data = match msg.map_err(|e| Error::Sync(format!("ws: {e}")))? {
@@ -242,6 +246,11 @@ impl LegacyServer {
         let net = self.storage.network();
         let (mut block, header_len) = crate::crypto::deserialize_block_header_prefix(bytes, net)?;
         let n = block.number_of_transactions as usize;
+        // header claims come from the wire: bound them before any allocation (4 length bytes per tx at least)
+        let max_tx = net.milestone(block.height).max_transactions() as usize;
+        if n > max_tx || n > bytes.len().saturating_sub(header_len) / 4 {
+            return Err(Error::Sync(format!("postBlock: implausible transaction count {n} (max {max_tx}, {} payload bytes)", bytes.len())));
+        }
         let mut off = header_len;
         let mut lens = Vec::with_capacity(n);
         for _ in 0..n {
@@ -311,11 +320,15 @@ impl LegacyServer {
 
     async fn post_transactions(&self, payload: &[u8], remote: SocketAddr) -> Result<Vec<u8>> {
         let req = PostTransactionsRequest::decode(payload).map_err(|e| Error::Sync(format!("postTransactions request: {e}")))?;
+        // legacy core caps a request at 40 transactions; more is a flood (ML-DSA verification costs CPU)
+        if req.transactions.len() > MAX_POST_TRANSACTIONS {
+            return Err(Error::Sync(format!("postTransactions: {} transactions in one request (max {MAX_POST_TRANSACTIONS})", req.transactions.len())));
+        }
         let mut txs = Vec::with_capacity(req.transactions.len());
         for raw in &req.transactions {
             txs.push(deserialize_transaction(raw)?);
         }
-        let (resp, errors) = self.mempool.add_many(txs).await;
+        let (resp, errors) = self.mempool.add_many_from(txs, &crate::antispam::TxOrigin::LegacyPeer(remote.ip().to_string())).await;
         let duplicates = errors.values().filter(|e| e.type_ == "ERR_DUPLICATE").count();
         if resp.accept.is_empty() && duplicates == resp.invalid.len() {
             tracing::debug!(peer = %remote.ip(), duplicates, "transactions received over legacy P2P: all already in the pool");

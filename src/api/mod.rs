@@ -5,6 +5,7 @@
 //! Every resource is served in the legacy "transformed" shape; `?transform=false` returns raw core objects.
 //! Resources live in one module each: `node`, `blocks`, `transactions`, `wallets`, `delegates`, `locks`.
 
+pub mod audit;
 mod blocks;
 mod delegates;
 mod sobj;
@@ -52,12 +53,14 @@ pub struct AppState {
     wallets_cache: Mutex<Option<(u64, Arc<Vec<crate::storage::WalletState>>)>>,
     /// Closed calendar days of `/api/node/fees?groupBy=day` (unix day start → bucket); past days never change.
     pub(crate) fee_days_cache: Mutex<std::collections::HashMap<i64, Value>>,
+    /// Live `audit-all` job (`/api/ntfry/audit`, loopback only).
+    pub audit_job: audit::SharedJob,
 }
 
 impl AppState {
     pub fn new(storage: Arc<Storage>, mempool: Arc<Mempool>, peers: Vec<String>) -> Self {
         let network = storage.network().clone();
-        Self { storage, mempool, network, peers, peer_table: None, iroh: None, forging: None, started: Instant::now(), page_metrics: false, cors_origins: Vec::new(), delegates_cache: Mutex::new(None), wallets_cache: Mutex::new(None), fee_days_cache: Mutex::new(Default::default()) }
+        Self { storage, mempool, network, peers, peer_table: None, iroh: None, forging: None, started: Instant::now(), page_metrics: false, cors_origins: Vec::new(), delegates_cache: Mutex::new(None), wallets_cache: Mutex::new(None), fee_days_cache: Mutex::new(Default::default()), audit_job: Default::default() }
     }
 
     pub fn with_cors_origins(mut self, origins: Vec<String>) -> Self {
@@ -188,6 +191,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/ntfry/finality", get(ntfry::finality))
         .route("/api/ntfry/tokens", get(ntfry::tokens))
         .route("/api/ntfry/market", get(ntfry::market))
+        .route("/api/ntfry/audit", get(audit::status).post(audit::start))
         .route("/api/blockchain", get(node::blockchain))
         .route("/api/node/status", get(node::status))
         .route("/api/node/syncing", get(node::syncing))

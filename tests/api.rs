@@ -453,3 +453,51 @@ async fn wallet_search_matches_address_username_and_public_key_prefixes() {
     let (_, r) = get(&base, "/api/wallets/search?q=zzzz").await;
     assert_eq!(r["meta"]["count"], 0);
 }
+
+/// Live `audit-all` on a running node: `POST /api/ntfry/audit?fix=true` (loopback only) runs the job in the background,
+/// `GET /api/ntfry/audit` shows progress / result, the CLI client (`audit_client::run`) follows it and returns the exit
+/// code; the summary lands in `node.lastAudit`. Proxied requests are refused.
+#[tokio::test]
+async fn live_audit_job_repairs_drift_and_reports_through_the_api() {
+    let (base, storage) = spawn_api().await;
+    // no job yet
+    let (status, v) = get(&base, "/api/ntfry/audit").await;
+    assert_eq!(status, 200);
+    assert_eq!(v["data"]["running"], false);
+    assert!(v["data"]["result"].is_null());
+
+    // reverse-proxy headers → refused even from loopback
+    let client = reqwest::Client::new();
+    let r = client.post(format!("{base}/api/ntfry/audit")).header("x-forwarded-for", "8.8.8.8").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+
+    // drift the recipient and run with fix through the CLI client
+    storage.update_wallet_state(RECIPIENT, -1_000, 3).unwrap();
+    let before = storage.get_wallet(RECIPIENT).unwrap().unwrap();
+    assert!(sth_core::audit_client::reachable(&base).await);
+    let code = sth_core::audit_client::run(&base, true, true).await.unwrap();
+    assert_eq!(code, 0, "drift repaired → 0");
+    let after = storage.get_wallet(RECIPIENT).unwrap().unwrap();
+    assert_eq!(after.nonce, before.nonce - 3);
+    assert_eq!(after.balance, before.balance + 1_000);
+
+    let (_, v) = get(&base, "/api/ntfry/audit").await;
+    let job = &v["data"];
+    assert_eq!(job["running"], false);
+    assert_eq!(job["fix"], true);
+    assert!(job["repaired"].as_u64().unwrap() >= 1, "{job}");
+    assert!(job["result"]["drifted"].as_array().unwrap().iter().any(|d| d["address"] == RECIPIENT), "{job}");
+    assert!(job["error"].is_null());
+    let (_, m) = get(&base, "/api/ntfry/metrics").await;
+    assert_eq!(m["data"]["node"]["lastAudit"]["fixed"], true);
+    assert_eq!(m["data"]["node"]["lastAudit"]["height"], job["result"]["height"]);
+
+    // drift again, run without fix → reported, not touched, exit 2
+    storage.update_wallet_state(RECIPIENT, -1_000, 3).unwrap();
+    let code = sth_core::audit_client::run(&base, false, true).await.unwrap();
+    assert_eq!(code, 2);
+    let (_, v) = get(&base, "/api/ntfry/audit").await;
+    assert_eq!(v["data"]["fix"], false);
+    assert!(v["data"]["result"]["drifted"].as_array().unwrap().iter().any(|d| d["address"] == RECIPIENT), "{}", v["data"]);
+    assert_eq!(storage.get_wallet(RECIPIENT).unwrap().unwrap().nonce, after.nonce + 3, "no --fix → untouched");
+}
