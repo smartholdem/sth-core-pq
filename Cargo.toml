@@ -1,6 +1,6 @@
 [package]
 name = "sth-core"
-version = "0.25.41"
+version = "0.25.48"
 edition = "2021"
 authors = ["TechnoL0g"]
 description = "SmartHoldem relay node core (Rust rewrite of @smartholdem/core)"

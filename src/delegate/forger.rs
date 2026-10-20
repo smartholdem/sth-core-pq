@@ -20,6 +20,13 @@ struct PeerView {
     ip: String,
     height: u64,
     id: String,
+    iroh_id: Option<iroh::EndpointId>,
+}
+
+/// Minority rule: `ahead` peers (strictly fewer than a third of the responders) sit one block above us while `same`
+/// peers — a full quorum (`needed`) — confirm our tip.
+pub fn minority_rule(ahead: usize, same: usize, responders: usize, needed: usize) -> bool {
+    ahead > 0 && ahead * 3 < responders && same >= needed
 }
 
 #[derive(Clone)]
@@ -33,13 +40,16 @@ pub struct ForgerOptions {
     /// Absolute minimum of peers that must agree with our tip (guards against forging alone while
     /// isolated: one or two of our own iroh nodes echoing our tip is not a network).
     pub min_quorum_peers: usize,
+    /// Forge on our tip when only a minority (< 1/3) of the peers is ahead and their block cannot be pulled (see
+    /// `DelegateConfig::forge_over_minority`).
+    pub forge_over_minority: bool,
     /// iroh layer whose peers take part in the quorum next to the legacy ones.
     pub iroh: Option<Arc<crate::p2p_iroh::IrohNode>>,
 }
 
 impl Default for ForgerOptions {
     fn default() -> Self {
-        Self { broadcast_fanout: 6, max_lag: 1, quorum_share: 0.5, min_quorum_peers: 3, iroh: None }
+        Self { broadcast_fanout: 6, max_lag: 1, quorum_share: 0.5, min_quorum_peers: 3, forge_over_minority: true, iroh: None }
     }
 }
 
@@ -157,7 +167,7 @@ impl Forger {
                 })
                 .await;
                 match res {
-                    Ok(Ok(status)) => status.state.map(|st| PeerView { ip, height: st.height as u64, id: st.header.map(|h| h.id).unwrap_or_default() }),
+                    Ok(Ok(status)) => status.state.map(|st| PeerView { ip, height: st.height as u64, id: st.header.map(|h| h.id).unwrap_or_default(), iroh_id: None }),
                     _ => None,
                 }
             }));
@@ -166,7 +176,7 @@ impl Forger {
             for id in node.peers.snapshot().into_iter().filter(|p| p.failures < 3).map(|p| p.id).take(count) {
                 probes.push(Box::pin(async move {
                     match tokio::time::timeout(Duration::from_secs(4), crate::p2p_iroh::fetch_status(&node.endpoint, &node.peers, id)).await {
-                        Ok(Ok((height, block_id))) => Some(PeerView { ip: format!("iroh:{}", id.fmt_short()), height, id: block_id.unwrap_or_default() }),
+                        Ok(Ok((height, block_id))) => Some(PeerView { ip: format!("iroh:{}", id.fmt_short()), height, id: block_id.unwrap_or_default(), iroh_id: Some(id) }),
                         _ => None,
                     }
                 }));
@@ -186,7 +196,10 @@ impl Forger {
     }
 
     /// Wait (until `deadline`) for the local tip to match the network majority; returns the tip to build on.
-    async fn wait_for_quorum(&self, deadline: Instant) -> std::result::Result<crate::models::Block, String> {
+    /// `mid_slot`: from this instant on the minority rule may apply (see `minority_rule`).
+    async fn wait_for_quorum(&self, deadline: Instant, mid_slot: Instant) -> std::result::Result<crate::models::Block, String> {
+        let mut pulled_for = 0u64;
+        let mut pull_failed_for = 0u64;
         loop {
             let tip = self.storage.get_last_block().ok().flatten().ok_or("empty database")?;
             // early exit: enough peers (counted against everyone we asked, so silent peers never relax the bar) agree
@@ -217,6 +230,31 @@ impl Forger {
             if max_h <= tip.height && same >= needed {
                 return Ok(tip);
             }
+            // peers are a block or two ahead (the previous slot's block has not reached us yet): pull it from them now
+            // instead of waiting for the follow loop — one attempt per height, within the slot
+            if max_h > tip.height && max_h - tip.height <= 3 && pulled_for != max_h && Instant::now() < deadline {
+                pulled_for = max_h;
+                if self.pull_ahead(&views, tip.height, max_h).await {
+                    continue;
+                }
+                pull_failed_for = max_h;
+            }
+            // minority rule: the block ahead exists on a few peers only and even they could not hand it to us — the
+            // network majority is on our tip, so the previous slot counts as missed and we forge (from mid-slot on,
+            // leaving time for our block to spread)
+            if self.opts.forge_over_minority && max_h > tip.height && pull_failed_for == max_h && Instant::now() >= mid_slot {
+                let ahead = views.iter().filter(|v| v.height > tip.height).count();
+                if minority_rule(ahead, same, views.len(), needed) {
+                    let who: Vec<String> = views.iter().filter(|v| v.height > tip.height).map(|v| format!("{}={}", v.ip, v.height)).collect();
+                    tracing::warn!(
+                        "Forging over a minority: {ahead} of {} peers report height {max_h} [{}] but their block could not be pulled; {same} peers confirm our tip {} — the previous slot counts as missed",
+                        views.len(),
+                        who.join(", "),
+                        tip.height
+                    );
+                    return Ok(tip);
+                }
+            }
             if Instant::now() >= deadline {
                 let heights: Vec<String> = views.iter().map(|v| format!("{}={}", v.ip, v.height)).collect();
                 if views.len() < self.opts.min_quorum_peers {
@@ -239,6 +277,30 @@ impl Forger {
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
+    }
+
+    /// Pull the block(s) peers report above our tip from one of them (iroh first, then legacy); `true` when the tip moved.
+    async fn pull_ahead(&self, views: &[PeerView], tip_height: u64, target: u64) -> bool {
+        let ahead: Vec<&PeerView> = views.iter().filter(|v| v.height > tip_height).collect();
+        for v in ahead.iter().filter(|v| v.iroh_id.is_some()).chain(ahead.iter().filter(|v| v.iroh_id.is_none())).take(3) {
+            let res = match (v.iroh_id, &self.opts.iroh) {
+                (Some(id), Some(node)) => tokio::time::timeout(Duration::from_secs(3), crate::p2p_iroh::fill_gap_from(node, &self.storage, id, target, true))
+                    .await
+                    .map_err(|_| "timeout".to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string())),
+                (Some(_), None) => continue,
+                (None, _) => crate::p2p_legacy::follow::pull_gap_from(&self.storage, &self.peers, &v.ip, target, true).await.map_err(|e| e.to_string()),
+            };
+            match res {
+                Ok(t) if t.height > tip_height => {
+                    tracing::info!(peer = %v.ip, height = t.height, "previous slot's block pulled from a peer ahead before forging");
+                    return true;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(peer = %v.ip, error = %e, "pull from peer ahead failed"),
+            }
+        }
+        false
     }
 
     fn record_skip(&self, slot: u64, delegate: &str, reason: String) {
@@ -375,7 +437,9 @@ impl Forger {
         let slot_end = slot_start(slot + 1, blocktime);
         let remaining = (slot_end as i64 - network.now_epoch() as i64).max(1) as u64;
         let deadline = Instant::now() + Duration::from_secs(remaining.saturating_sub(2).max(1));
-        let tip = match self.wait_for_quorum(deadline).await {
+        // minority rule may apply from mid-slot on: our block still has half a slot to reach everyone
+        let mid_slot = Instant::now() + Duration::from_secs(remaining.saturating_sub(u64::from(blocktime) / 2));
+        let tip = match self.wait_for_quorum(deadline, mid_slot).await {
             Ok(tip) => tip,
             Err(reason) => {
                 tracing::warn!("Skipping slot {slot} for delegate {name}: {reason}");

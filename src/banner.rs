@@ -103,7 +103,7 @@ pub fn rows(cfg: &NodeConfig, network: &Network, ms: &Milestone, f: &Facts) -> V
     r.push(Switch("REST API", cfg.api.enabled, if cfg.api.enabled { format!("http://{}:{}/api · CORS origins {}", cfg.api.host, cfg.api.port, cfg.api.cors_origins.len()) } else { "off".into() }));
     let metrics = cfg.api.enabled && cfg.api.page_metrics;
     r.push(Switch("Metrics page", metrics, if !metrics { "off".into() } else if cfg.api.metrics_listen.trim().is_empty() { format!("http://{}:{}/", cfg.api.host, cfg.api.port) } else { format!("http://{}/", cfg.api.metrics_listen.trim()) }));
-    r.push(Switch("Delegate", f.forging_keys > 0, if f.forging_keys > 0 { format!("{} key(s) loaded{} · quorum {} of peers, min {}", f.forging_keys, if cfg.delegate.pq_secrets.is_empty() { "" } else { " + PQ" }, cfg.delegate.quorum_share, cfg.delegate.min_quorum_peers) } else { "relay only".into() }));
+    r.push(Switch("Delegate", f.forging_keys > 0, if f.forging_keys > 0 { format!("{} key(s) loaded{} · quorum {} of peers, min {}{}", f.forging_keys, if cfg.delegate.pq_secrets.is_empty() { "" } else { " + PQ" }, cfg.delegate.quorum_share, cfg.delegate.min_quorum_peers, if cfg.delegate.forge_over_minority { " · minority rule" } else { "" }) } else { "relay only".into() }));
     r.push(Switch("Service Nodes", ms.masternodes.enabled, if ms.masternodes.enabled { format!("SHIP-42 · collateral {}", sth(ms.masternodes.collateral_amount)) } else { "off until milestone".into() }));
     r.push(Switch("Token Market", ms.token_market.enabled, if ms.token_market.enabled { format!("SHIP-43 · max {} open orders", ms.token_market.max_open_orders) } else { "off until milestone".into() }));
     let alerts = crate::alerts::enabled();

@@ -102,7 +102,7 @@ fn tip_of(storage: &Storage) -> Result<ChainTip> {
 }
 
 /// Fetch one range from a peer (fresh connection: legacy peers reset the socket after a large reply).
-async fn fetch_range(table: &PeerTable, ip: &str, from: u64, limit: u32, timeout: Duration) -> std::result::Result<Vec<Block>, String> {
+pub(crate) async fn fetch_range(table: &PeerTable, ip: &str, from: u64, limit: u32, timeout: Duration) -> std::result::Result<Vec<Block>, String> {
     let started = Instant::now();
     let result = async {
         let mut peer = LegacyPeer::connect(ip, table.port(), timeout).await?;
@@ -136,6 +136,22 @@ async fn apply(storage: &Arc<Storage>, blocks: Vec<Block>, tip: ChainTip, verify
         .await
         .map_err(|e| Error::Sync(format!("apply task failed: {e}")))?
 }
+
+/// Pull the blocks between our tip and `target` from one legacy peer that claims to have them (a `postBlock` for
+/// tip+2, a getStatus one block ahead during the forging quorum) and apply them. Bounded to one small request.
+pub async fn pull_gap_from(storage: &Arc<Storage>, table: &PeerTable, ip: &str, target: u64, verify: bool) -> Result<ChainTip> {
+    let tip = tip_of(storage)?;
+    if target <= tip.height {
+        return Ok(tip);
+    }
+    let want = (target - tip.height).min(MAX_BLOCKS_PER_REQUEST as u64) as u32;
+    let blocks = fetch_range(table, ip, tip.height, want, Duration::from_secs(2)).await.map_err(Error::Sync)?;
+    let got = blocks.len();
+    let new_tip = apply(storage, blocks, tip, verify).await?;
+    tracing::info!(peer = ip, blocks = got, height = new_tip.height, "gap filled from legacy peer");
+    Ok(new_tip)
+}
+
 
 /// Range scheduler shared by the download workers: next range to fetch, ranges to retry,
 /// per-peer request spacing and the set of peers currently busy.
@@ -565,6 +581,13 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
                 }
                 Err(Error::StaleTip(msg)) => {
                     tracing::debug!(peer = ip, %msg, "blocks already applied by another intake path");
+                    just_fetched = true;
+                }
+                Err(Error::FutureBlock(msg)) => {
+                    // the peer accepted a block whose slot has not started (older node / same forger clock): retry
+                    // after a second instead of parking the peer — it becomes valid once the slot starts
+                    tracing::debug!(peer = ip, %msg, "future block not applied yet");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     just_fetched = true;
                 }
                 Err(e) => {

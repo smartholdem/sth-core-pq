@@ -77,6 +77,17 @@ pub fn evaluate(m: &Value, now_unix: i64) -> Vec<Check> {
     let age = chain["lastBlockAge"].as_i64().unwrap_or(0);
     out.push(check(if age > 10 * bt { Level::Fail } else if age > 3 * bt { Level::Warn } else { Level::Ok }, "last block", format!("{} ago (slot {bt}s)", dur(age))));
 
+    // system clock: NTP probe (every 10 min) + the earliest block arrival (a block before its slot start = our clock lags)
+    let clock = &m["clock"];
+    let skew = m["intake"]["clockSkewHintMs"].as_i64().unwrap_or(0);
+    match clock["offsetMs"].as_i64() {
+        Some(ms) if ms.abs() > crate::ntp::DRIFT_ALERT_MS => out.push(check(Level::Fail, "clock", format!("system clock {}ms {} NTP ({}) — enable time sync (chrony / timedatectl set-ntp true)", ms.abs(), if ms > 0 { "ahead of" } else { "behind" }, clock["server"].as_str().unwrap_or("?")))),
+        Some(ms) if skew > 500 => out.push(check(Level::Warn, "clock", format!("NTP offset {ms}ms but blocks arrive up to {skew}ms before their slot — a forger's clock runs ahead (not ours)"))),
+        Some(ms) => out.push(check(Level::Ok, "clock", format!("{ms}ms from NTP ({})", clock["server"].as_str().unwrap_or("?")))),
+        None if skew > 500 => out.push(check(Level::Warn, "clock", format!("NTP unreachable ({}) and blocks arrive up to {skew}ms before their slot start — system clock probably behind, enable time sync", clock["error"].as_str().unwrap_or("not probed yet")))),
+        None => out.push(check(if clock["error"].is_string() { Level::Warn } else { Level::Ok }, "clock", clock["error"].as_str().map(|e| format!("NTP probe failed: {e}")).unwrap_or_else(|| "NTP not probed yet".into()))),
+    }
+
     let legacy = &m["legacy"];
     if legacy["enabled"] == true {
         let alive = legacy["alive"].as_u64().unwrap_or(0);

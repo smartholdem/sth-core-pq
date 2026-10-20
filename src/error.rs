@@ -32,6 +32,10 @@ pub enum Error {
     /// The chain moved while a block was being applied (another intake path won the race); not a peer fault.
     #[error("stale tip: {0}")]
     StaleTip(String),
+    /// Block for a slot that has not started yet (legacy core: "Discarded block … because it takes a future slot").
+    /// The forger's clock is ahead; the block may become valid once its slot starts — not a peer fault.
+    #[error("block from the future: {0}")]
+    FutureBlock(String),
     #[error("config error: {0}")]
     Config(String),
 }

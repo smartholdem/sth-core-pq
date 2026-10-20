@@ -246,7 +246,7 @@ pub fn delegate_json(st: &AppState, w: &WalletState, votes: u64, rank: usize) ->
         "votes": votes.to_string(),
         "rank": rank,
         "isResigned": w.resigned,
-        "blocks": { "produced": w.produced_blocks, "last": last },
+        "blocks": { "produced": w.produced_blocks, "missed": w.public_key.as_deref().and_then(|pk| st.storage.missed_count(pk).ok()).unwrap_or(0), "last": last },
         "production": { "approval": approval },
         "forged": {
             "fees": w.forged_fees.to_string(),

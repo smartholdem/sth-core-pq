@@ -28,6 +28,8 @@ pub struct NodeConfig {
     /// Runtime freeze watchdog: abort (→ systemd restart) when the async runtime has not ticked for this many seconds
     /// (deadlock, swap thrash, disk stall — a frozen delegate misses every slot). 0 = never abort. Default 120.
     pub freeze_abort_secs: u64,
+    /// SNTP server probed at start and every 10 minutes (`/api/ntfry/metrics.clock`, `clock-drift` alert above 1 s).
+    pub ntp_server: String,
     pub api: ApiConfig,
     pub sync: SyncSection,
     pub p2p: P2pConfig,
@@ -102,6 +104,10 @@ pub struct DelegateConfig {
     /// Never forge with fewer than this many peers agreeing on our tip (default 3) — an isolated node
     /// must skip its slot instead of building a private fork.
     pub min_quorum_peers: usize,
+    /// Minority rule (default true): when a block the previous forger made reached only a few peers (< 1/3 of the
+    /// responders are ahead of us, the rest confirm our tip) and pulling it from them failed, forge on our tip from
+    /// mid-slot on instead of skipping the slot at the deadline. `false` = always wait for the whole network.
+    pub forge_over_minority: bool,
     /// Announce over iroh gossip (signed by the delegate key) that these delegates forge on a Rust node,
     /// so every metrics page can show "N of 21 delegates on Rust". Public keys are public anyway.
     pub announce: bool,
@@ -112,7 +118,7 @@ pub struct DelegateConfig {
 
 impl Default for DelegateConfig {
     fn default() -> Self {
-        Self { enabled: false, secrets: Vec::new(), secrets_file: String::new(), pq_secrets: Vec::new(), broadcast_fanout: 6, quorum_share: 0.5, min_quorum_peers: 3, announce: true, guard: DoubleForgeGuardConfig::default() }
+        Self { enabled: false, secrets: Vec::new(), secrets_file: String::new(), pq_secrets: Vec::new(), broadcast_fanout: 6, quorum_share: 0.5, min_quorum_peers: 3, forge_over_minority: true, announce: true, guard: DoubleForgeGuardConfig::default() }
     }
 }
 
@@ -180,8 +186,9 @@ pub struct P2pConfig {
     pub legacy_peers: Vec<String>,
     /// Load the published peers.json at start.
     pub use_peer_list: bool,
-    /// Inbound legacy P2P server, e.g. "0.0.0.0:4001" (gateway nodes with a public IP; also what a
-    /// netfory-provider `local_ws_url: ws://127.0.0.1:4001` endpoint proxies). Empty = disabled.
+    /// Inbound legacy P2P server — default "0.0.0.0:4001" (every PQ node with a public IP is a block source for the
+    /// others over the second transport; also what a netfory-provider `local_ws_url: ws://127.0.0.1:4001` proxies).
+    /// Empty = disabled (e.g. a node behind NAT without port forwarding).
     pub legacy_listen: String,
     /// Public address of our legacy port announced to Rust peers over iroh (`ip:4001`), e.g. for gateway nodes.
     pub legacy_public_addr: String,
@@ -279,7 +286,7 @@ pub struct DiscoveryConfig {
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
-        Self { enabled: true, listen_port: 0, external_addr: String::new(), announce_secs: 1800, expire_days: 30, max_entries: 2000, n0_dns: true, mainline: true, mainline_bootstrap: Vec::new(), mainline_port: 0, mainline_server: false }
+        Self { enabled: true, listen_port: 4004, external_addr: String::new(), announce_secs: 1800, expire_days: 30, max_entries: 2000, n0_dns: true, mainline: true, mainline_bootstrap: Vec::new(), mainline_port: 0, mainline_server: false }
     }
 }
 
@@ -425,6 +432,7 @@ impl Default for NodeConfig {
             network: "mainnet".into(),
             network_dir: String::new(),
             freeze_abort_secs: 120,
+            ntp_server: "pool.ntp.org".into(),
             db_path: "./data".into(),
             db_cache_mb: 64,
             startup_scan: true,
@@ -465,7 +473,7 @@ impl Default for P2pConfig {
             legacy_port: crate::p2p_legacy::DEFAULT_P2P_PORT,
             legacy_peers: Vec::new(),
             use_peer_list: true,
-            legacy_listen: String::new(),
+            legacy_listen: "0.0.0.0:4001".into(),
             legacy_public_addr: String::new(),
             parallel_peers: 4,
             relay_fanout: 20,
@@ -590,6 +598,8 @@ impl NodeConfig {
              #               the state is kept in sled incrementally; integrity is checked by `sth-core audit-all`, not at start.\n\
              # freeze_abort_secs: runtime freeze watchdog — an OS thread aborts the process (systemd restarts it) when the async\n\
              #          runtime has not ticked for this long (deadlock / swap thrash / disk stall). 0 = log only. Default 120.\n\
+             # ntp_server: SNTP host probed at start and every 10 min; a clock off by >1 s raises a clock-drift alert\n\
+             #          (negative slot delays on the metrics page = this machine's clock is behind the network).\n\
              # api:     local REST bridge for wallets / explorers / netfory-provider (keep host 127.0.0.1).\n\
              #          page_metrics: true serves the operator dashboard at http://host:port/ — or on its own address\n\
              #          with metrics_listen: \"0.0.0.0:4888\" (page + /api/ntfry/* only, safe to expose).\n\
@@ -598,7 +608,8 @@ impl NodeConfig {
              #          (`latest` downloads from https://snapshots.smartholdem.io/, a path imports a local dump, empty skips).\n\
              # p2p:     legacy_enabled follows the chain through port 4001 (IP peers) with parallel_peers ranges in flight;\n\
              #          relay_fanout peers receive every accepted transaction.\n\
-             #          GATEWAY node = legacy_listen: \"0.0.0.0:4001\" (inbound legacy server: old nodes and netfory-provider\n\
+             #          legacy_listen: \"0.0.0.0:4001\" (default) = inbound legacy server, the second block transport between PQ nodes\n\
+             #          (open TCP 4001); set \"\" behind NAT. GATEWAY node = legacy_listen + legacy_public_addr (netfory-provider\n\
              #          ws:// clients pull blocks from us) + legacy_public_addr: \"<public IP of THIS server>:4001\" (announced to\n\
              #          Rust peers over iroh; they show us with gateway: true in /api/ntfry/peers). Both must be set.\n\
              #          p2p.iroh enables the Web 4.0 layer\n\
@@ -611,7 +622,8 @@ impl NodeConfig {
              #          non-n1 relay from the map after max_failures (5) handshake timeouts within window_secs (600).\n\
              #          discovery (sthpq address book, enabled: true): nodes gossip signed dial records (EndpointId + public ip:port +\n\
              #          relay) and pull them over RPC / legacy port 4001, so peers are found without n0 DNS. Dead peers are forgotten\n\
-             #          after expire_days (30). Gateways: listen_port: 4004 (fixed UDP, open it) + external_addr: \"<public ip>:4004\";\n\
+             #          after expire_days (30). listen_port: 4004 (default, fixed UDP — OPEN IT in the firewall: stable direct dial\n\
+             #          info across restarts, relay-independent) + optional external_addr: \"<public ip>:4004\";\n\
              #          bootstrap entries may pin a direct address: \"<EndpointId>@<ip>:4004\". mainline: true publishes/resolves the\n\
              #          record in the BitTorrent Mainline DHT (BEP-44, as NETFORY clients do; mainline_bootstrap adds your seeders);\n\
              #          n0_dns: true keeps dns.iroh.link as a fallback — set false once the DHT is confirmed to drop n0 entirely.\n\
@@ -619,6 +631,8 @@ impl NodeConfig {
              #          Not the delegate's reward: block rewards always go to the forging delegate's wallet.\n\
              # delegate: forging module. enabled: true + secrets: [passphrase] (or secrets_file: ./delegates.json, legacy format).\n\
              #          min_quorum_peers (3): the slot is skipped unless that many peers confirm our tip — never forge while isolated.\n\
+             #          forge_over_minority (true): if < 1/3 of the peers are one block ahead (a block that did not spread) and it\n\
+             #          cannot be pulled from them, forge on our tip from mid-slot instead of skipping the slot.\n\
              #          announce (true): tell the network (signed) that these delegates run on Rust — counted on the metrics page.\n\
              #          Forging happens only when this delegate is in the active top-21 of the round; fees go to its wallet.\n\
              #          pq_secrets: [passphrase] = ML-DSA-44 key(s) registered on chain with `sth-cli pq-register` (Quantum Shield\n\

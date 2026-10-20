@@ -38,6 +38,10 @@ const PREFIX_TX_LIST: &[u8] = b"tl:";
 const PREFIX_WALLET_TX: &[u8] = b"wt:";
 const PREFIX_LOCK: &[u8] = b"lk:";
 const PREFIX_ROUND: &[u8] = b"rd:";
+/// Missed forging slots: `ms:<delegate public key>` → BE u64 total, `mb:<height BE>` → JSON `Vec<MissedSlot>` attributed
+/// while applying that height (so a rollback / re-apply at the height never double counts).
+const PREFIX_MISSED_TOTAL: &[u8] = b"ms:";
+const PREFIX_MISSED_AT: &[u8] = b"mb:";
 /// sthpq address book entries (`p2p_iroh::addrbook`), JSON per EndpointId hex.
 const PREFIX_ADDR: &[u8] = b"ab:";
 const PREFIX_UNDO: &[u8] = b"undo:";
@@ -288,6 +292,19 @@ pub struct DelegateRank {
     pub public_key: String,
     #[serde(with = "string_u64")]
     pub votes: u64,
+}
+
+/// A forging slot nobody filled (`Storage::missed_recent`): attributed to the delegate that owned it in the round order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissedSlot {
+    /// Height of the block that closed the gap (the missed block would have had this height).
+    pub height: u64,
+    pub slot: u64,
+    /// Slot start (chain epoch seconds).
+    pub timestamp: u32,
+    pub public_key: String,
+    pub username: Option<String>,
 }
 
 /// Last block forged by a delegate.
@@ -1548,6 +1565,80 @@ impl Storage {
         }
     }
 
+    fn missed_at_key(height: u64) -> Vec<u8> {
+        let mut k = PREFIX_MISSED_AT.to_vec();
+        k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    fn bump_missed_total(&self, public_key: &str, delta: i64) -> Result<()> {
+        self.tree.update_and_fetch(prefixed(PREFIX_MISSED_TOTAL, public_key), |old| {
+            let cur = old.and_then(|v| v.try_into().ok()).map(u64::from_be_bytes).unwrap_or(0) as i64;
+            let next = (cur + delta).max(0) as u64;
+            (next > 0).then(|| next.to_be_bytes().to_vec())
+        })?;
+        Ok(())
+    }
+
+    /// Slots skipped between the previous block and `block` (same round order as the forger: `rd:` snapshot + shuffle)
+    /// go on the account of the delegates that owned them. Gaps longer than one round are outages, not misses — not
+    /// attributed. A re-applied height was rolled back first (`rollback_last_block` drops its record) → no double count.
+    fn record_missed_slots(&self, prev_timestamp: u32, block: &Block) -> Result<()> {
+        use crate::delegate::round::{round_info, slot_number, slot_start};
+        let ms = self.network.milestone(block.height);
+        let (blocktime, n) = (ms.blocktime, u64::from(ms.active_delegates).max(1));
+        let (prev_slot, cur_slot) = (slot_number(prev_timestamp, blocktime), slot_number(block.timestamp, blocktime));
+        if cur_slot <= prev_slot + 1 || cur_slot - prev_slot - 1 > n {
+            return Ok(());
+        }
+        let Some(order) = crate::delegate::round::forging_order(self, round_info(block.height, n).round, n as usize)? else { return Ok(()) };
+        let mut list = Vec::new();
+        for slot in prev_slot + 1..cur_slot {
+            let pk = &order[(slot % n) as usize].public_key;
+            let username = crate::crypto::address_from_public_key(pk, self.network.pubkey_hash).ok().and_then(|a| self.get_wallet(&a).ok().flatten()).and_then(|w| w.username);
+            self.bump_missed_total(pk, 1)?;
+            list.push(MissedSlot { height: block.height, slot, timestamp: slot_start(slot, blocktime), public_key: pk.clone(), username });
+        }
+        self.tree.insert(Self::missed_at_key(block.height), serde_json::to_vec(&list)?)?;
+        Ok(())
+    }
+
+    fn drop_missed_at(&self, height: u64) -> Result<()> {
+        if let Some(v) = self.tree.remove(Self::missed_at_key(height))? {
+            let list: Vec<MissedSlot> = serde_json::from_slice(&v)?;
+            for m in list {
+                self.bump_missed_total(&m.public_key, -1)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Total slots a delegate missed since this index exists (0.25.47+ nodes; history before that is not counted).
+    pub fn missed_count(&self, public_key: &str) -> Result<u64> {
+        Ok(self.tree.get(prefixed(PREFIX_MISSED_TOTAL, public_key))?.and_then(|v| v.as_ref().try_into().ok()).map(u64::from_be_bytes).unwrap_or(0))
+    }
+
+    /// Latest missed slots, newest first.
+    pub fn missed_recent(&self, limit: usize) -> Result<Vec<MissedSlot>> {
+        let mut out = Vec::new();
+        for item in self.tree.scan_prefix(PREFIX_MISSED_AT).rev() {
+            let (_, v) = item?;
+            let mut list: Vec<MissedSlot> = serde_json::from_slice(&v)?;
+            list.reverse();
+            out.extend(list);
+            if out.len() >= limit {
+                out.truncate(limit);
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Height at which the missed-slot index starts (oldest `mb:` record), `None` when nothing was missed yet.
+    pub fn missed_since(&self) -> Result<Option<u64>> {
+        Ok(self.tree.scan_prefix(PREFIX_MISSED_AT).next().transpose()?.and_then(|(k, _)| k.get(PREFIX_MISSED_AT.len()..).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes)))
+    }
+
     /// Address book (`ab:<id hex>`): best effort, a failed write only costs a re-discovery after restart.
     pub fn save_addr_entry(&self, id_hex: &str, json: &[u8]) {
         if let Err(e) = self.tree.insert([PREFIX_ADDR, id_hex.as_bytes()].concat(), json) {
@@ -1701,6 +1792,16 @@ impl Storage {
         self.bump();
         if let Some((last, _)) = prepared.last() {
             self.snapshot_round_if_boundary(last.height)?;
+        }
+        // missed-slot statistics (never fail a block apply over them)
+        let mut prev_ts = if prepared[0].0.height > 1 { self.get_block_by_height(prepared[0].0.height - 1).ok().flatten().map(|b| b.timestamp) } else { None };
+        for (block, _) in &prepared {
+            if let Some(p) = prev_ts {
+                if let Err(e) = self.record_missed_slots(p, block) {
+                    tracing::debug!(height = block.height, error = %e, "missed-slot index skipped");
+                }
+            }
+            prev_ts = Some(block.timestamp);
         }
         if self.events.receiver_count() > 0 {
             for (block, _) in prepared {
@@ -1875,6 +1976,9 @@ impl Storage {
             })
             .map_err(map_tx_err)?;
         self.bump();
+        if let Err(e) = self.drop_missed_at(height) {
+            tracing::debug!(height, error = %e, "missed-slot index cleanup skipped");
+        }
         // the round snapshot taken after this boundary block belongs to the rolled-back branch
         let n = u64::from(self.network.milestone(height).active_delegates).max(1);
         if height % n == 0 {

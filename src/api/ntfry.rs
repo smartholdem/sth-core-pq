@@ -123,6 +123,7 @@ fn delegates_json(st: &Shared) -> Result<Value, crate::error::Error> {
             "node": info.map(|i| i.node.fmt_short().to_string()),
             "lastSeen": info.map(|i| i.last_seen.elapsed().as_secs()),
             "pqKey": pq_key,
+            "missed": st.storage.missed_count(&pk)?,
             "doubleVotes": proofs.len(),
             "bannedUntilRound": latest_ban,
             "banned": slashing && latest_ban.is_some_and(|r| r > round),
@@ -137,6 +138,7 @@ fn delegates_json(st: &Shared) -> Result<Value, crate::error::Error> {
         "pqBlocks": { "active": ms.pq.blocks, "activation": pq_blocks_at, "graceEnd": grace_end, "blocksLeft": grace_end.map(|g| g.saturating_sub(tip)) },
         "slashing": { "enabled": slashing, "rounds": ms.finality.slashing_rounds(), "currentRound": round },
         "equivocations": equivocations_json(st, tip)?,
+        "missedSlots": { "since": st.storage.missed_since()?, "recent": st.storage.missed_recent(50)?.into_iter().map(|m| { let at = st.network.epoch_to_unix(m.timestamp); let mut v = serde_json::to_value(m).unwrap_or_default(); v["atUnix"] = json!(at); v }).collect::<Vec<_>>() },
         "list": list }))
 }
 
@@ -302,6 +304,7 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
             "legacyPool": { "dynamicFees": st.mempool.legacy_dynamic_fees(), "minTransferFee": st.mempool.legacy_min_transfer_fee(), "pendingRefused": st.mempool.below_legacy_min().await },
             "dynamicFees": { "enabled": df.enabled, "minFeePool": df.min_fee_pool, "minFeeBroadcast": df.min_fee_broadcast, "addonBytes": df.addon_bytes_api(), "minTransferFee": st.mempool.min_transfer_fee(), "transferBytes": crate::mempool::Mempool::TRANSFER_WIRE_BYTES, "lowFeeRejected": st.mempool.low_fee_rejected() } },
         "intake": crate::intake::snapshot(),
+        "clock": crate::ntp::status(),
         "doubleForgeGuard": crate::delegate::guard::snapshot(tip + 1, u64::from(ms.active_delegates)),
         "legacy": legacy,
         "ntfry": iroh,

@@ -144,6 +144,48 @@ async fn legacy_server_serves_blocks_and_accepts_post_block() {
     assert_eq!(storage.get_wallet(&a).unwrap().unwrap().nonce, 1);
 }
 
+/// `postBlock` for tip+2: the missing block is pulled from the sender (it has it) and both are applied — no
+/// "not chained to our tip" rejection while the follow loop catches up.
+#[tokio::test]
+async fn post_block_two_ahead_pulls_the_gap_from_the_sender() {
+    let network = Network::mainnet();
+    let genesis = mainnet_block().unwrap();
+    let keys = KeyPair::from_passphrase("gap filler").unwrap();
+    let b2 = forge_block(&network, &keys, &genesis, 8, vec![]).unwrap();
+    let b3 = forge_block(&network, &keys, &b2, 16, vec![]).unwrap();
+    let b4 = forge_block(&network, &keys, &b3, 24, vec![]).unwrap();
+
+    // the sender: has 2, 3 and 4 and serves getBlocks on a known port
+    let sender = Arc::new(Storage::temporary(network.clone()).unwrap());
+    ensure_genesis(&sender, &network).unwrap();
+    for b in [&b2, &b3, &b4] {
+        sender.apply_block(b).unwrap();
+    }
+    let sender_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sender_addr = sender_listener.local_addr().unwrap();
+    drop(sender_listener);
+    let sender_srv = LegacyServer::new(sender.clone(), Arc::new(Mempool::new(sender.clone(), vec![], 10)), Arc::new(PeerTable::new(sender_addr.port(), Vec::<String>::new())), false);
+    tokio::spawn(sender_srv.serve(sender_addr));
+
+    // the receiver: at height 2, its legacy port (where it reaches peers) is the sender's port
+    let receiver = Arc::new(Storage::temporary(network.clone()).unwrap());
+    ensure_genesis(&receiver, &network).unwrap();
+    receiver.apply_block(&b2).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let srv = LegacyServer::new(receiver.clone(), Arc::new(Mempool::new(receiver.clone(), vec![], 10)), Arc::new(PeerTable::new(sender_addr.port(), Vec::<String>::new())), false);
+    tokio::spawn(srv.serve(addr));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut peer = LegacyPeer::connect("127.0.0.1", addr.port(), Duration::from_secs(5)).await.unwrap();
+    let resp = peer.post_block(serialize_block_with_transactions(&b4, &network).unwrap()).await.expect("gap filled from the sender, block applied");
+    assert!(resp.status && resp.height == 4, "{resp:?}");
+    assert_eq!(receiver.get_last_height().unwrap(), 4);
+    assert_eq!(receiver.get_block_by_height(3).unwrap().unwrap().id, b3.id);
+}
+
+
 /// A node that forged blocks while isolated (private fork) must roll them back during catch-up
 /// and continue on the branch the network serves.
 #[tokio::test]

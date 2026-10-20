@@ -53,6 +53,7 @@ pub async fn list(State(st): State<Shared>, Query(q): Query<Params>) -> ApiResul
     list.retain(|d| {
         q.range_ok("votes", d["votes"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0))
             && q.range_ok("blocks.produced", d["blocks"]["produced"].as_u64().unwrap_or(0))
+            && q.range_ok("blocks.missed", d["blocks"]["missed"].as_u64().unwrap_or(0))
             && q.range_ok("forged.fees", d["forged"]["fees"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0))
             && q.range_ok("forged.total", d["forged"]["total"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0))
     });
@@ -62,6 +63,7 @@ pub async fn list(State(st): State<Shared>, Query(q): Query<Params>) -> ApiResul
                 "rank" => d["rank"].as_u64().unwrap_or(0),
                 "votes" => d["votes"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0),
                 "blocks.produced" => d["blocks"]["produced"].as_u64().unwrap_or(0),
+                "blocks.missed" => d["blocks"]["missed"].as_u64().unwrap_or(0),
                 "forged.total" => d["forged"]["total"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0),
                 _ => d["rank"].as_u64().unwrap_or(0),
             }

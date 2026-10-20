@@ -577,6 +577,16 @@ pub fn apply_blocks(storage: &Storage, network: &Network, blocks: &[Block], mut 
         if height != tip.height + 1 {
             return Err(Error::Sync(format!("height gap: expected {}, got {height}", tip.height + 1)));
         }
+        if let Some(early_ms) = crate::intake::future_slot_ms(block, network) {
+            crate::intake::note_future_block(storage, block, early_ms);
+            return Err(Error::FutureBlock(format!(
+                "block {height} ({}) by {} takes slot {} which starts in {:.1}s — the forger's clock is ahead",
+                block.id.as_deref().and_then(|i| i.get(..8)).unwrap_or("?"),
+                block.generator_public_key,
+                crate::delegate::round::slot_number(block.timestamp, network.milestone(height).blocktime),
+                early_ms as f64 / 1000.0
+            )));
+        }
         let id = block
             .id
             .clone()

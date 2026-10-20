@@ -296,15 +296,18 @@ impl Guard {
             }
             st.forks.push_back(ForkSeen { height: ours.height, ours: our_id.to_string(), our_generator: our_name.clone(), theirs: their_id.to_string(), their_generator: their_name.clone(), peer: peer.to_string(), at_unix: now_unix() });
         }
+        // who forged first tells whose block failed to spread: the EARLIER slot is the legitimate one, the later
+        // delegate forged because that block never reached it within the slot
+        let (late_name, early_name, early_ts, late_ts) = if theirs.timestamp < ours.timestamp { (&our_name, &their_name, theirs.timestamp, ours.timestamp) } else { (&their_name, &our_name, ours.timestamp, theirs.timestamp) };
         let msg = format!(
-            "SAME-HEIGHT FORK at {}: we hold {}… by {our_name} (slot ts {}), {peer} sent {}… by {their_name} (slot ts {}) via {} — the network split at this height (the other side did not receive our block within its slot). If the other side is legacy: roll it back below {} and let it resync from a PQ gateway; check clocks (chronyc tracking) on both sides",
+            "SAME-HEIGHT FORK at {}: we hold {}… by {our_name} (slot ts {}), {peer} sent {}… by {their_name} (slot ts {}) via {}. {early_name}'s block (slot {early_ts}) did not reach {late_name} within {}s, so {late_name} forged the same height at slot {late_ts}; the majority chain wins and the minority rolls back automatically. Check {early_name}'s node: gossip neighbours ≥ 3, peers[].path = direct (UDP port open), its record present on the PQ MAP of other nodes, clock in sync (chronyc tracking)",
             crate::delegate::forger::group(ours.height),
             short(our_id),
             ours.timestamp,
             short(their_id),
             theirs.timestamp,
             source.label(),
-            crate::delegate::forger::group(ours.height.saturating_sub(1)),
+            late_ts.saturating_sub(early_ts),
         );
         tracing::error!("{msg}");
         crate::console::event(crate::console::Kind::Rejected, &format!("#{}  fork", crate::delegate::forger::group(ours.height)), &format!("{our_name} vs {their_name} from {peer}"));

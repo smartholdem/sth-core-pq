@@ -177,7 +177,7 @@ impl NodeContext {
 
     /// Full node lifecycle; returns when the intake loop stops or on Ctrl+C.
     pub async fn run(mut self, flags: RunFlags) -> Result<()> {
-        tokio::spawn(crate::ntp::check_clock("pool.ntp.org"));
+        tokio::spawn(crate::ntp::monitor(self.config.ntp_server.clone(), std::time::Duration::from_secs(600)));
         tokio::spawn(crate::mem::watchdog(std::time::Duration::from_secs(600)));
         crate::mem::spawn_freeze_watchdog(self.config.freeze_abort_secs, self.config.alerts.clone(), crate::alerts::node_label(&self.config, &self.network.name));
         self.start_iroh().await?;
@@ -221,6 +221,7 @@ impl NodeContext {
                     broadcast_fanout: cfg.delegate.broadcast_fanout,
                     quorum_share: cfg.delegate.quorum_share,
                     min_quorum_peers: cfg.delegate.min_quorum_peers,
+                    forge_over_minority: cfg.delegate.forge_over_minority,
                     iroh: self.iroh.clone(),
                     ..Default::default()
                 },

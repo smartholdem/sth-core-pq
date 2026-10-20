@@ -222,6 +222,7 @@ async fn on_block(node: &IrohNode, storage: &Arc<Storage>, seen: &Mutex<Seen>, f
             if let Some(ours) = storage.get_block_by_height(block.height)? {
                 if ours.id != block.id {
                     crate::delegate::guard::on_competing(crate::intake::Source::GossipIroh, &from.fmt_short().to_string(), &ours, &block);
+                    crate::intake::prefer_earlier_slot(storage, &ours, &block, &from.fmt_short().to_string()).await;
                 }
             }
         }

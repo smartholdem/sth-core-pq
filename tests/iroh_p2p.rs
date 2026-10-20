@@ -163,7 +163,7 @@ async fn address_book_records_are_served_over_rpc() {
     let a_storage = Arc::new(Storage::temporary(network.clone()).unwrap());
     sth_core::genesis::ensure_genesis(&a_storage, &network).unwrap();
     let a_pool = Arc::new(Mempool::new(a_storage.clone(), vec![], 10));
-    let discovery = DiscoveryOpts { cfg: DiscoveryConfig::default(), pinned: vec![] };
+    let discovery = DiscoveryOpts { cfg: DiscoveryConfig { listen_port: 0, ..DiscoveryConfig::default() }, pinned: vec![] };
     let a = IrohNode::spawn_with(iroh::SecretKey::generate(), vec![], true, None, a_storage.clone(), a_pool, false, None, None, Some(discovery)).await.unwrap();
     let book = a.addrbook.get().cloned().expect("address book enabled");
 
@@ -205,7 +205,7 @@ async fn minimal_preset_without_n0_talks_via_pinned_bootstrap() {
     use sth_core::p2p_iroh::DiscoveryOpts;
 
     let network = Network::mainnet();
-    let cfg = DiscoveryConfig { n0_dns: false, mainline: false, ..DiscoveryConfig::default() };
+    let cfg = DiscoveryConfig { n0_dns: false, mainline: false, listen_port: 0, ..DiscoveryConfig::default() };
     let a_storage = Arc::new(Storage::temporary(network.clone()).unwrap());
     sth_core::genesis::ensure_genesis(&a_storage, &network).unwrap();
     let a_pool = Arc::new(Mempool::new(a_storage.clone(), vec![], 10));

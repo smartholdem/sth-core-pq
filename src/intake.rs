@@ -51,6 +51,65 @@ struct Intake {
     last: Option<LastBlock>,
     delays: VecDeque<(Source, i64)>,
     origins: VecDeque<Origin>,
+    /// Received block that arrived the earliest relative to its slot (negative delay = before the slot started).
+    earliest: Option<EarlyBlock>,
+    future_rejected: u64,
+    last_future: Option<EarlyBlock>,
+    /// Id of the last discarded future block: the same block is offered again by several paths — count it once.
+    last_future_id: Option<String>,
+}
+
+/// A block seen before its slot start: `delay_ms` < 0 (or `early_ms` > 0 for a rejected future block).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EarlyBlock {
+    pub height: u64,
+    pub generator: String,
+    pub username: Option<String>,
+    pub source: Option<Source>,
+    /// Milliseconds before the slot start the block was seen (positive).
+    pub early_ms: i64,
+    pub at_unix: i64,
+}
+
+/// A block whose slot starts more than this far in the future is discarded (legacy core discards any future slot;
+/// one second of grace absorbs normal sub-second clock differences between honest nodes).
+pub const FUTURE_SLOT_GRACE_MS: i64 = 1_000;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// `Some(ms)` when `block` takes a slot that starts more than `FUTURE_SLOT_GRACE_MS` from now (ms until the slot start).
+pub fn future_slot_ms(block: &crate::models::Block, network: &crate::config::Network) -> Option<i64> {
+    let blocktime = network.milestone(block.height).blocktime;
+    let slot = crate::delegate::round::slot_number(block.timestamp, blocktime);
+    let start_ms = network.epoch_to_unix(crate::delegate::round::slot_start(slot, blocktime)) * 1000;
+    let early = start_ms - now_ms();
+    (early > FUTURE_SLOT_GRACE_MS).then_some(early)
+}
+
+/// Count a discarded future block (metrics `intake.futureRejected`) and alert once per cooldown: the generator's clock
+/// is ahead — its blocks steal the next delegate's slot on nodes that accept them and split the network otherwise.
+pub fn note_future_block(storage: &crate::storage::Storage, block: &crate::models::Block, early_ms: i64) {
+    let username = crate::crypto::address_from_public_key(&block.generator_public_key, storage.network().pubkey_hash).ok().and_then(|a| storage.get_wallet(&a).ok().flatten()).and_then(|w| w.username);
+    let name = username.clone().unwrap_or_else(|| block.generator_public_key.clone());
+    let early = EarlyBlock { height: block.height, generator: block.generator_public_key.clone(), username, source: None, early_ms, at_unix: now_ms() / 1000 };
+    {
+        let mut i = intake().lock().unwrap_or_else(|e| e.into_inner());
+        if i.last_future_id.is_some() && i.last_future_id == block.id {
+            return;
+        }
+        i.last_future_id = block.id.clone();
+        i.future_rejected += 1;
+        i.last_future = Some(early);
+    }
+    tracing::warn!("Discarded block {} by {name}: it takes a future slot starting in {:.1}s — delegate {name}'s clock runs ahead", block.height, early_ms as f64 / 1000.0);
+    crate::alerts::notify(
+        "future-block",
+        format!("FUTURE BLOCK discarded: height {} by delegate {name} takes a slot that starts in {:.1}s. The system clock of {name}'s node is ahead by about that much — tell the operator to enable NTP (timedatectl set-ntp true / chrony). Until then that delegate misses its slots.", block.height, early_ms as f64 / 1000.0),
+        false,
+    );
 }
 
 const WINDOW: usize = 100;
@@ -64,7 +123,7 @@ fn intake() -> &'static Mutex<Intake> {
 
 /// Record a block that just entered the chain live (catch-up batches are not counted).
 pub fn record(source: Source, peer: impl Into<String>, height: u64, block_epoch: u32, generator: &str, network: &crate::config::Network) {
-    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let now_ms = now_ms();
     let delay_ms = now_ms - network.epoch_to_unix(block_epoch) * 1000;
     let peer = peer.into();
     let mut i = intake().lock().unwrap_or_else(|e| e.into_inner());
@@ -73,6 +132,9 @@ pub fn record(source: Source, peer: impl Into<String>, height: u64, block_epoch:
         i.delays.pop_front();
     }
     i.delays.push_back((source, delay_ms));
+    if source != Source::Forged && delay_ms < 0 && i.earliest.as_ref().is_none_or(|e| -delay_ms > e.early_ms) {
+        i.earliest = Some(EarlyBlock { height, generator: generator.to_string(), username: None, source: Some(source), early_ms: -delay_ms, at_unix: now_ms / 1000 });
+    }
     if i.origins.len() == ORIGINS {
         i.origins.pop_front();
     }
@@ -97,7 +159,11 @@ pub fn legacy_evidence(rust_ws: &std::collections::HashSet<String>) -> std::coll
     seen
 }
 
-/// `{ last, avgDelayMs, samples, bySource: { label: { count, avgDelayMs } } }`
+/// `{ last, avgDelayMs, samples, bySource: { label: { count, avgDelayMs } }, clockSkewHintMs }`
+///
+/// A block cannot arrive before its slot starts, so a negative delay means OUR clock is behind the forger's.
+/// `clockSkewHintMs` = the earliest arrival among received blocks (0 when none is early): a lower bound on how far
+/// the local clock lags the network, independent of NTP.
 pub fn snapshot() -> serde_json::Value {
     let i = intake().lock().unwrap_or_else(|e| e.into_inner());
     let avg = |xs: &[i64]| if xs.is_empty() { None } else { Some(xs.iter().sum::<i64>() / xs.len() as i64) };
@@ -109,7 +175,14 @@ pub fn snapshot() -> serde_json::Value {
             by.insert(s.label().into(), serde_json::json!({ "count": xs.len(), "avgDelayMs": avg(&xs) }));
         }
     }
-    serde_json::json!({ "last": i.last, "avgDelayMs": avg(&all), "samples": all.len(), "bySource": by })
+    let skew = skew_hint(i.delays.iter().filter(|(s, _)| *s != Source::Forged).map(|(_, d)| *d));
+    serde_json::json!({ "last": i.last, "avgDelayMs": avg(&all), "samples": all.len(), "bySource": by, "clockSkewHintMs": skew,
+        "earliest": i.earliest, "futureRejected": { "count": i.future_rejected, "last": i.last_future } })
+}
+
+/// Most negative received delay, as a positive lag (ms); 0 = nothing arrived before its slot.
+pub fn skew_hint(received: impl Iterator<Item = i64>) -> i64 {
+    received.min().map(|m| (-m).max(0)).unwrap_or(0)
 }
 
 /// Why the chain stopped receiving blocks (`note_stall_reason`): the last diagnosis made by the follow loop or the
@@ -307,7 +380,10 @@ pub fn spawn_stall_watchdog(storage: std::sync::Arc<crate::storage::Storage>, pe
                 //    exactly like this: same height, same id, every legacy peer ahead)
                 match branch_check(&storage, &peers).await {
                     Some((ours, theirs, ip)) if ours != theirs => {
-                        let target = tip.saturating_sub(fork_depth).max(1);
+                        // never below a SHIP-35 certificate: 15/21 delegates signed that block, so the network has it
+                        // and the fork point is above — rolling further only destroyed finalized history (HEL, 2026-10-19)
+                        let floor = storage.latest_finality_cert().ok().flatten().map(|c| c.height).unwrap_or(0);
+                        let target = tip.saturating_sub(fork_depth).max(1).max(floor.min(tip.saturating_sub(1)));
                         let msg = format!(
                             "stall recovery: local tip {} ({}) is NOT on the network branch (network has {}) — rolling back to {} so the follow loop can resync",
                             crate::delegate::forger::group(tip), &ours[..ours.len().min(10)], &theirs[..theirs.len().min(10)], crate::delegate::forger::group(target)
@@ -475,4 +551,44 @@ mod tests {
         assert_eq!(v["lastReason"]["kind"], "lagging-peer");
         assert_eq!(v["lastStall"]["recoveredHeight"], 104);
     }
+}
+
+/// Same-height conflict AT THE TIP: the block from the EARLIER slot is the legitimate one — the later delegate forged
+/// because it had not received it within the slot. Every node applies the same rule, so the network converges in one
+/// hop instead of a 24 s stall plus a rollback. Bounded on purpose: only our tip (no children yet), same parent, tip
+/// not certified, the other block signed by its generator. Returns `true` when the tip was swapped.
+pub async fn prefer_earlier_slot(storage: &std::sync::Arc<crate::storage::Storage>, ours: &crate::models::Block, theirs: &crate::models::Block, peer: &str) -> bool {
+    let tip = storage.get_last_height().unwrap_or(0);
+    if ours.height != tip || theirs.height != tip || theirs.timestamp >= ours.timestamp || theirs.previous_block != ours.previous_block {
+        return false;
+    }
+    if !matches!(crate::crypto::verify_block_signature(theirs), Ok(true)) {
+        return false;
+    }
+    if matches!(storage.latest_finality_cert(), Ok(Some(c)) if c.height >= tip) {
+        return false;
+    }
+    let (st, ours_c, theirs_c) = (storage.clone(), ours.clone(), theirs.clone());
+    let swapped = tokio::task::spawn_blocking(move || -> Result<bool, crate::error::Error> {
+        st.rollback_to(tip - 1)?;
+        match st.apply_blocks(std::slice::from_ref(&theirs_c)) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                tracing::warn!(error = %e, "earlier-slot block failed to apply, restoring ours");
+                st.apply_blocks(std::slice::from_ref(&ours_c))?;
+                Ok(false)
+            }
+        }
+    })
+    .await
+    .unwrap_or(Ok(false))
+    .unwrap_or(false);
+    if swapped {
+        tracing::warn!(
+            height = tip, ours = %ours.id.as_deref().unwrap_or("?").get(..10).unwrap_or("?"), theirs = %theirs.id.as_deref().unwrap_or("?").get(..10).unwrap_or("?"),
+            our_slot = ours.timestamp, their_slot = theirs.timestamp, peer,
+            "same-height fork at the tip: swapped to the block from the EARLIER slot (the network converges on it)"
+        );
+    }
+    swapped
 }

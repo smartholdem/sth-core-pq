@@ -24,3 +24,24 @@ async fn sntp_offset_against_mock_server() {
     let ms = sth_core::ntp::clock_offset_ms_at(&format!("127.0.0.1:{port}")).await.unwrap();
     assert!((-6_000..=-4_000).contains(&ms), "offset {ms}ms should be about -5000 (local behind)");
 }
+
+#[test]
+fn drift_state_is_remembered_and_failures_keep_the_verdict() {
+    let (st, prev) = sth_core::ntp::record("mock", Ok(-1_500), 1_000);
+    assert!(st.drifted && st.ok && prev.is_none());
+    let (st, prev) = sth_core::ntp::record("mock", Err("timeout".into()), 1_600);
+    assert!(st.drifted && !st.ok && st.offset_ms.is_none() && prev == Some(true));
+    let (st, prev) = sth_core::ntp::record("mock", Ok(120), 2_200);
+    assert!(!st.drifted && prev == Some(true));
+    let v = sth_core::ntp::status();
+    assert_eq!(v["offsetMs"], 120);
+    assert_eq!(v["server"], "mock");
+    assert_eq!(v["drifted"], false);
+}
+
+#[test]
+fn skew_hint_is_the_earliest_arrival_or_zero() {
+    assert_eq!(sth_core::intake::skew_hint([40, 900, -847, -568].into_iter()), 847);
+    assert_eq!(sth_core::intake::skew_hint([40, 900].into_iter()), 0);
+    assert_eq!(sth_core::intake::skew_hint(std::iter::empty()), 0);
+}

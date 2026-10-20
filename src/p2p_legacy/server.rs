@@ -285,8 +285,28 @@ impl LegacyServer {
             if let (false, Some(ours)) = (known, ours.as_ref()) {
                 if height + 1 >= tip.height {
                     crate::delegate::guard::on_competing(crate::intake::Source::PushLegacy, &remote.ip().to_string(), ours, &block);
+                    if crate::intake::prefer_earlier_slot(&self.storage, ours, &block, &remote.ip().to_string()).await {
+                        return Ok(PostBlockResponse { status: true, height: height as u32 }.encode_to_vec());
+                    }
                 }
             }
+            return Ok(PostBlockResponse { status: known, height: tip.height as u32 }.encode_to_vec());
+        }
+        if height > tip.height + 1 && height - tip.height <= 8 {
+            // the sender has the block(s) we are missing (a poorly connected forger's block did not reach us): pull
+            // them from the sender right now instead of answering "not chained" and waiting for the follow loop
+            let ip = remote.ip().to_string();
+            match super::follow::pull_gap_from(&self.storage, &self.table, &ip, height - 1, self.verify).await {
+                Ok(t) => tracing::debug!(peer = ip, height = t.height, pushed = height, "postBlock gap filled from the sender"),
+                Err(e) => tracing::debug!(peer = ip, error = %e, pushed = height, "postBlock gap fill from the sender failed"),
+            }
+        }
+        let tip = match self.storage.get_last_block()? {
+            Some(b) => ChainTip { height: b.height, id: b.id },
+            None => ChainTip { height: 0, id: None },
+        };
+        if height <= tip.height {
+            let known = self.storage.get_block_by_height(height)?.and_then(|b| b.id) == block.id;
             return Ok(PostBlockResponse { status: known, height: tip.height as u32 }.encode_to_vec());
         }
         if height != tip.height + 1 || tip.id.as_deref().is_some_and(|id| block.previous_block != id) {
