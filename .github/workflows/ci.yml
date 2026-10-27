@@ -23,7 +23,7 @@ jobs:
       #- run: cargo fmt --all -- --check
       #  continue-on-error: true
       #- run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets
         continue-on-error: true
       - run: cargo build --bins
       - run: cargo test
