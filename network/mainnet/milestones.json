@@ -47,5 +47,19 @@
     {
         "height": 11800000,
         "ship13": true
+    },
+    {
+        "height": 12365000,
+        "tokens": true,
+        "sobjV2": true,
+        "strictBalance": true,
+        "tokenFees": {
+            "meta": 1000000000
+        },
+        "tokenMarket": {
+            "enabled": true,
+            "maxOpenOrders": 64
+        },
+        "minCoreVersion": "0.25.49"
     }
 ]

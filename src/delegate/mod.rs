@@ -87,11 +87,11 @@ mod tests {
         std::fs::write(&file, "{\n\"secrets\": [\"secret1\",\"secret2\"]\n}\n").unwrap();
         let path = file.to_str().unwrap().to_string();
         // `secrets: "./delegates.json"` (user's spelling) parses as a one-element list and is read as a file
-        let cfg = crate::node_config::NodeConfig::parse(&format!("delegate:\n  enabled: true\n  secrets: \"{path}\"\n")).unwrap();
+        let cfg = crate::node_config::NodeConfig::parse(&format!("delegate:\n  enabled: true\n  secrets: '{path}'\n")).unwrap();
         assert_eq!(cfg.delegate.secrets, vec![path.clone()]);
         assert_eq!(load_secrets(&cfg.delegate.secrets, &cfg.delegate.secrets_file).unwrap(), vec!["secret1", "secret2"]);
         // the documented field
-        let cfg = crate::node_config::NodeConfig::parse(&format!("delegate:\n  enabled: true\n  secrets_file: {path}\n")).unwrap();
+        let cfg = crate::node_config::NodeConfig::parse(&format!("delegate:\n  enabled: true\n  secrets_file: '{path}'\n")).unwrap();
         assert_eq!(load_secrets(&cfg.delegate.secrets, &cfg.delegate.secrets_file).unwrap(), vec!["secret1", "secret2"]);
         // inline passphrases still work and mix with the file
         assert_eq!(load_secrets(&["one two".into(), path.clone()], "").unwrap(), vec!["one two", "secret1", "secret2"]);

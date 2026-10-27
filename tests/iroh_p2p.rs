@@ -190,7 +190,7 @@ async fn address_book_records_are_served_over_rpc() {
     assert_eq!(got, vec![record]);
     // persisted for the next start
     assert_eq!(a_storage.load_addr_entries().len(), 1);
-    let s = sth_core::p2p_iroh::addrbook::snapshot();
+    let s = book.snapshot();
     assert_eq!(s["entries"], 1);
     assert_eq!(s["fresh"], 1);
     a.shutdown().await;

@@ -24,6 +24,7 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 pub struct RpcHandler {
     storage: Arc<Storage>,
     peers: Arc<IrohPeers>,
+    addrbook: Arc<std::sync::OnceLock<Arc<super::addrbook::AddrBook>>>,
 }
 
 impl std::fmt::Debug for RpcHandler {
@@ -33,8 +34,8 @@ impl std::fmt::Debug for RpcHandler {
 }
 
 impl RpcHandler {
-    pub fn new(storage: Arc<Storage>, peers: Arc<IrohPeers>) -> Self {
-        Self { storage, peers }
+    pub fn new(storage: Arc<Storage>, peers: Arc<IrohPeers>, addrbook: Arc<std::sync::OnceLock<Arc<super::addrbook::AddrBook>>>) -> Self {
+        Self { storage, peers, addrbook }
     }
 
     fn handle(&self, req: Request) -> Response {
@@ -59,7 +60,7 @@ impl RpcHandler {
                 Ok(certificate) => Response::Finality { certificate },
                 Err(e) => Response::Error { message: e.to_string() },
             },
-            Request::GetAddrs { limit } => match super::addrbook::global() {
+            Request::GetAddrs { limit } => match self.addrbook.get() {
                 Some(book) => Response::Addrs { records: book.fresh(limit as usize) },
                 None => Response::Error { message: "address book disabled".into() },
             },

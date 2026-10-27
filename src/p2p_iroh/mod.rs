@@ -62,7 +62,7 @@ pub struct IrohNode {
     /// Node key (signs sthpq address records; the same key the endpoint runs on).
     pub secret: SecretKey,
     /// sthpq address book (`p2p.iroh.discovery`), set when the module is enabled.
-    pub addrbook: std::sync::OnceLock<Arc<addrbook::AddrBook>>,
+    pub addrbook: Arc<std::sync::OnceLock<Arc<addrbook::AddrBook>>>,
 }
 
 /// `p2p.iroh.discovery` runtime options: the config + bootstrap entries given as `id@ip:port`.
@@ -340,6 +340,7 @@ impl IrohNode {
         // blocks with transactions and vote batches exceed the 4 KiB iroh-gossip default; peers on older builds still
         // receive our ≤ 4 KiB messages (votes are chunked), we accept up to 64 KiB from newer ones
         let gossip = Gossip::builder().max_message_size(GOSSIP_MAX_MESSAGE_SIZE).spawn(endpoint.clone());
+        let addrbook = Arc::new(std::sync::OnceLock::new());
         let mut builder = Router::builder(endpoint.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(wallet_api::ALPN_API_V0, wallet_api::ApiHandler::new(wallet_api.clone(), false))
@@ -347,7 +348,7 @@ impl IrohNode {
             .accept(wallet_api::ALPN_API, wallet_api::ApiHandler::new(wallet_api.clone(), true))
             .accept(wallet_api::ALPN_EVENTS, wallet_api::EventsHandler::new(wallet_api.clone()));
         if serve_blocks {
-            builder = builder.accept(ALPN, RpcHandler::new(storage.clone(), peers.clone()));
+            builder = builder.accept(ALPN, RpcHandler::new(storage.clone(), peers.clone(), addrbook.clone()));
         }
         let router = builder.spawn();
         let topics = Topics::for_network(&storage.network().nethash);
@@ -366,7 +367,7 @@ impl IrohNode {
         for id in &bootstrap {
             peers.seen(*id, None);
         }
-        let node = Arc::new(Self { endpoint, router, gossip, peers, topics, lookup, gateway, relay_urls, forging_keys: Default::default(), announce: std::sync::atomic::AtomicBool::new(true), rust_delegates: Default::default(), finality: Arc::new(finality::FinalityTracker::new(storage.clone())), wallet_api, nethash: storage.network().nethash.clone(), secret, addrbook: std::sync::OnceLock::new() });
+        let node = Arc::new(Self { endpoint, router, gossip, peers, topics, lookup, gateway, relay_urls, forging_keys: Default::default(), announce: std::sync::atomic::AtomicBool::new(true), rust_delegates: Default::default(), finality: Arc::new(finality::FinalityTracker::new(storage.clone())), wallet_api, nethash: storage.network().nethash.clone(), secret, addrbook });
         if let Some(d) = discovery {
             for addr in d.pinned {
                 tracing::info!(peer = %addr.id.fmt_short(), addrs = ?addr.ip_addrs().collect::<Vec<_>>(), "bootstrap peer pinned with a direct address");
