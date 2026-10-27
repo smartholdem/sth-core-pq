@@ -1,4 +1,4 @@
-# Every push / PR: format, clippy, build both binaries, run the test suites.
+# Every push/PR: format, clippy, build both binaries, run the test suites.
 name: ci
 
 on:
