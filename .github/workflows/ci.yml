@@ -20,8 +20,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # style gates are advisory until the codebase is rustfmt-normalised (long-line style today)
-      - run: cargo fmt --all -- --check
-        continue-on-error: true
+      #- run: cargo fmt --all -- --check
+      #  continue-on-error: true
       - run: cargo clippy --all-targets -- -D warnings
         continue-on-error: true
       - run: cargo build --bins
