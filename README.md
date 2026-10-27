@@ -3,12 +3,11 @@
 
 # SmartHoldem Core Node PQ (Post Quantum Node)
 
-Rust rewrite of the SmartHoldem (`@smartholdem/core` 3.8.2, network byte `63`) node: relay, gateway and delegate.
-Current status (**v0.19.0**): 100 % legacy REST API, legacy P2P (port 4001, in + out), Web 4.0 layer (iroh gossip / RPC),
+Rust rewrite of the SmartHoldem (network byte `63`) node: relay, gateway and delegate.
+Current status (**v0.19.0**): 100% REST API, P2P (port 4001, in + out), Web 4.0 layer (iroh gossip / RPC),
 pluggable delegate forging (live on mainnet), automatic fork rollback, compact Sled database, operator metrics page,
 second-signature enforcement, SmartObjects (sObject, active since 11 800 000), native tokens + manifests + market (milestone
 `tokens` / `sobjV2`), Quantum Shield stages A (active) and B (milestone `pq`), standalone `sth-cli`, `init newnet`.
-Startup prints `core version X.Y.Z`. History: `CHANGELOG.md`.
 
 ## Build & test
 
@@ -305,4 +304,4 @@ tx-status --wait`: `sth-cli --api https://node0.smartholdem.io status`. The metr
   - Stage C: PQ delegate block signatures, hybrid X25519 + ML-KEM transport in iroh, new single-key quantum addresses.
     Postponed by decision of the network owner; second-signature enforcement (done in v0.8.3) was the prerequisite.
 - `api://<EndpointId>/<provider>` client, cross-compilation / release packaging, snapshot publishing by gateway nodes.
-  See `CHANGELOG.md` for the history.
+  
