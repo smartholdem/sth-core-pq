@@ -9,6 +9,22 @@ pluggable delegate forging (live on mainnet), automatic fork rollback, compact S
 second-signature enforcement, SmartObjects (sObject, active since 11 800 000), native tokens + manifests + market (milestone
 `tokens` / `sobjV2`), Quantum Shield stages A (active) and B (milestone `pq`), standalone `sth-cli`, `init newnet`.
 
+# Fast start
+
+```bash
+mkdir sth-core && cd sth-core
+wget https://smartholdem.io/download/core/sth-core 
+wget https://smartholdem.io/download/core/sth-cli
+wget http://smartholdem.io/download/core/snapshot/data.tgz #snapshot bootstrap (optional)
+tar -zxvf data.tgz
+rm data.tgz
+chmod +x sth-core sth-cli
+./sth-core init
+./sth-core start
+```
+
+
+
 ## Build & test
 
 ```bash
