@@ -1,0 +1,32 @@
+# PQ Node (sth-core-pq) systemd unit.
+# Install:  sudo cp sth-core.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now sth-core
+# Adjust User / WorkingDirectory to your layout (here: user "mainnet", binary + node.yaml in /home/mainnet/sth-core).
+[Unit]
+Description=SmartHoldem PQ Node (sth-core)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mainnet
+Group=mainnet
+WorkingDirectory=/home/mainnet/sth-core
+ExecStart=/home/mainnet/sth-core/sth-core run
+Restart=always
+RestartSec=5
+# graceful stop: sled flushes on SIGTERM
+KillSignal=SIGTERM
+TimeoutStopSec=60
+LimitNOFILE=65536
+# soft memory ceiling systemd restarts the node instead of the kernel OOM-killing the whole host
+MemoryMax=1500M
+# logs -> journald (no nohup.out); size is capped by journald.conf (see docs/systemd/README.md)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sth-core
+Environment=RUST_LOG=info
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
