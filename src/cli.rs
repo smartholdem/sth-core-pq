@@ -225,7 +225,7 @@ pub enum TxCmd {
         #[arg(long)]
         id: String,
     },
-    /// Initialize a token on a type-5 sObject you own (supply / cap in whole tokens).
+    /// Initialize a token on a type-5 sObject you own (supply / cap in whole tokens). Fee: milestone `tokenFees.init` (default 5000 STH, 50 % burned).
     TokenInit {
         /// Ticker (type-5 sObject name) or its registration id.
         #[arg(long)]
@@ -287,7 +287,7 @@ pub enum TxCmd {
         #[arg(long)]
         order: String,
     },
-    /// Publish / update the on-chain manifest (name, description, website, SVG or PNG logo ≤ 8 KB).
+    /// Publish / update the on-chain manifest (name, description, website, SVG or PNG logo ≤ 8 KB). Fee: `tokenFees.meta` (mainnet 100 STH).
     TokenMeta {
         #[arg(long)]
         ticker: String,

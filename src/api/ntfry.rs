@@ -311,9 +311,18 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
         "forging": forging,
         "blocks": blocks,
         "delegates": delegates_json(&st)?,
+        "burn": burn_json(&st, tip)?,
     });
     data["doctor"] = crate::doctor::summary(&data, now_unix);
     Ok(Json(json!({ "data": data })))
+}
+
+/// Burn counter: balance of the network burn address (TokenInit burns + anything sent there) vs total supply.
+fn burn_json(st: &Shared, tip: u64) -> Result<Value, crate::error::Error> {
+    let address = &st.network.burn_address;
+    let burned = if address.is_empty() { 0 } else { st.storage.get_wallet(address)?.map(|w| w.balance.max(0)).unwrap_or(0) };
+    let init_burn = st.network.milestone(tip.max(1)).token_fees.init_burn();
+    Ok(json!({ "address": address, "burned": burned.to_string(), "supply": st.network.supply(tip).to_string(), "tokenInitBurn": init_burn.to_string() }))
 }
 
 /// Router for the dedicated metrics port: the page plus the two `ntfry` endpoints only.
