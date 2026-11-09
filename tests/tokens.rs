@@ -11,7 +11,7 @@ use sth_core::storage::Storage;
 use sth_core::sync::{apply_blocks, ChainTip};
 use std::sync::Arc;
 
-const INIT_FEE: u64 = 50_000_000_000;
+const INIT_FEE: u64 = 500_000_000_000;
 
 /// mainnet with aip36 + tokens active from genesis
 fn network_tokens() -> Network {

@@ -278,7 +278,7 @@ fn sobj_transfer_moves_object_and_token() {
     let reg = sign(register(&alice, 1, 5, "COFFEE"), &alice);
     c.try_block(vec![reg.clone()]).unwrap();
     let id = reg.id.clone().unwrap();
-    let init = sign(tx(&alice, 2, serde_json::json!({ "typeGroup": 3, "type": token::INIT, "fee": "50000000000", "asset": { "token": { "id": id, "decimals": 0, "flags": 3, "initialSupply": "1000", "supplyCap": "5000" } } })), &alice);
+    let init = sign(tx(&alice, 2, serde_json::json!({ "typeGroup": 3, "type": token::INIT, "fee": "500000000000", "asset": { "token": { "id": id, "decimals": 0, "flags": 3, "initialSupply": "1000", "supplyCap": "5000" } } })), &alice);
     c.try_block(vec![init]).unwrap();
 
     // wire round-trip keeps recipientId (travels in the ntfryData slot)
@@ -365,7 +365,7 @@ fn sobj_sell_and_buy() {
     let reg = sign(register(&alice, 1, 5, "COFFEE"), &alice);
     c.try_block(vec![reg.clone()]).unwrap();
     let id = reg.id.clone().unwrap();
-    c.try_block(vec![sign(tx(&alice, 2, serde_json::json!({ "typeGroup": 3, "type": token::INIT, "fee": "50000000000", "asset": { "token": { "id": id, "decimals": 0, "flags": 3, "initialSupply": "1000", "supplyCap": "5000" } } })), &alice)]).unwrap();
+    c.try_block(vec![sign(tx(&alice, 2, serde_json::json!({ "typeGroup": 3, "type": token::INIT, "fee": "500000000000", "asset": { "token": { "id": id, "decimals": 0, "flags": 3, "initialSupply": "1000", "supplyCap": "5000" } } })), &alice)]).unwrap();
 
     // wire: price travels in the slot
     let t = sell(&alice, 3, &id, 200_000_000_000);
@@ -462,7 +462,7 @@ async fn resign_guard_protects_live_token_registry() {
     let (reg, plain) = (sign(register(&alice, 1, 5, "COFFEE"), &alice), sign(register(&alice, 2, 5, "BEANS"), &alice));
     c.try_block(vec![reg.clone(), plain.clone()]).unwrap();
     let id = reg.id.clone().unwrap();
-    let init = sign(tx(&alice, 3, serde_json::json!({ "typeGroup": 3, "type": token::INIT, "fee": "50000000000", "asset": { "token": { "id": id, "decimals": 0, "flags": 2, "initialSupply": "10", "supplyCap": "10" } } })), &alice);
+    let init = sign(tx(&alice, 3, serde_json::json!({ "typeGroup": 3, "type": token::INIT, "fee": "500000000000", "asset": { "token": { "id": id, "decimals": 0, "flags": 2, "initialSupply": "10", "supplyCap": "10" } } })), &alice);
     c.try_block(vec![init]).unwrap();
 
     // live supply → refused in a block and in the pool

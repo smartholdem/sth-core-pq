@@ -201,7 +201,7 @@ pub struct TokenMarketParams {
 }
 
 fn default_init_fee() -> u64 {
-    50_000_000_000
+    500_000_000_000
 }
 fn default_transfer_fee() -> u64 {
     10_000_000
@@ -663,17 +663,17 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_tokens_market_at_12_365_000() {
+    fn mainnet_tokens_market_at_12_500_000() {
         let n = Network::mainnet();
-        let before = n.milestone(12_364_999);
+        let before = n.milestone(12_499_999);
         assert!(!before.tokens && !before.sobj_v2 && !before.strict_balance && !before.token_market.enabled);
-        let m = n.milestone(12_365_000);
+        let m = n.milestone(12_500_000);
         assert!(m.tokens && m.sobj_v2 && m.strict_balance && m.token_market.enabled && m.sobj_active && m.tx_v2);
         assert_eq!(m.token_market.max_open_orders, 64);
-        assert_eq!(m.token_fees.meta, 1_000_000_000);
-        assert_eq!((m.token_fees.init, m.token_fees.init_burn_percent, m.token_fees.transfer, m.token_fees.mint, m.token_fees.burn), (50_000_000_000, 50, 10_000_000, 100_000_000, 10_000_000));
+        assert_eq!(m.token_fees.meta, 10_000_000_000);
+        assert_eq!((m.token_fees.init, m.token_fees.init_burn_percent, m.token_fees.transfer, m.token_fees.mint, m.token_fees.burn), (500_000_000_000, 50, 10_000_000, 100_000_000, 10_000_000));
         assert_eq!((m.token_fees.sell, m.token_fees.buy, m.token_fees.cancel), (100_000_000, 10_000_000, 10_000_000));
-        assert_eq!(m.min_core_version, "0.25.49");
+        assert_eq!(m.min_core_version, "0.25.50");
         assert!(!m.pq.active && !m.pq.blocks && !m.finality.active && !m.masternodes.enabled);
         assert_eq!(m.static_fee("transfer"), 100_000_000);
     }
