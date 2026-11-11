@@ -49,7 +49,11 @@ pub async fn broadcast(table: &PeerTable, serialized: Vec<Vec<u8>>, fanout: usiz
     }
     let peers = table.best(fanout.max(MIN_RELAY_FANOUT));
     if peers.is_empty() {
-        tracing::warn!("no healthy legacy peers for transaction relay");
+        if table.is_empty() {
+            tracing::debug!("no legacy peers configured, transaction relay skipped");
+        } else {
+            tracing::warn!("no healthy legacy peers for transaction relay");
+        }
         return 0;
     }
     let results = futures::future::join_all(peers.iter().map(|ip| {

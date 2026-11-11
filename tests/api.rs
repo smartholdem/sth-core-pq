@@ -335,10 +335,12 @@ async fn metrics_report_stall_state_and_last_audit() {
     assert_eq!(m["data"]["chain"]["stall"]["stalled"], false);
     assert!(m["data"]["node"]["lastAudit"].is_null(), "no audit yet: {}", m["data"]["node"]["lastAudit"]);
     assert_eq!(m["data"]["node"]["implementation"], "sth-core-pq");
+    let burn = &m["data"]["burn"];
+    assert!(burn["burned"].as_str().unwrap().parse::<u64>().is_ok() && burn["supply"].as_str().unwrap().parse::<u64>().unwrap() > 0, "{burn}");
     // in-process doctor verdict + relay coverage for the metrics page
     let doc = &m["data"]["doctor"];
     assert!(["HEALTHY", "DEGRADED", "UNHEALTHY"].contains(&doc["verdict"].as_str().unwrap()), "{doc}");
-    assert!(doc["checks"].as_array().unwrap().iter().any(|c| c["name"] == "state audit" && c["level"] == "warn"), "no audit yet → warn: {doc}");
+    assert!(doc["checks"].as_array().unwrap().iter().any(|c| c["name"] == "state audit" && c["level"] == "ok"), "no audit yet → reminder only, verdict unaffected: {doc}");
     assert_eq!(m["data"]["mempool"]["relay"]["relays"], 0);
     // fee advisor + stall cause for the metrics page
     let lp = &m["data"]["mempool"]["legacyPool"];

@@ -20,12 +20,55 @@ pub const MAINNET_NETWORK_JSON: &str = include_str!("../network/mainnet/network.
 pub const MAINNET_MILESTONES_JSON: &str = include_str!("../network/mainnet/milestones.json");
 pub const MAINNET_EXCEPTIONS_JSON: &str = include_str!("../network/mainnet/exceptions.json");
 pub const MAINNET_GENESIS_GZ: &[u8] = include_bytes!("../network/mainnet/genesisBlock.json.gz");
+/// Anti-scam ticker list (CoinMarketCap top): registrable as type-5 sObject / token only by [`RESERVED_TOKENS_OWNER`].
+pub const MAINNET_RESERVED_TOKENS_JSON: &str = include_str!("../network/mainnet/reserved-tokens.json");
+/// The only address allowed to register the mainnet reserved tickers.
+pub const RESERVED_TOKENS_OWNER: &str = include_str!("../network/mainnet/reserved-tokens-owner.txt");
+/// Tickers nobody can register on mainnet (the native coin).
+pub const MAINNET_FORBIDDEN_TOKENS: &[&str] = &["STH"];
+
+/// Ticker protection of a network (mainnet: embedded; other networks: optional `reserved-tokens.json` in network_dir).
+#[derive(Debug, Clone, Default)]
+pub struct ReservedTokens {
+    /// May register the `reserved` tickers; empty = nobody.
+    pub owner: String,
+    pub reserved: std::collections::HashSet<String>,
+    /// Never registrable.
+    pub forbidden: std::collections::HashSet<String>,
+}
+
+impl ReservedTokens {
+    /// `["USD","BTC",…]` (upper-cased); `owner` / `forbidden` as given.
+    pub fn from_json(list: &str, owner: &str, forbidden: &[&str]) -> Result<Self> {
+        let names: Vec<String> = serde_json::from_str(list).map_err(|e| Error::Config(format!("reserved-tokens.json: {e}")))?;
+        Ok(Self { owner: owner.trim().to_string(), reserved: names.into_iter().map(|n| n.trim().to_ascii_uppercase()).collect(), forbidden: forbidden.iter().map(|s| s.to_string()).collect() })
+    }
+
+    pub fn mainnet() -> Self {
+        Self::from_json(MAINNET_RESERVED_TOKENS_JSON, RESERVED_TOKENS_OWNER, MAINNET_FORBIDDEN_TOKENS).expect("embedded reserved-tokens.json is valid")
+    }
+
+    /// Error text for a ticker `sender` may not register, None if allowed.
+    pub fn refuse(&self, name: &str, sender: &str) -> Option<String> {
+        let name = name.to_ascii_uppercase();
+        if self.forbidden.contains(&name) {
+            return Some(format!("TokenReservedError: Token Reserved — {name} is the native coin of this network and can never be registered, please choose another name"));
+        }
+        if self.reserved.contains(&name) && (self.owner.is_empty() || sender != self.owner) {
+            return Some(format!("TokenReservedError: Token Reserved — {name} is reserved to protect holders from scam tokens, please choose another name"));
+        }
+        None
+    }
+}
 
 /// Milestone parameters active from a given height (later milestones deep-merge into earlier ones).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Milestone {
     pub height: u64,
+    /// Not part of milestones.json: the network's reserved tickers, shared by every milestone.
+    #[serde(skip)]
+    pub reserved_tokens: Arc<ReservedTokens>,
     #[serde(deserialize_with = "de_u64_lenient")]
     pub reward: u64,
     pub active_delegates: u32,
@@ -262,6 +305,7 @@ impl Default for Milestone {
     fn default() -> Self {
         Self {
             height: 1,
+            reserved_tokens: Arc::default(),
             reward: 0,
             active_delegates: 21,
             blocktime: 8,
@@ -432,6 +476,7 @@ impl Network {
         MAINNET.get_or_init(|| {
             Self::from_json(MAINNET_NETWORK_JSON, MAINNET_MILESTONES_JSON, MAINNET_EXCEPTIONS_JSON, MAINNET_GENESIS_GZ)
                 .expect("embedded mainnet configuration is valid")
+                .with_reserved_tokens(ReservedTokens::mainnet())
         })
     }
 
@@ -467,8 +512,31 @@ impl Network {
             &read("exceptions.json", MAINNET_EXCEPTIONS_JSON)?,
             &genesis,
         )?;
+        // mainnet (even from a network_dir) always carries the embedded list; other networks only their own file
+        let reserved_file = dir.join("reserved-tokens.json");
+        let net = if reserved_file.exists() {
+            let list = std::fs::read_to_string(&reserved_file).map_err(|e| Error::Config(format!("cannot read {}: {e}", reserved_file.display())))?;
+            let owner = std::fs::read_to_string(dir.join("reserved-tokens-owner.txt")).unwrap_or_default();
+            let forbidden: Vec<&str> = if net.nethash == Self::mainnet_ref().nethash { MAINNET_FORBIDDEN_TOKENS.to_vec() } else { Vec::new() };
+            let r = ReservedTokens::from_json(&list, &owner, &forbidden)?;
+            net.with_reserved_tokens(r)
+        } else if net.nethash == Self::mainnet_ref().nethash {
+            net.with_reserved_tokens(ReservedTokens::mainnet())
+        } else {
+            net
+        };
         tracing::info!(dir = %dir.display(), milestones = net.milestones.len(), "network configuration loaded");
         Ok(net)
+    }
+
+    pub fn with_reserved_tokens(mut self, r: ReservedTokens) -> Self {
+        let r = Arc::new(r);
+        let mut ms = (*self.milestones).clone();
+        for m in &mut ms {
+            m.reserved_tokens = r.clone();
+        }
+        self.milestones = Arc::new(ms);
+        self
     }
 
     pub fn from_json(network: &str, milestones: &str, exceptions: &str, genesis_gz: &[u8]) -> Result<Self> {

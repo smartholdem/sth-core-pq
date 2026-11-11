@@ -23,7 +23,7 @@ struct Net {
 
 fn newnet(seed: &str, hard: bool) -> Net {
     let dir = tempfile::tempdir().unwrap();
-    let opts = NewNetOptions { ticker: "FIN".into(), title: "FinNet".into(), delegates: 3, pubkey_hash: 30, p2p_port: 4102, api_port: 4104, metrics_port: 4989, seed: seed.into(), tokens_at: None, pq_at: None, pq_blocks_at: None, finality_hard: hard, treasury_supply: 1_000_000 * 100_000_000, delegate_stake: 1000 * 100_000_000 };
+    let opts = NewNetOptions { ticker: "FIN".into(), title: "FinNet".into(), delegates: 3, pubkey_hash: 30, p2p_port: 4102, api_port: 4104, metrics_port: 4989, seed: seed.into(), tokens_at: None, pq_at: None, pq_blocks_at: None, finality_hard: hard, treasury_supply: 1_000_000 * 100_000_000, delegate_stake: 1000 * 100_000_000, epoch: Some("2023-08-29T00:00:00.000Z".into()), ..Default::default() };
     let n = generate(&opts, dir.path()).unwrap();
     let network = NodeConfig::load(&dir.path().join("node.yaml")).unwrap().load_network().unwrap();
     let storage = Arc::new(Storage::temporary(network.clone()).unwrap());
@@ -262,6 +262,8 @@ async fn dashboard_shows_double_votes_and_proof_history() {
     assert_eq!(row["bannedUntilRound"], d["slashing"]["currentRound"].as_u64().unwrap() + 30);
     let honest = d["list"].as_array().unwrap().iter().find(|x| x["publicKey"] == n.delegates[0].public_key_hex()).unwrap();
     assert_eq!((honest["doubleVotes"].as_u64(), honest["banned"].as_bool()), (Some(0), Some(false)));
+    assert_eq!(honest["reason"], "iroh-off", "why not PQ: this API node runs without iroh");
+    assert!(honest["reasonText"].as_str().unwrap().contains("iroh is off"));
     let eq = d["equivocations"].as_array().unwrap();
     assert_eq!(eq.len(), 1);
     assert_eq!(eq[0]["height"], 2);

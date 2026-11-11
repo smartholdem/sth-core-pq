@@ -1,7 +1,7 @@
 //! Author: TechnoL0g
 //!
 //! `sth-core doctor` — one health verdict for operators: node API + metrics feed (sync, stall, peers, last audit),
-//! then the legacy acceptance check (`peers --accepted`) when the node has a public legacy address.
+//! then, only if the node still has a public legacy address, the legacy acceptance check (`peers --accepted`).
 
 use crate::node_config::NodeConfig;
 use serde_json::Value;
@@ -93,11 +93,16 @@ pub fn evaluate(m: &Value, now_unix: i64) -> Vec<Check> {
         let alive = legacy["alive"].as_u64().unwrap_or(0);
         let parked = legacy["parked"].as_u64().unwrap_or(0);
         let known = legacy["known"].as_u64().unwrap_or(0);
-        out.push(check(if alive == 0 { Level::Fail } else if alive < 3 { Level::Warn } else { Level::Ok }, "legacy peers", format!("{alive}/{known} alive · {parked} parked · best {}", legacy["bestHeight"])));
+        out.push(check(Level::Ok, "legacy peers", format!("{alive}/{known} alive · {parked} parked · best {} (informational: blocks travel over iroh)", legacy["bestHeight"])));
     } else {
-        out.push(check(Level::Warn, "legacy peers", "legacy P2P disabled (p2p.legacy_enabled: false)"));
+        out.push(check(Level::Ok, "legacy peers", "legacy P2P disabled (p2p.legacy_enabled: false) — iroh only"));
     }
     let ntfry = &m["ntfry"];
+    let legacy_alive = if legacy["enabled"] == true { legacy["alive"].as_u64().unwrap_or(0) } else { 0 };
+    let iroh_neighbors = if ntfry["enabled"] == true { ntfry["neighbors"].as_u64().unwrap_or(0) } else { 0 };
+    if legacy_alive == 0 && iroh_neighbors == 0 {
+        out.push(check(Level::Fail, "peers", "no iroh neighbours and no legacy peers — the node is isolated from the network"));
+    }
     if ntfry["enabled"] == true {
         let n = ntfry["neighbors"].as_u64().unwrap_or(0);
         let relays = ntfry["homeRelays"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -129,13 +134,14 @@ pub fn evaluate(m: &Value, now_unix: i64) -> Vec<Check> {
     }
 
     match &node["lastAudit"] {
-        Value::Null => out.push(check(Level::Warn, "state audit", "never run — schedule `sth-core audit-all` nightly (node stopped)")),
+        Value::Null => out.push(check(Level::Ok, "state audit", "never run — schedule `sth-core audit-all --fix` weekly (the node keeps running)")),
         a => {
             let age = now_unix - a["atUnix"].as_i64().unwrap_or(0);
             let drifted = a["drifted"].as_u64().unwrap_or(0);
             let fixed = a["fixed"] == true;
-            let level = if drifted > 0 && !fixed { Level::Fail } else if age > 2 * 86_400 { Level::Warn } else { Level::Ok };
-            out.push(check(level, "state audit", format!("{} ago at height {} · {} wallets · {drifted} drifted{}{}", dur(age), a["height"], a["wallets"], if drifted > 0 { if fixed { " (repaired)" } else { " — run audit-all --fix" } } else { "" }, if age > 2 * 86_400 { " · older than 2 days" } else { "" })));
+            // a stale audit is a reminder, not a health problem: only unrepaired drift affects the verdict
+            let level = if drifted > 0 && !fixed { Level::Fail } else { Level::Ok };
+            out.push(check(level, "state audit", format!("{} ago at height {} · {} wallets · {drifted} drifted{}{}", dur(age), a["height"], a["wallets"], if drifted > 0 { if fixed { " (repaired)" } else { " — run audit-all --fix" } } else { "" }, if age > AUDIT_STALE_SECS { " · older than 7 days — run audit-all --fix" } else { "" })));
         }
     }
     let mp = &m["mempool"];
@@ -144,6 +150,9 @@ pub fn evaluate(m: &Value, now_unix: i64) -> Vec<Check> {
     out.push(check(if count * 10 > max * 9 { Level::Warn } else { Level::Ok }, "mempool", format!("{count} / {max} transactions")));
     out
 }
+
+/// Audit older than this is flagged in the detail line (weekly cron is enough).
+pub const AUDIT_STALE_SECS: i64 = 7 * 86_400;
 
 pub fn verdict(checks: &[Check]) -> Level {
     checks.iter().map(|c| c.level).max().unwrap_or(Level::Ok)
@@ -221,10 +230,12 @@ pub async fn run(cfg: &NodeConfig, public_ip: Option<String>, api_url: Option<St
             let alive = table.refresh(16, Duration::from_secs(10)).await;
             let r = crate::p2p_legacy::acceptance_check(&table, &me, Duration::from_secs(10)).await;
             let pct = if r.asked > 0 { r.listed * 100 / r.asked } else { 0 };
-            let level = if alive == 0 { Level::Warn } else if r.listed == 0 { Level::Fail } else if pct < 50 { Level::Warn } else { Level::Ok };
+            // informational: the network runs on PQ nodes, legacy acceptance no longer affects the verdict
+            let level = Level::Ok;
             checks.push(check(level, "legacy acceptance", if alive == 0 { "no legacy peer reachable from here".to_string() } else { format!("{me}:{port} listed by {} / {} peers ({pct}%){}", r.listed, r.asked, if r.listed == 0 { " — port open? legacy_public_addr correct? node ≥ 0.23.0?" } else { "" }) }));
         }
-        _ => checks.push(check(Level::Warn, "legacy acceptance", "skipped: set p2p.legacy_public_addr (gateway) or pass --public-ip to check whether legacy nodes accept this node")),
+        // all delegates run PQ nodes: without a public legacy address the check is simply not run
+        _ => {}
     }
     finish(checks)
 }
@@ -285,12 +296,21 @@ mod tests {
         assert_eq!(c.iter().find(|c| c.name == "state audit").unwrap().level, Level::Fail);
         m["node"]["lastAudit"]["fixed"] = json!(true);
         assert_eq!(evaluate(&m, 1_000_100).iter().find(|c| c.name == "state audit").unwrap().level, Level::Ok);
-        assert_eq!(evaluate(&base(), 1_000_000 + 3 * 86_400).iter().find(|c| c.name == "state audit").unwrap().level, Level::Warn);
+        let stale = evaluate(&base(), 1_000_000 + 8 * 86_400);
+        let a = stale.iter().find(|c| c.name == "state audit").unwrap();
+        assert_eq!(a.level, Level::Ok, "stale audit does not degrade the verdict");
+        assert!(a.detail.contains("older than 7 days"), "{}", a.detail);
+        assert!(!evaluate(&base(), 1_000_000 + 6 * 86_400).iter().find(|c| c.name == "state audit").unwrap().detail.contains("older"));
         let mut m = base();
         m["node"]["lastAudit"] = Value::Null;
         m["legacy"]["alive"] = json!(0);
         let c = evaluate(&m, 1_000_100);
-        assert_eq!(c.iter().find(|c| c.name == "state audit").unwrap().level, Level::Warn);
-        assert_eq!(verdict(&c), Level::Fail, "no legacy peer alive");
+        assert_eq!(c.iter().find(|c| c.name == "state audit").unwrap().level, Level::Ok);
+        assert_eq!(verdict(&c), Level::Ok, "no legacy peer alive, iroh neighbours present: healthy");
+        m["legacy"] = json!({ "enabled": false });
+        assert_eq!(verdict(&evaluate(&m, 1_000_100)), Level::Ok, "legacy P2P disabled: healthy");
+        m["ntfry"]["neighbors"] = json!(0);
+        let c = evaluate(&m, 1_000_100);
+        assert_eq!(c.iter().find(|c| c.name == "peers").unwrap().level, Level::Fail, "isolated node");
     }
 }

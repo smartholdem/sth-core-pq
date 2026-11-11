@@ -438,6 +438,9 @@ impl Actor {
                         let peer_state = self.peers.get(&peer_id);
                         let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
                         if !is_active {
+                            // sth-core patch: drop the Pending entry, otherwise its non-empty queue means no later
+                            // SendMessage ever dials this peer again (queue_dial only runs on an empty queue)
+                            self.peers.remove(&peer_id);
                             self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
                                 .await;
                         }
@@ -445,6 +448,12 @@ impl Actor {
                     None => {
                         warn!(peer = %peer_id.fmt_short(), "dial disconnected");
                         self.metrics.actor_tick_dialer_failure.inc();
+                        // sth-core patch: same as a failed dial — a stuck Pending entry would block redials forever
+                        if matches!(self.peers.get(&peer_id), Some(PeerState::Pending { .. })) {
+                            self.peers.remove(&peer_id);
+                            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
+                                .await;
+                        }
                     }
                 }
             }

@@ -23,6 +23,7 @@ pub mod mempool;
 pub mod models;
 pub mod node;
 pub mod newnet;
+pub mod newnet_wizard;
 pub mod node_config;
 pub mod node_pool;
 pub mod ntp;

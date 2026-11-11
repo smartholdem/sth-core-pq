@@ -30,7 +30,7 @@ struct Net {
 
 fn newnet(seed: &str) -> Net {
     let dir = tempfile::tempdir().unwrap();
-    let opts = NewNetOptions { ticker: "PQC".into(), title: "PqNet".into(), delegates: 3, pubkey_hash: 30, p2p_port: 4102, api_port: 4104, metrics_port: 4989, seed: seed.into(), tokens_at: None, pq_at: Some(PQ_AT), pq_blocks_at: Some(PQ_BLOCKS_AT), finality_hard: false, treasury_supply: 1_000_000 * 100_000_000, delegate_stake: 1000 * 100_000_000 };
+    let opts = NewNetOptions { ticker: "PQC".into(), title: "PqNet".into(), delegates: 3, pubkey_hash: 30, p2p_port: 4102, api_port: 4104, metrics_port: 4989, seed: seed.into(), tokens_at: None, pq_at: Some(PQ_AT), pq_blocks_at: Some(PQ_BLOCKS_AT), finality_hard: false, treasury_supply: 1_000_000 * 100_000_000, delegate_stake: 1000 * 100_000_000, epoch: Some("2023-08-29T00:00:00.000Z".into()), ..Default::default() };
     let n = generate(&opts, dir.path()).unwrap();
     let network = NodeConfig::load(&dir.path().join("node.yaml")).unwrap().load_network().unwrap();
     let storage = Arc::new(Storage::temporary(network.clone()).unwrap());

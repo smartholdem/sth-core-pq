@@ -1,6 +1,6 @@
 [package]
 name = "sth-core"
-version = "0.25.50"
+version = "0.25.51"
 edition = "2021"
 authors = ["TechnoL0g"]
 description = "SmartHoldem relay node core (Rust rewrite of @smartholdem/core)"
@@ -65,6 +65,13 @@ tempfile = "3"
 lto = true
 codegen-units = 1
 strip = true
+
+# Low-memory build (2-4 GB RAM, WSL2, small VPS): `cargo build --profile release-lowmem -j 2`
+# -> target/release-lowmem/sth-core; a few % slower than `release`, several times less RAM to compile.
+[profile.release-lowmem]
+inherits = "release"
+lto = false
+codegen-units = 16
 
 [profile.dev]
 debug = 0

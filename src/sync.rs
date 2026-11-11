@@ -859,6 +859,7 @@ pub fn check_stateful_rules(storage: &Storage, network: &Network, blocks: &[Bloc
                 let a = crate::rules::check_token_format(tx, storage.network().milestone(block.height)).map_err(fail)?;
                 tokens.sobjects = &sobjects as *const _;
                 crate::rules::check_token(tx, &a, &sender, &tokens).map_err(fail)?;
+                crate::rules::check_token_reserved(tx, &a, &sender, &tokens, storage.network().milestone(block.height)).map_err(fail)?;
                 if tx.type_ == crate::models::token::BUY {
                     // STH leg of a fill: buyer → seller, on top of the fee already subtracted above.
                     // Always strict (unlike legacy core transfers): tokens must never be bought with coins the buyer lacks.

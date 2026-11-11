@@ -555,6 +555,7 @@ impl Mempool {
             }
             let view = PoolTokenView { storage: &self.storage, pool: &pool, sender_pk: &tx.sender_public_key };
             crate::rules::check_token(tx, &a, &sender, &view).map_err(|e| ("ERR_APPLY".into(), e))?;
+            crate::rules::check_token_reserved(tx, &a, &sender, &view, ms).map_err(|e| ("ERR_APPLY".into(), e))?;
         } else if tx.type_group != crate::models::TYPE_GROUP_CORE {
             if !tx.is_sobj() {
                 return Err(("ERR_UNKNOWN".into(), format!("unsupported typeGroup {} type {}", tx.type_group, tx.type_)));

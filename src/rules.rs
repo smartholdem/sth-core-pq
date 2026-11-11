@@ -165,6 +165,11 @@ pub fn check_sobj(
                 return Err("SmartObjectAlreadyRegisteredError".into());
             }
             let name = e.data.name.as_deref().unwrap_or_default();
+            if ms.sobj_v2 && e.type_ == crate::models::token::TICKER_SOBJ_TYPE {
+                if let Some(err) = ms.reserved_tokens.refuse(name, wallet.map(|w| w.address.as_str()).unwrap_or_default()) {
+                    return Err(err);
+                }
+            }
             if name_taken(name, e.type_) {
                 return Err("SmartObjectNameAlreadyRegisteredError".into());
             }
@@ -396,6 +401,18 @@ pub trait TokenView {
     fn order(&self, id: &str) -> Option<crate::storage::TokenOrder>;
     /// Open SHIP-43 orders of `seller` for `token_id`.
     fn open_orders(&self, seller: &str, token_id: &str) -> usize;
+}
+
+/// TokenInit on a reserved / forbidden ticker (e.g. a type-5 sObject registered before the list was enforced) is
+/// refused unless the sender is the reserved-tickers owner.
+pub fn check_token_reserved(tx: &Transaction, a: &crate::models::TokenAsset, sender: &str, view: &dyn TokenView, ms: &crate::config::Milestone) -> Result<(), String> {
+    if tx.type_ != crate::models::token::INIT {
+        return Ok(());
+    }
+    match view.ticker_sobj(&a.id).and_then(|(_, name, _)| ms.reserved_tokens.refuse(&name, sender)) {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// STH the buyer pays for a `TokenBuy` (0 for every other transaction / unknown order).

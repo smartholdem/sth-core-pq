@@ -12,6 +12,7 @@ pub use gossip::fill_gap_from;
 mod peers;
 pub mod proto;
 pub mod relay_guard;
+pub mod relay_probe;
 pub mod rpc;
 pub mod wallet_api;
 
@@ -289,16 +290,19 @@ impl IrohNode {
         let lookup = iroh::address_lookup::MemoryLookup::new();
         // n0 DNS (`presets::N0*`) stays a fallback unless discovery.n0_dns is off → `Minimal` = no n0 contact at all
         let n0_dns = discovery.as_ref().map_or(true, |d| !d.cfg.enabled || d.cfg.n0_dns);
+        let mut dead_relays = Vec::new();
         let (mut builder, relay_urls) = match (&relay, n0_dns) {
             (Some(setup), true) => {
                 let map = setup.relay_map();
                 let urls: Vec<String> = map.urls::<Vec<iroh::RelayUrl>>().iter().map(|u| u.to_string()).collect();
+                dead_relays = relay_probe::prune_dead(&map).await;
                 (Endpoint::builder(presets::N0).relay_mode(iroh::RelayMode::Custom(map)), urls)
             }
             (None, true) => (Endpoint::builder(presets::N0DisableRelay), Vec::new()),
             (Some(setup), false) => {
                 let map = setup.relay_map();
                 let urls: Vec<String> = map.urls::<Vec<iroh::RelayUrl>>().iter().map(|u| u.to_string()).collect();
+                dead_relays = relay_probe::prune_dead(&map).await;
                 (Endpoint::builder(presets::Minimal).relay_mode(iroh::RelayMode::Custom(map)), urls)
             }
             (None, false) => (Endpoint::builder(presets::Minimal).relay_mode(iroh::RelayMode::Disabled), Vec::new()),
@@ -339,7 +343,9 @@ impl IrohNode {
         let peers = Arc::new(IrohPeers::default());
         // blocks with transactions and vote batches exceed the 4 KiB iroh-gossip default; peers on older builds still
         // receive our ≤ 4 KiB messages (votes are chunked), we accept up to 64 KiB from newer ones
-        let gossip = Gossip::builder().max_message_size(GOSSIP_MAX_MESSAGE_SIZE).spawn(endpoint.clone());
+        // validator swarm of ~20-30 nodes: a wider active view (upstream 5) keeps more direct paths
+        let membership = iroh_gossip::proto::HyparviewConfig { active_view_capacity: 8, passive_view_capacity: 48, ..Default::default() };
+        let gossip = Gossip::builder().max_message_size(GOSSIP_MAX_MESSAGE_SIZE).membership_config(membership).spawn(endpoint.clone());
         let addrbook = Arc::new(std::sync::OnceLock::new());
         let mut builder = Router::builder(endpoint.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())
@@ -363,6 +369,7 @@ impl IrohNode {
                 tracing::warn!("p2p.iroh.relay_n0: true — the public n0 relays are rate-limited and not meant for production; if one wins the latency race wallets time out through it (relay guard removes it after repeated failures). Prefer relay_n0: false (NETFORY n1 only)");
             }
             relay_guard::init(&setup.guard, &setup.protected(), endpoint.clone());
+            relay_probe::readd_when_alive(endpoint.clone(), std::mem::take(&mut dead_relays));
         }
         for id in &bootstrap {
             peers.seen(*id, None);
@@ -393,7 +400,7 @@ impl IrohNode {
     pub async fn refresh_peers(&self) -> usize {
         let ids: Vec<EndpointId> = self.peers.snapshot().into_iter().map(|p| p.id).filter(|id| *id != self.id()).collect();
         let results = futures::future::join_all(ids.into_iter().map(|id| async move {
-            tokio::time::timeout(std::time::Duration::from_secs(15), rpc::fetch_status(&self.endpoint, &self.peers, id)).await.ok().and_then(|r| r.ok())
+            tokio::time::timeout(std::time::Duration::from_secs(15), rpc::fetch_status(&self.endpoint, &self.peers, &self.nethash, id)).await.ok().and_then(|r| r.ok())
         }))
         .await;
         let alive = results.iter().filter(|r| r.is_some()).count();

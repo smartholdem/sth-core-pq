@@ -77,7 +77,7 @@ enum Command {
     /// Check the `alerts:` section: with an empty telegram_chat_id lists the chats the bot has seen (copy the id into
     /// node.yaml), otherwise sends a test message to Telegram / the webhook and prints the delivery result.
     AlertsTest,
-    /// One health verdict: node API / sync / stall / peers / last audit (from /api/ntfry/metrics) + legacy acceptance.
+    /// One health verdict: node API / sync / stall / peers / last audit (from /api/ntfry/metrics).
     /// Exit code 0 healthy, 1 warnings, 2 failures — cron-friendly.
     Doctor {
         /// Public IP of this node for the legacy acceptance check (default: p2p.legacy_public_addr).
@@ -239,20 +239,44 @@ enum Command {
 
 #[derive(Subcommand)]
 enum InitCmd {
-    /// Generate a private / test network (mainnet rules from block 1, tokens & PQ off): network files, signed genesis
-    /// with N delegates, their passphrases and node.yaml on separate ports. Nothing touches mainnet.
+    /// Generate a private / test network: network files, signed genesis with N delegates, their passphrases and
+    /// node.yaml on separate ports. In a terminal it asks the parameters interactively (ENTER = default); `--yes`
+    /// or a non-interactive stdin takes the flags / defaults. Nothing touches mainnet.
     Newnet {
-        #[arg(long, default_value = "./testnet")]
-        out: PathBuf,
+        /// Accept every default / flag without questions (scripts, CI).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Output folder (default: ./<name>).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Network name: lowercase a-z and '-' (also the default folder name).
+        #[arg(long, alias = "title", default_value = "smartholdem-testnet")]
+        name: String,
         #[arg(long, default_value = "TSH")]
-        ticker: String,
-        #[arg(long, default_value = "SmartHoldemTestNet")]
-        title: String,
+        symbol: String,
+        /// Native coin ticker; its first letter picks the address prefix and the burn address.
+        #[arg(long, alias = "ticker", default_value = "TSH")]
+        token: String,
+        /// Signed-message prefix (`\n` = new line).
+        #[arg(long, default_value = "SmartHoldemTestNet message:\\n")]
+        message_prefix: String,
+        /// First character of every address, e.g. S (default: the token's first letter, S if it cannot start an address).
+        #[arg(long)]
+        address_start: Option<char>,
+        /// Raw address version byte instead of --address-start (mainnet 63 = "S…").
+        #[arg(long, conflicts_with = "address_start")]
+        pubkey_hash: Option<u8>,
+        /// BIP-44 coin type, 0-2147483647.
+        #[arg(long, default_value_t = 255, value_parser = clap::value_parser!(u32).range(0..=0x7fff_ffff))]
+        slip44: u32,
+        #[arg(long, default_value_t = 255)]
+        wif: u8,
+        /// Activate everything from the first blocks (tokens + market, PQ v3 transactions, hard finality, service nodes);
+        /// `--all-features false` = mainnet base rules, tokens and PQ off.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        all_features: bool,
         #[arg(long, default_value_t = 21)]
         delegates: u16,
-        /// Address version byte (mainnet 63 = "S…"; 30 = "D…").
-        #[arg(long, default_value_t = 30)]
-        pubkey_hash: u8,
         #[arg(long, default_value_t = 4002)]
         p2p_port: u16,
         #[arg(long, default_value_t = 4004)]
@@ -280,6 +304,9 @@ enum InitCmd {
         /// Stake per delegate in whole coins.
         #[arg(long, default_value_t = 1_000)]
         delegate_stake: u64,
+        /// Coins the forger receives for every block from height 2, e.g. 2 or 0.5 (0 = no reward).
+        #[arg(long, default_value = "0", value_parser = |v: &str| sth_core::newnet::parse_coins(v).ok_or_else(|| "a number with up to 8 decimals".to_string()))]
+        block_reward: u64,
     },
 }
 
@@ -560,12 +587,33 @@ async fn async_main() -> anyhow::Result<()> {
                 None => println!("wallet {address} not found"),
             }
         }
-        Command::Init { newnet: Some(InitCmd::Newnet { out, ticker, title, delegates, pubkey_hash, p2p_port, api_port, metrics_port, seed, tokens_at, pq_at, pq_blocks_at, finality_hard, treasury, delegate_stake }), .. } => {
+        Command::Init { newnet: Some(InitCmd::Newnet { yes, out, name, symbol, token, message_prefix, address_start, pubkey_hash, slip44, wif, all_features, delegates, p2p_port, api_port, metrics_port, seed, tokens_at, pq_at, pq_blocks_at, finality_hard, treasury, delegate_stake, block_reward }), .. } => {
+            use std::io::IsTerminal;
             let seed = seed.unwrap_or_else(|| hex::encode(&iroh::SecretKey::generate().to_bytes()[..16]));
-            let opts = sth_core::newnet::NewNetOptions { ticker, title, delegates: delegates.max(1), pubkey_hash, p2p_port, api_port, metrics_port, seed: seed.clone(), tokens_at, pq_at, pq_blocks_at, finality_hard, treasury_supply: treasury * 100_000_000, delegate_stake: delegate_stake * 100_000_000 };
+            let auto_hash = match address_start {
+                Some(c) => sth_core::newnet::pubkey_hash_for(c).ok_or_else(|| anyhow::anyhow!("--address-start {c:?}: allowed {}", sth_core::newnet::address_start_symbols()))?,
+                None => token.chars().next().and_then(sth_core::newnet::pubkey_hash_for).unwrap_or(63),
+            };
+            let mut opts = sth_core::newnet::NewNetOptions { ticker: token, title: name, symbol, message_prefix: message_prefix.replace("\\n", "\n"), slip44, wif, all_features, delegates: delegates.max(1), pubkey_hash: pubkey_hash.unwrap_or(auto_hash), p2p_port, api_port, metrics_port, seed: seed.clone(), tokens_at, pq_at, pq_blocks_at, finality_hard, treasury_supply: treasury * 100_000_000, delegate_stake: delegate_stake * 100_000_000, block_reward, epoch: None };
+            if !yes && std::io::stdin().is_terminal() {
+                if !sth_core::newnet_wizard::run(&mut opts, &mut std::io::stdin().lock(), &mut std::io::stdout())? {
+                    println!("cancelled — nothing written");
+                    return Ok(());
+                }
+            } else if !opts.title.chars().next().is_some_and(|c| c.is_ascii_lowercase()) || !opts.title.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+                anyhow::bail!("--name {:?}: only lowercase letters a-z and '-', starting with a letter", opts.title);
+            }
+            let out = out.unwrap_or_else(|| PathBuf::from(format!("./{}", opts.title)));
+            if out.join("genesisBlock.json").exists() {
+                anyhow::bail!("{} already contains a network (genesisBlock.json) — choose another name or remove the folder", out.display());
+            }
+            let epoch = opts.epoch.get_or_insert_with(sth_core::newnet::now_epoch).clone();
             let n = sth_core::newnet::generate(&opts, &out)?;
-            println!("new network written to {}", out.display());
+            println!("\nnew network written to {}", out.display());
             println!("  nethash     {}", n.nethash);
+            println!("  burn        {}", n.burn_address);
+            println!("  epoch       {epoch}");
+            println!("  iroh id     {}  (p2p.iroh.bootstrap of further nodes: \"{}@<ip>:{}\")", n.iroh_id, n.iroh_id, opts.p2p_port);
             println!("  genesis id  {}", n.genesis_id);
             println!("  treasury    {}  (passphrase in delegates.json)", n.treasury_address);
             println!("  delegates   {} (passphrases in delegates.json, all forging in node.yaml)", n.delegate_passphrases.len());

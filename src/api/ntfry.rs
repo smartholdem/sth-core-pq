@@ -85,6 +85,9 @@ fn delegates_json(st: &Shared) -> Result<Value, crate::error::Error> {
     let slashing = ms.finality.slashing;
     let min_version = ms.min_core_version.as_str();
     let known = st.iroh.as_ref().map(|i| i.rust_delegates.snapshot()).unwrap_or_default();
+    let ever = st.iroh.as_ref().map(|i| i.rust_delegates.all()).unwrap_or_default();
+    let rejected = st.iroh.as_ref().map(|i| i.rust_delegates.rejected()).unwrap_or_default();
+    let iroh_on = st.iroh.is_some();
     // legacy-protocol addresses that are actually Rust nodes (gateways announced over iroh + this node)
     let mut rust_ws: std::collections::HashSet<String> = st
         .iroh
@@ -110,6 +113,24 @@ fn delegates_json(st: &Shared) -> Result<Value, crate::error::Error> {
         } else {
             "unknown"
         };
+        // why the delegate is not shown as PQ: the most specific evidence first
+        let (reason, reason_text): (Option<&str>, Option<String>) = if info.is_some() {
+            (None, None)
+        } else if !iroh_on {
+            (Some("iroh-off"), Some("iroh is off on this node: delegate announces cannot be received".into()))
+        } else if let Some(r) = rejected.get(&pk) {
+            let what = match r.reason {
+                crate::p2p_iroh::delegates::Rejection::Signature => "signature does not match the announcing node (node on sth-core < 0.25.51 behind a gossip hop, or a forged announce)",
+                crate::p2p_iroh::delegates::Rejection::Clock => "announce timestamp more than 10 min off — the delegate's node clock is wrong (check NTP)",
+            };
+            (Some(r.reason.code()), Some(format!("{} announce(s) refused, last {} s ago: {what}", r.count, r.last.elapsed().as_secs())))
+        } else if let Some(old) = ever.get(&pk) {
+            (Some("announce-stale"), Some(format!("last announce {} min ago (expected every 2 min): node offline, stopped forging or lost its iroh neighbours", old.last_seen.elapsed().as_secs() / 60)))
+        } else if implementation == "legacy" {
+            (Some("legacy-blocks"), Some(format!("{observed} blocks seen only from legacy nodes and no announce: most likely still a Node.js core")))
+        } else {
+            (Some("no-announce"), Some("no announce received yet: delegate not on sth-core, announce disabled, or no gossip path to its node".into()))
+        };
         list.push(json!({
             "rank": rank + 1,
             "username": w.username,
@@ -117,6 +138,8 @@ fn delegates_json(st: &Shared) -> Result<Value, crate::error::Error> {
             "votes": votes.to_string(),
             "implementation": implementation,
             "inferred": implementation == "legacy",
+            "reason": reason,
+            "reasonText": reason_text,
             "observed": observed,
             "version": info.map(|i| i.version.clone()),
             "outdated": info.is_some_and(|i| version_below(&i.version, min_version)),

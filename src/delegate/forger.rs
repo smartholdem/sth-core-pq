@@ -175,7 +175,7 @@ impl Forger {
         if let Some(node) = &self.opts.iroh {
             for id in node.peers.snapshot().into_iter().filter(|p| p.failures < 3).map(|p| p.id).take(count) {
                 probes.push(Box::pin(async move {
-                    match tokio::time::timeout(Duration::from_secs(4), crate::p2p_iroh::fetch_status(&node.endpoint, &node.peers, id)).await {
+                    match tokio::time::timeout(Duration::from_secs(4), crate::p2p_iroh::fetch_status(&node.endpoint, &node.peers, &node.nethash, id)).await {
                         Ok(Ok((height, block_id))) => Some(PeerView { ip: format!("iroh:{}", id.fmt_short()), height, id: block_id.unwrap_or_default(), iroh_id: Some(id) }),
                         _ => None,
                     }

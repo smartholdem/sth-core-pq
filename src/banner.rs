@@ -46,10 +46,10 @@ pub enum Row {
     Switch(&'static str, bool, String),
 }
 
-fn sth(v: u64) -> String {
+fn sth(v: u64, symbol: &str) -> String {
     let s = format!("{}.{:08}", v / 100_000_000, v % 100_000_000);
     let s = s.trim_end_matches('0').trim_end_matches('.');
-    format!("{s} STH")
+    format!("{s} {symbol}")
 }
 
 fn short(id: &str) -> String {
@@ -77,9 +77,9 @@ pub fn rows(cfg: &NodeConfig, network: &Network, ms: &Milestone, f: &Facts) -> V
         (Some(id), Some(a)) if f.tip_height > 0 => format!("{} · id {} · {}", group(f.tip_height), short(id), age(a)),
         _ => "none — genesis will be written".to_string(),
     }));
-    r.push(Info("Milestone", format!("@{} · {}s slots · {} active delegates · reward {} · multiPayment {} · HTLC {}", group(f.tip_height + 1), ms.blocktime, ms.active_delegates, sth(ms.reward), ms.multi_payment_limit, if ms.htlc_enabled { "on" } else { "off" })));
+    r.push(Info("Milestone", format!("@{} · {}s slots · {} active delegates · reward {} · multiPayment {} · HTLC {}", group(f.tip_height + 1), ms.blocktime, ms.active_delegates, sth(ms.reward, &network.token), ms.multi_payment_limit, if ms.htlc_enabled { "on" } else { "off" })));
     r.push(Info("Consensus", format!("DPoS + SHIP-35 finality (quorum {}/{}{}) · strict balance {}", ms.finality_quorum(), ms.active_delegates, if ms.finality.active { ", hard mode" } else { "" }, if ms.strict_balance { "on" } else { "off" })));
-    r.push(Info("Fees", format!("dynamic {} (min transfer {}) · legacy pools {} {}", if cfg.mempool.dynamic_fees.enabled { "on" } else { "off" }, sth(f.min_transfer_fee), if f.legacy_dynamic_fees { "≥" } else { "exactly" }, sth(f.legacy_min_transfer_fee))));
+    r.push(Info("Fees", format!("dynamic {} (min transfer {}) · legacy pools {} {}", if cfg.mempool.dynamic_fees.enabled { "on" } else { "off" }, sth(f.min_transfer_fee, &network.token), if f.legacy_dynamic_fees { "≥" } else { "exactly" }, sth(f.legacy_min_transfer_fee, &network.token))));
     let pq_stage = if ms.pq.blocks { "C — PQ blocks" } else if ms.pq.active { "B — v3 transactions" } else { "A — commitments" };
     r.push(Info("Quantum Shield", format!("stage {pq_stage} · ML-DSA-44 · {} committed · {} PQ keys", group(f.pq_commitments as u64), group(f.pq_keys as u64))));
 
@@ -104,7 +104,7 @@ pub fn rows(cfg: &NodeConfig, network: &Network, ms: &Milestone, f: &Facts) -> V
     let metrics = cfg.api.enabled && cfg.api.page_metrics;
     r.push(Switch("Metrics page", metrics, if !metrics { "off".into() } else if cfg.api.metrics_listen.trim().is_empty() { format!("http://{}:{}/", cfg.api.host, cfg.api.port) } else { format!("http://{}/", cfg.api.metrics_listen.trim()) }));
     r.push(Switch("Delegate", f.forging_keys > 0, if f.forging_keys > 0 { format!("{} key(s) loaded{} · quorum {} of peers, min {}{}", f.forging_keys, if cfg.delegate.pq_secrets.is_empty() { "" } else { " + PQ" }, cfg.delegate.quorum_share, cfg.delegate.min_quorum_peers, if cfg.delegate.forge_over_minority { " · minority rule" } else { "" }) } else { "relay only".into() }));
-    r.push(Switch("Service Nodes", ms.masternodes.enabled, if ms.masternodes.enabled { format!("SHIP-42 · collateral {}", sth(ms.masternodes.collateral_amount)) } else { "off until milestone".into() }));
+    r.push(Switch("Service Nodes", ms.masternodes.enabled, if ms.masternodes.enabled { format!("SHIP-42 · collateral {}", sth(ms.masternodes.collateral_amount, &network.token)) } else { "off until milestone".into() }));
     r.push(Switch("Token Market", ms.token_market.enabled, if ms.token_market.enabled { format!("SHIP-43 · max {} open orders", ms.token_market.max_open_orders) } else { "off until milestone".into() }));
     let alerts = crate::alerts::enabled();
     r.push(Switch("Alerts", alerts, if alerts { [(!cfg.alerts.telegram_chat_id.is_empty(), "telegram"), (!cfg.alerts.webhook_url.is_empty(), "webhook")].iter().filter(|(b, _)| *b).map(|(_, n)| *n).collect::<Vec<_>>().join(" + ") } else { "off".into() }));
@@ -416,9 +416,9 @@ mod tests {
 
     #[test]
     fn helpers() {
-        assert_eq!(sth(100_000_000), "1 STH");
-        assert_eq!(sth(25_000_000), "0.25 STH");
-        assert_eq!(sth(0), "0 STH");
+        assert_eq!(sth(100_000_000, "STH"), "1 STH");
+        assert_eq!(sth(25_000_000, "STH"), "0.25 STH");
+        assert_eq!(sth(0, "STH"), "0 STH");
         assert_eq!(age(30), "30s ago");
         assert_eq!(age(600), "10m ago");
         assert_eq!(age(7_200), "2h ago");

@@ -533,3 +533,47 @@ async fn token_market_orders_fill_cancel_and_rollback() {
     assert_eq!((cs[0]["open"].as_str(), cs[0]["close"].as_str(), cs[0]["high"].as_str(), cs[0]["low"].as_str()), (Some("100000000"), Some("200000000"), Some("200000000"), Some("100000000")));
     assert_eq!((cs[0]["volume"].as_str(), cs[0]["trades"].as_u64()), (Some("40"), Some(2)));
 }
+
+#[test]
+fn reserved_and_forbidden_tickers_are_protected() {
+    let alice = KeyPair::from_passphrase("alice").unwrap();
+    let bob = KeyPair::from_passphrase("bob").unwrap();
+    let (a_addr, b_addr) = (alice.address(63).unwrap(), bob.address(63).unwrap());
+    let reserved = |n: Network| n.with_reserved_tokens(sth_core::config::ReservedTokens::from_json(r#"["BTC","eth"]"#, &a_addr, &["STH"]).unwrap());
+    let ms = MAINNET_MILESTONES_JSON.replace("\"ship11\": true", "\"ship11\": true, \"aip36\": true, \"tokens\": true, \"sobjV2\": true");
+    let mut c = Chain::new(reserved(Network::from_json(MAINNET_NETWORK_JSON, &ms, MAINNET_EXCEPTIONS_JSON, MAINNET_GENESIS_GZ).unwrap()));
+    c.storage.update_wallet_state(&a_addr, 100_000_000_000_000, 0).unwrap();
+    c.storage.update_wallet_state(&b_addr, 100_000_000_000_000, 0).unwrap();
+
+    let e = c.try_block(vec![sign(ticker(&bob, 1, "BTC"), &bob)]).unwrap_err();
+    assert!(e.contains("Token Reserved") && e.contains("choose another name"), "{e}");
+    let e = c.try_block(vec![sign(ticker(&bob, 1, "ETH"), &bob)]).unwrap_err();
+    assert!(e.contains("TokenReservedError"), "list is case-insensitive: {e}");
+    let e = c.try_block(vec![sign(ticker(&alice, 1, "STH"), &alice)]).unwrap_err();
+    assert!(e.contains("native coin"), "STH is forbidden even for the owner: {e}");
+    c.try_block(vec![sign(ticker(&bob, 1, "COFFEE"), &bob)]).unwrap();
+    let btc = sign(ticker(&alice, 1, "BTC"), &alice);
+    c.try_block(vec![btc.clone()]).unwrap();
+    c.try_block(vec![sign(init(&alice, 2, btc.id.as_deref().unwrap(), 3, 1_000, 10_000), &alice)]).unwrap();
+
+    // a reserved ticker sObject registered before the list was enforced cannot become a token for someone else
+    let mut old = Chain::new(reserved(network_tokens()));
+    old.storage.update_wallet_state(&b_addr, 100_000_000_000_000, 0).unwrap();
+    let eth = sign(ticker(&bob, 1, "ETH"), &bob);
+    old.try_block(vec![eth.clone()]).unwrap();
+    let e = old.try_block(vec![sign(init(&bob, 2, eth.id.as_deref().unwrap(), 3, 1_000, 10_000), &bob)]).unwrap_err();
+    assert!(e.contains("Token Reserved"), "{e}");
+
+    // the embedded mainnet list
+    let m = Network::mainnet_ref().milestone(12_500_000);
+    for t in ["BTC", "ETH", "USDT", "USD", "SOL", "DOGE"] {
+        assert!(m.reserved_tokens.reserved.contains(t), "{t}");
+    }
+    assert!(m.reserved_tokens.reserved.len() >= 200 && m.reserved_tokens.forbidden.contains("STH"));
+    assert!(m.reserved_tokens.refuse("COFFEE", &b_addr).is_none());
+    let owner = &m.reserved_tokens.owner;
+    let raw = bs58::decode(owner).with_check(None).into_vec().expect("embedded owner is a valid base58check address");
+    assert_eq!(raw[0], 63, "owner is a mainnet address");
+    assert!(m.reserved_tokens.refuse("BTC", owner).is_none() && m.reserved_tokens.refuse("BTC", &b_addr).is_some());
+    assert!(m.reserved_tokens.refuse("STH", owner).is_some());
+}

@@ -23,9 +23,11 @@ async fn rpc_between_two_nodes() {
 
     let _ = tokio::time::timeout(Duration::from_secs(15), a.endpoint.online()).await;
     let addr = a.endpoint.addr();
-    let (height, id) = tokio::time::timeout(Duration::from_secs(30), fetch_status(&b.endpoint, &b.peers, addr.clone())).await.unwrap().unwrap();
+    let (height, id) = tokio::time::timeout(Duration::from_secs(30), fetch_status(&b.endpoint, &b.peers, &b.nethash, addr.clone())).await.unwrap().unwrap();
     assert_eq!(height, 1);
     assert_eq!(id.as_deref(), Some(network.genesis_block_id.as_str()));
+    let other = tokio::time::timeout(Duration::from_secs(30), fetch_status(&b.endpoint, &b.peers, &"f".repeat(64), addr.clone())).await.unwrap();
+    assert!(other.unwrap_err().to_string().contains("another network"), "a node of another network is refused");
     let blocks = fetch_blocks(&b.endpoint, &b.peers, addr.clone(), 0, 10).await.unwrap();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].transactions.len(), 1855);
@@ -107,7 +109,10 @@ fn delegate_announce_is_bound_to_node_and_time() {
     assert_eq!(a.len(), 1);
     assert_eq!(a[0].public_key, key.public_key_hex());
     assert!(verify_announce(&a[0], &me));
-    assert!(!verify_announce(&a[0], &other), "announce replayed from another node must fail");
+    assert!(verify_announce(&a[0], &other), "relayed by another node: still the forging node's announce (nodeId)");
+    let mut claimed = a[0].clone();
+    claimed.node_id = Some(other.to_string());
+    assert!(!verify_announce(&claimed, &other), "another node cannot claim the delegate for itself");
     let mut stale = a[0].clone();
     stale.timestamp -= 3600;
     assert!(!verify_announce(&stale, &me));
@@ -221,7 +226,7 @@ async fn minimal_preset_without_n0_talks_via_pinned_bootstrap() {
     let b = IrohNode::spawn_with(iroh::SecretKey::generate(), vec![a.id()], true, None, b_storage.clone(), b_pool, false, None, None, Some(DiscoveryOpts { cfg, pinned })).await.unwrap();
 
     // B dials A by id only: the pinned address in MemoryLookup is the whole "discovery"
-    let (height, _) = tokio::time::timeout(Duration::from_secs(30), fetch_status(&b.endpoint, &b.peers, a.id())).await.unwrap().unwrap();
+    let (height, _) = tokio::time::timeout(Duration::from_secs(30), fetch_status(&b.endpoint, &b.peers, &b.nethash, a.id())).await.unwrap().unwrap();
     assert_eq!(height, 1);
     assert!(a.relay_urls.is_empty(), "no relays configured → none reported");
     a.shutdown().await;

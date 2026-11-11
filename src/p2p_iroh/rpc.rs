@@ -144,12 +144,17 @@ async fn call(endpoint: &Endpoint, peer: impl Into<EndpointAddr>, req: &Request)
     Ok(resp)
 }
 
-/// `GetStatus` → (height, block id); records latency in the peer table.
-pub async fn fetch_status(endpoint: &Endpoint, peers: &IrohPeers, peer: impl Into<EndpointAddr>) -> Result<(u64, Option<String>)> {
+/// `GetStatus` → (height, block id); records latency in the peer table. A peer of another network (different
+/// nethash, e.g. a testnet node dialled by mistake) is an error and never enters the height table.
+pub async fn fetch_status(endpoint: &Endpoint, peers: &IrohPeers, nethash: &str, peer: impl Into<EndpointAddr>) -> Result<(u64, Option<String>)> {
     let peer: EndpointAddr = peer.into();
     let started = Instant::now();
     let id = peer.id;
     match call(endpoint, peer, &Request::GetStatus).await {
+        Ok(Response::Status { nethash: theirs, .. }) if !theirs.is_empty() && theirs != nethash => {
+            peers.record_rpc(id, None, None);
+            Err(Error::Sync(format!("iroh peer {} is on another network (nethash {}…)", id.fmt_short(), &theirs[..theirs.len().min(12)])))
+        }
         Ok(Response::Status { height, id: block_id, .. }) => {
             peers.record_rpc(id, Some(started.elapsed().as_millis() as u64), Some(height));
             if let Some(kind) = pool().lock().unwrap_or_else(|e| e.into_inner()).get(&id).and_then(path_kind) {

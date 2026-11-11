@@ -457,6 +457,7 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
     storage.set_undo_enabled(true);
     let mut fork_depth = 1u64;
     let mut last_ip = String::new();
+    let mut last_warn: Option<Instant> = None;
     loop {
         let Some(ip) = table.best_for_blocks(1).into_iter().next() else {
             // every alive peer parked as a block source (our own gossip/pull races count as failures) → forgive them
@@ -465,8 +466,17 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
                 tracing::warn!(unparked, "all legacy peers were parked as block sources, parking lifted");
                 continue;
             }
-            tracing::warn!("no healthy legacy peers, re-probing in 5s");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // a private network without p2p.legacy_peers has nobody to probe: say it once, then stay quiet
+            let empty = table.is_empty();
+            if last_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(300)) {
+                if empty {
+                    tracing::info!("no legacy peers configured (p2p.legacy_peers empty) — legacy follow idle, blocks come from this node's forging / iroh");
+                } else {
+                    tracing::warn!("no healthy legacy peers, re-probing every 5s");
+                }
+                last_warn = Some(Instant::now());
+            }
+            tokio::time::sleep(Duration::from_secs(if empty { 30 } else { 5 })).await;
             table.refresh(PROBE_CONCURRENCY, PROBE_TIMEOUT).await;
             continue;
         };

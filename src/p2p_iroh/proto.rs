@@ -48,6 +48,10 @@ pub struct FinalityVote {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DelegateAnnounce {
+    /// EndpointId of the forging node (hex). Gossip `delivered_from` is only the last hop, so a relayed announce must
+    /// be verified against this; absent on nodes before 0.25.51 (receivers then fall back to the sender).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     pub public_key: String,
     pub version: String,
     /// Unix seconds; receivers accept ±10 min.
