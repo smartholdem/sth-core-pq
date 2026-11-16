@@ -300,6 +300,7 @@ impl NodeContext {
             });
         }
         crate::delegate::spawn_round_tracker(self.storage.clone());
+        crate::intake::spawn_parked_applier(self.storage.clone());
         crate::intake::spawn_stall_watchdog(self.storage.clone(), self.peers.clone(), self.iroh.clone(), cfg.sync.verify_blocks);
         let pool = self.mempool.clone();
         tokio::spawn(async move {

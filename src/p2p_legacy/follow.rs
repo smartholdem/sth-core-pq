@@ -597,6 +597,7 @@ async fn follow_live(storage: &Arc<Storage>, table: &PeerTable, opts: &P2pOption
                     // the peer accepted a block whose slot has not started (older node / same forger clock): retry
                     // after a second instead of parking the peer — it becomes valid once the slot starts
                     tracing::debug!(peer = ip, %msg, "future block not applied yet");
+                    crate::intake::park_origin(headers.last().and_then(|b| b.id.as_deref()), crate::intake::Source::PullLegacy, ip.as_str());
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     just_fetched = true;
                 }

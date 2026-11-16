@@ -329,6 +329,9 @@ impl LegacyServer {
             let known = self.storage.get_block_by_height(height)?.and_then(|b| b.id) == block_id;
             return Ok(PostBlockResponse { status: known, height: self.storage.get_last_height()? as u32 }.encode_to_vec());
         }
+        if matches!(applied, Err(Error::FutureBlock(_))) {
+            crate::intake::park_origin(block_id.as_deref(), crate::intake::Source::PushLegacy, remote.ip().to_string());
+        }
         applied?;
         crate::intake::record(crate::intake::Source::PushLegacy, remote.ip().to_string(), height, block_ts, &generator, self.storage.network());
         crate::delegate::guard::on_accepted(crate::intake::Source::PushLegacy, &remote.ip().to_string(), &header, self.storage.network());

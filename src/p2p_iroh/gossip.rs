@@ -231,7 +231,11 @@ async fn on_block(node: &IrohNode, storage: &Arc<Storage>, seen: &Mutex<Seen>, f
     if block.height == tip.height + 1 {
         let (h, ts, gen) = (block.height, block.timestamp, block.generator_public_key.clone());
         let header = Block { transactions: Vec::new(), ..block.clone() };
-        let tip = apply(storage, vec![block], tip, verify).await?;
+        let applied = apply(storage, vec![block], tip, verify).await;
+        if matches!(applied, Err(Error::FutureBlock(_))) {
+            crate::intake::park_origin(header.id.as_deref(), crate::intake::Source::GossipIroh, from.fmt_short().to_string());
+        }
+        let tip = applied?;
         crate::intake::record(crate::intake::Source::GossipIroh, from.fmt_short().to_string(), h, ts, &gen, storage.network());
         crate::delegate::guard::on_accepted(crate::intake::Source::GossipIroh, &from.fmt_short().to_string(), &header, storage.network());
         let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());

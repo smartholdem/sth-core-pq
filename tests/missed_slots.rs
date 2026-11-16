@@ -68,7 +68,7 @@ fn blocks_for_a_future_slot_are_discarded() {
     assert!(err.to_string().contains("takes slot"), "{err}");
     assert_eq!(storage.get_last_height().unwrap(), 1);
     let snap = sth_core::intake::snapshot();
-    assert_eq!(snap["futureRejected"]["count"], 1);
+    assert!(snap["futureRejected"]["count"].as_u64().unwrap() >= 1);
     assert_eq!(snap["futureRejected"]["last"]["height"], 2);
 
     // the current slot (and anything in the past) is fine
@@ -92,4 +92,54 @@ fn minority_rule_needs_a_quorum_on_our_tip_and_fewer_than_a_third_ahead() {
     // tiny networks: 1 of 3 ahead is a third → wait
     assert!(!minority_rule(1, 2, 3, 2));
     assert!(minority_rule(1, 3, 4, 3));
+}
+
+#[test]
+fn a_block_less_than_a_slot_early_is_held_and_applied_at_its_slot_start() {
+    let network = Network::mainnet();
+    let storage = Storage::temporary(network.clone()).unwrap();
+    sth_core::genesis::ensure_genesis(&storage, &network).unwrap();
+    let genesis = sth_core::genesis::mainnet_block().unwrap();
+    let k = KeyPair::from_passphrase("slightly fast clock").unwrap();
+    // 2..5 s before the next slot (the cyber case of 16.11.2026: 2.5 s early)
+    let unix_ms = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let slot_ms = |s: u64| network.epoch_to_unix(slot_start(s, 8)) * 1000;
+    let next = loop {
+        let next = network.now_epoch() as u64 / 8 + 1;
+        let left = slot_ms(next) - unix_ms();
+        if (2_000..=5_000).contains(&left) {
+            break next;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let tip = ChainTip { height: 1, id: genesis.id.clone() };
+    let early = forge_block(&network, &k, &genesis, slot_start(next, 8), vec![]).unwrap();
+    let err = sth_core::sync::apply_blocks(&storage, &network, std::slice::from_ref(&early), tip.clone(), false).unwrap_err();
+    assert!(matches!(err, Error::FutureBlock(_)) && err.to_string().contains("held"), "{err}");
+    assert_eq!(storage.get_last_height().unwrap(), 1, "not applied before its slot");
+    assert_eq!(sth_core::intake::apply_due_parked(&storage), 0, "slot not started yet");
+    assert_eq!(sth_core::intake::snapshot()["futureHeld"]["last"]["height"], 2);
+
+    // a second block of the same generator is not held (one per delegate)
+    let twin = forge_block(&network, &KeyPair::from_passphrase("slightly fast clock").unwrap(), &genesis, slot_start(next, 8) + 1, vec![]).unwrap();
+    let err = sth_core::sync::apply_blocks(&storage, &network, &[twin], tip, false).unwrap_err();
+    assert!(!err.to_string().contains("held"), "{err}");
+
+    std::thread::sleep(std::time::Duration::from_millis((slot_ms(next) - unix_ms()).max(0) as u64 + 50));
+    assert_eq!(sth_core::intake::apply_due_parked(&storage), 1);
+    assert_eq!(storage.get_last_block().unwrap().unwrap().id, early.id);
+    assert_eq!(sth_core::intake::apply_due_parked(&storage), 0);
+
+    // a held block is dropped when the tip moved meanwhile (same test: the parked buffer is process-global)
+    let storage = Storage::temporary(network.clone()).unwrap();
+    sth_core::genesis::ensure_genesis(&storage, &network).unwrap();
+    let genesis = sth_core::genesis::mainnet_block().unwrap();
+    let now = network.now_epoch() as u64;
+    let honest = forge_block(&network, &KeyPair::from_passphrase("honest").unwrap(), &genesis, slot_start(now / 8, 8), vec![]).unwrap();
+    let early = forge_block(&network, &KeyPair::from_passphrase("stale and fast").unwrap(), &genesis, slot_start(now / 8 + 1, 8), vec![]).unwrap();
+    // parked directly: independent of where in the slot the test runs
+    assert!(sth_core::intake::park_future(&early, &network, 0, false));
+    storage.apply_block(&honest).unwrap();
+    assert_eq!(sth_core::intake::apply_due_parked(&storage), 0);
+    assert_eq!(storage.get_last_block().unwrap().unwrap().id, honest.id, "the honest block stays");
 }

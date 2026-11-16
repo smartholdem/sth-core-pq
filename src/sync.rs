@@ -572,19 +572,24 @@ pub fn apply_blocks(storage: &Storage, network: &Network, blocks: &[Block], mut 
             Ok(())
         })
         .collect();
-    for block in blocks {
+    for (i, block) in blocks.iter().enumerate() {
         let height = block.height;
         if height != tip.height + 1 {
             return Err(Error::Sync(format!("height gap: expected {}, got {height}", tip.height + 1)));
         }
         if let Some(early_ms) = crate::intake::future_slot_ms(block, network) {
-            crate::intake::note_future_block(storage, block, early_ms);
+            // less than a slot ahead and properly signed on top of the tip → held until the slot starts
+            let held = crypto[i].is_ok()
+                && tip.id.as_deref().is_none_or(|p| block.previous_block == p)
+                && crate::intake::park_future(block, network, early_ms, verify);
+            crate::intake::note_future_block(storage, block, early_ms, held);
             return Err(Error::FutureBlock(format!(
-                "block {height} ({}) by {} takes slot {} which starts in {:.1}s — the forger's clock is ahead",
+                "block {height} ({}) by {} takes slot {} which starts in {:.1}s — the forger's clock is ahead{}",
                 block.id.as_deref().and_then(|i| i.get(..8)).unwrap_or("?"),
                 block.generator_public_key,
                 crate::delegate::round::slot_number(block.timestamp, network.milestone(height).blocktime),
-                early_ms as f64 / 1000.0
+                early_ms as f64 / 1000.0,
+                if held { " (held until the slot starts)" } else { "" }
             )));
         }
         let id = block

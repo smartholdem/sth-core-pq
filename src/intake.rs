@@ -55,6 +55,8 @@ struct Intake {
     earliest: Option<EarlyBlock>,
     future_rejected: u64,
     last_future: Option<EarlyBlock>,
+    future_held: u64,
+    last_held: Option<EarlyBlock>,
     /// Id of the last discarded future block: the same block is offered again by several paths — count it once.
     last_future_id: Option<String>,
 }
@@ -89,9 +91,9 @@ pub fn future_slot_ms(block: &crate::models::Block, network: &crate::config::Net
     (early > FUTURE_SLOT_GRACE_MS).then_some(early)
 }
 
-/// Count a discarded future block (metrics `intake.futureRejected`) and alert once per cooldown: the generator's clock
-/// is ahead — its blocks steal the next delegate's slot on nodes that accept them and split the network otherwise.
-pub fn note_future_block(storage: &crate::storage::Storage, block: &crate::models::Block, early_ms: i64) {
+/// Count a future block (metrics `intake.futureRejected` / `intake.futureHeld`) and alert once per cooldown.
+/// `held` = the block is parked until its slot starts (clock ahead by less than a slot), otherwise it is dropped.
+pub fn note_future_block(storage: &crate::storage::Storage, block: &crate::models::Block, early_ms: i64, held: bool) {
     let username = crate::crypto::address_from_public_key(&block.generator_public_key, storage.network().pubkey_hash).ok().and_then(|a| storage.get_wallet(&a).ok().flatten()).and_then(|w| w.username);
     let name = username.clone().unwrap_or_else(|| block.generator_public_key.clone());
     let early = EarlyBlock { height: block.height, generator: block.generator_public_key.clone(), username, source: None, early_ms, at_unix: now_ms() / 1000 };
@@ -101,15 +103,124 @@ pub fn note_future_block(storage: &crate::storage::Storage, block: &crate::model
             return;
         }
         i.last_future_id = block.id.clone();
-        i.future_rejected += 1;
-        i.last_future = Some(early);
+        if held {
+            i.future_held += 1;
+            i.last_held = Some(early);
+        } else {
+            i.future_rejected += 1;
+            i.last_future = Some(early);
+        }
     }
-    tracing::warn!("Discarded block {} by {name}: it takes a future slot starting in {:.1}s — delegate {name}'s clock runs ahead", block.height, early_ms as f64 / 1000.0);
-    crate::alerts::notify(
-        "future-block",
-        format!("FUTURE BLOCK discarded: height {} by delegate {name} takes a slot that starts in {:.1}s. The system clock of {name}'s node is ahead by about that much — tell the operator to enable NTP (timedatectl set-ntp true / chrony). Until then that delegate misses its slots.", block.height, early_ms as f64 / 1000.0),
-        false,
-    );
+    let secs = early_ms as f64 / 1000.0;
+    if held {
+        tracing::warn!("Block {} by {name} arrived {secs:.1}s before its slot — held and applied when the slot starts (delegate {name}'s clock runs ahead)", block.height);
+        crate::alerts::notify(
+            "future-block-held",
+            format!("EARLY BLOCK held: height {} by delegate {name} arrived {secs:.1}s before its slot. It is applied when the slot starts, other delegates are not affected. The system clock of {name}'s node is ahead by about that much — tell the operator to enable NTP (timedatectl set-ntp true / chrony).", block.height),
+            false,
+        );
+    } else {
+        tracing::warn!("Discarded block {} by {name}: it takes a future slot starting in {secs:.1}s — delegate {name}'s clock runs ahead", block.height);
+        crate::alerts::notify(
+            "future-block",
+            format!("FUTURE BLOCK discarded: height {} by delegate {name} takes a slot that starts in {secs:.1}s (more than one slot ahead). The system clock of {name}'s node is ahead by about that much — tell the operator to enable NTP (timedatectl set-ntp true / chrony). Until then that delegate misses its slots; other delegates are not affected.", block.height),
+            false,
+        );
+    }
+}
+
+struct Parked {
+    block: crate::models::Block,
+    verify: bool,
+    start_ms: i64,
+    origin: Option<(Source, String)>,
+}
+
+const MAX_PARKED: usize = 8;
+
+fn parked() -> &'static Mutex<Vec<Parked>> {
+    static P: OnceLock<Mutex<Vec<Parked>>> = OnceLock::new();
+    P.get_or_init(Default::default)
+}
+
+/// Hold a signed block whose slot starts within one blocktime; `apply_due_parked` applies it at the slot start, so
+/// every node takes it at the same moment and the next delegate forges on top of it. `false` = not held (too far
+/// ahead or the buffer is full) → the block is dropped.
+pub fn park_future(block: &crate::models::Block, network: &crate::config::Network, early_ms: i64, verify: bool) -> bool {
+    if early_ms > network.milestone(block.height).blocktime as i64 * 1000 {
+        return false;
+    }
+    let mut p = parked().lock().unwrap_or_else(|e| e.into_inner());
+    if p.iter().any(|x| x.block.id == block.id) {
+        return true;
+    }
+    if p.len() >= MAX_PARKED || p.iter().any(|x| x.block.generator_public_key == block.generator_public_key) {
+        return false;
+    }
+    p.push(Parked { block: block.clone(), verify, start_ms: now_ms() + early_ms, origin: None });
+    true
+}
+
+/// Remember which channel delivered a parked block (first one wins) for the intake statistics.
+pub fn park_origin(block_id: Option<&str>, source: Source, peer: impl Into<String>) {
+    let mut p = parked().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(x) = p.iter_mut().find(|x| x.block.id.as_deref() == block_id && x.origin.is_none()) {
+        x.origin = Some((source, peer.into()));
+    }
+}
+
+fn parked_due() -> Vec<Parked> {
+    let now = now_ms();
+    let mut p = parked().lock().unwrap_or_else(|e| e.into_inner());
+    let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *p).into_iter().partition(|x| x.start_ms <= now);
+    *p = rest;
+    due
+}
+
+/// Apply the parked blocks whose slot has started, when they still extend the tip. Returns how many were applied.
+pub fn apply_due_parked(storage: &crate::storage::Storage) -> usize {
+    let network = storage.network().clone();
+    let mut applied = 0;
+    for x in parked_due() {
+        let height = x.block.height;
+        let tip = match storage.get_last_block() {
+            Ok(Some(b)) => crate::sync::ChainTip { height: b.height, id: b.id },
+            _ => continue,
+        };
+        if height != tip.height + 1 || tip.id.as_deref().is_some_and(|id| x.block.previous_block != id) {
+            tracing::debug!(height, tip = tip.height, "held early block no longer extends the tip, dropped");
+            continue;
+        }
+        match crate::sync::apply_blocks(storage, &network, std::slice::from_ref(&x.block), tip, x.verify) {
+            Ok(_) => {
+                applied += 1;
+                if let Some((source, peer)) = &x.origin {
+                    record(*source, peer.clone(), height, x.block.timestamp, &x.block.generator_public_key, &network);
+                    crate::delegate::guard::on_accepted(*source, peer, &crate::models::Block { transactions: Vec::new(), ..x.block.clone() }, &network);
+                }
+                tracing::info!(height, "held early block applied at its slot start");
+            }
+            Err(crate::error::Error::StaleTip(_)) => {}
+            Err(e) => tracing::warn!(height, error = %e, "held early block rejected at its slot start"),
+        }
+    }
+    applied
+}
+
+/// Background applier of parked early blocks (50 ms resolution).
+pub fn spawn_parked_applier(storage: std::sync::Arc<crate::storage::Storage>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+        loop {
+            tick.tick().await;
+            let now = now_ms();
+            if !parked().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|x| x.start_ms <= now) {
+                continue;
+            }
+            let st = storage.clone();
+            let _ = tokio::task::spawn_blocking(move || apply_due_parked(&st)).await;
+        }
+    });
 }
 
 const WINDOW: usize = 100;
@@ -177,7 +288,8 @@ pub fn snapshot() -> serde_json::Value {
     }
     let skew = skew_hint(i.delays.iter().filter(|(s, _)| *s != Source::Forged).map(|(_, d)| *d));
     serde_json::json!({ "last": i.last, "avgDelayMs": avg(&all), "samples": all.len(), "bySource": by, "clockSkewHintMs": skew,
-        "earliest": i.earliest, "futureRejected": { "count": i.future_rejected, "last": i.last_future } })
+        "earliest": i.earliest, "futureRejected": { "count": i.future_rejected, "last": i.last_future },
+        "futureHeld": { "count": i.future_held, "last": i.last_held } })
 }
 
 /// Most negative received delay, as a positive lag (ms); 0 = nothing arrived before its slot.
