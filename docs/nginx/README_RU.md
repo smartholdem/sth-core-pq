@@ -7,11 +7,11 @@
 | URL                                   | upstream          | что это                                                  |
 |---------------------------------------|-------------------|----------------------------------------------------------|
 | `https://node-pq01.smartholdem.io/`   | `127.0.0.1:4888`  | страница метрик оператора (`api.page_metrics`)           |
-| `.../api/ntfry/*`                       | `127.0.0.1:4888`  | peers / delegates / metrics / finality / tokens / market |
-| `.../api/*`, `.../status`                 | `127.0.0.1:4003`  | полный REST API, `POST /api/transactions`                |
-| `wss://.../ws/events`, `wss://.../ws/api` | `127.0.0.1:4005`  | WebSocket-мост SHIP-44 для браузерных кошельков (`snippets/sth-ws-bridge.conf` - на том же домене, `ws-bridge.smartholdem.io.conf` - отдельный домен; инструкция для кошелька - `../wallet/WALLET-WS-MSGPACK_RU.md`) |
+| `…/api/ntfry/*`                       | `127.0.0.1:4888`  | peers / delegates / metrics / finality / tokens / market |
+| `…/api/*`, `…/status`                 | `127.0.0.1:4003`  | полный REST API, `POST /api/transactions`                |
+| `wss://…/ws/events`, `wss://…/ws/api` | `127.0.0.1:4005`  | WebSocket-мост SHIP-44 для браузерных кошельков (`snippets/sth-ws-bridge.conf` — на том же домене, `ws-bridge.smartholdem.io.conf` — отдельный домен; инструкция для кошелька — `../WALLET-WS-MSGPACK_RU.md`) |
 
-Нода слушает только loopback - наружу открыт лишь nginx (443) и legacy P2P (4001), если нода - gateway.
+Нода слушает только loopback — наружу открыт лишь nginx (443) и legacy P2P (4001), если нода — gateway.
 
 ```yaml
 # node.yaml
@@ -53,7 +53,7 @@ curl -s https://node-pq01.smartholdem.io/api/ntfry/metrics | head -c 300
 
 ## Ограничить CORS списком доменов
 
-Вместо `"*"` в `snippets/sth-cors.conf` - `map` в контексте `http` (в начало `.conf`-файла) и переменная:
+Вместо `"*"` в `snippets/sth-cors.conf` — `map` в контексте `http` (в начало `.conf`-файла) и переменная:
 
 ```nginx
 map $http_origin $sth_cors {
@@ -66,14 +66,14 @@ map $http_origin $sth_cors {
 # snippets/sth-cors.conf
 add_header Access-Control-Allow-Origin $sth_cors always;
 add_header Vary Origin always;
-...
+…
 ```
 
 Альтернатива без nginx-CORS: убрать `include snippets/sth-cors.conf` и включить в `node.yaml`
-`cors_origins: ["https://wallet.smartholdem.io"]` - нода выдаст заголовки сама (см. `tests/cors.rs`).
+`cors_origins: ["https://wallet.smartholdem.io"]` — нода выдаст заголовки сама (см. `tests/cors.rs`).
 
 ## Лимиты
 
-- `sth_api` - 20 r/s на IP (burst 40–60) для чтения; `sth_post` - 2 r/s (burst 10) на `/api/transactions`.
-- `client_max_body_size 1m` - хватает для multipay на 1024 получателей.
+- `sth_api` — 20 r/s на IP (burst 40–60) для чтения; `sth_post` — 2 r/s (burst 10) на `/api/transactions`.
+- `client_max_body_size 1m` — хватает для multipay на 1024 получателей.
 - При 429/503 в логах поднимите `rate`/`burst`, либо вынесите тяжёлые эксплореры на отдельную ноду.

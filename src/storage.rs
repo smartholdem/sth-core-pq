@@ -14,6 +14,9 @@
 //!   `lk:<lock id>`       → open HTLC lock JSON (`/api/locks`)
 //!   `rd:<round BE u64>`  → active delegates of a round JSON (written while following the chain)
 //!   `meta:last_height`   → height BE u64
+//!
+//! Since 0.26.0 the `t:` / `tl:` / `wt:` records older than the hot window (last 50 000 transactions) live in a second
+//! flat files of the cold store (`storage/history.rs`); readers join both transparently.
 
 use crate::config::Network;
 use crate::crypto::{
@@ -27,6 +30,11 @@ use sled::transaction::{ConflictableTransactionError, TransactionError, Transact
 use sled::IVec;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+
+mod cold;
+mod history;
+pub use cold::{ColdOptions, ColdStatus};
+pub use history::{HistoryOptions, HistoryStatus, HOT_TX_WINDOW};
 
 const PREFIX_BLOCK: &[u8] = b"b:";
 const PREFIX_BLOCK_ID: &[u8] = b"bid:";
@@ -655,6 +663,19 @@ pub struct Storage {
     events: tokio::sync::broadcast::Sender<ChainEvent>,
     /// Serialises apply / rollback: several intake paths (gossip, legacy pull, postBlock, forger) may hold the same block.
     apply_lock: std::sync::Mutex<()>,
+    /// Flat-file store of blocks deeper than the undo margin and of the old transaction index (`None` = all in sled).
+    cold: Option<cold::Cold>,
+    cache_mb: u32,
+}
+
+/// Everything `Storage::open_full` can be told.
+#[derive(Debug, Clone)]
+pub struct StorageOptions {
+    pub cache_mb: u32,
+    pub history: HistoryOptions,
+    pub cold: ColdOptions,
+    /// Rebuild the main database when enough blocks left it (node start only — takes the database offline for the copy).
+    pub rebuild: bool,
 }
 
 /// `Storage::audit_all` result: every stored wallet compared with the state recomputed from the whole chain.
@@ -750,16 +771,70 @@ impl Storage {
 
     /// Open (or create) the database at `path` with a `cache_mb` MiB sled page cache.
     pub fn open_with_cache<P: AsRef<Path>>(path: P, network: Network, cache_mb: u32) -> Result<Self> {
-        // zstd page compression: block headers / wallet JSON compress ~2-3x.
-        let db = sled::Config::new()
-            .path(path)
-            .use_compression(true)
-            .compression_factor(3)
-            .cache_capacity(u64::from(cache_mb.max(8)) * 1024 * 1024)
-            .open()?;
-        let tree = db.open_tree("chain")?;
-        let s = Self { db, tree, network, undo_enabled: Default::default(), generation: Default::default(), events: chain_events(), apply_lock: Default::default() };
+        // nothing is moved out of sled by this handle; an existing cold store is still opened
+        Self::open_with_options(path, network, cache_mb, HistoryOptions { enabled: false, ..Default::default() })
+    }
+
+    /// Open the main database plus the cold transaction-history store described by `history`.
+    pub fn open_with_options<P: AsRef<Path>>(path: P, network: Network, cache_mb: u32, history: HistoryOptions) -> Result<Self> {
+        Self::open_full(path, network, StorageOptions { cache_mb, history, cold: ColdOptions { enabled: false, ..Default::default() }, rebuild: false })
+    }
+
+    /// Open the main database, the cold block store and the history store.
+    pub fn open_full<P: AsRef<Path>>(path: P, network: Network, opts: StorageOptions) -> Result<Self> {
+        let main_path = path.as_ref().to_path_buf();
+        let (cache_mb, history) = (opts.cache_mb, opts.history);
+        if main_path.is_dir() {
+            cold::finish_rebuild(&main_path)?;
+        }
+        let open_db = || -> Result<(sled::Db, sled::Tree)> {
+            let mut attempt = 0;
+            loop {
+                let opened = sled::Config::new()
+                    .path(&main_path)
+                    .use_compression(true)
+                    .compression_factor(3)
+                    .cache_capacity(u64::from(cache_mb.max(8)) * 1024 * 1024)
+                    .open();
+                match opened {
+                    Ok(db) => {
+                        let tree = db.open_tree("chain")?;
+                        return Ok((db, tree));
+                    }
+                    // the previous handle of this process may still be releasing its file lock
+                    Err(_) if attempt < 20 => {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
+        let (mut db, mut tree) = open_db()?;
+        let id_net = network.clone();
+        history::restore_legacy(&tree, &main_path)?;
+        let block_id: cold::BlockIdFn = std::sync::Arc::new(move |bytes: &[u8]| -> Result<[u8; 32]> {
+            let id = decode_block(bytes, &id_net)?.id.unwrap_or_default();
+            let mut out = [0u8; 32];
+            hex::decode_to_slice(&id, &mut out).map_err(|_| Error::Sync(format!("block id {id} is not 32 bytes of hex")))?;
+            Ok(out)
+        });
+        let mut cold = cold::Cold::open(&tree, &main_path, &opts.cold, &history, block_id.clone())?;
+        let deep = tree.get(KEY_LAST_HEIGHT)?.map(|v| be_u64(&v)).unwrap_or(0).saturating_sub(UNDO_DEPTH + 100);
+        if opts.rebuild && cold::rebuild_due(&tree, opts.cold.rebuild_after) && (!opts.cold.enabled || deep.saturating_sub(cold.as_ref().map(|c| c.range().1).unwrap_or(0)) < 1_000) {
+            cold::rebuild(&tree, &main_path, cache_mb)?;
+            drop(cold.take());
+            drop(tree);
+            drop(db);
+            cold::finish_rebuild(&main_path)?;
+            (db, tree) = open_db()?;
+            cold = cold::Cold::open(&tree, &main_path, &opts.cold, &history, block_id)?;
+        }
+        let s = Self { db, tree, network, undo_enabled: Default::default(), generation: Default::default(), events: chain_events(), apply_lock: Default::default(), cold, cache_mb: cache_mb.max(8) };
         s.ensure_tx_count()?;
+        if s.cold.as_ref().is_some_and(|c| c.tx_damaged) {
+            s.rebuild_tx_index()?;
+        }
         Ok(s)
     }
 
@@ -767,7 +842,7 @@ impl Storage {
     pub fn temporary(network: Network) -> Result<Self> {
         let db = sled::Config::new().temporary(true).open()?;
         let tree = db.open_tree("chain")?;
-        Ok(Self { db, tree, network, undo_enabled: Default::default(), generation: Default::default(), events: chain_events(), apply_lock: Default::default() })
+        Ok(Self { db, tree, network, undo_enabled: Default::default(), generation: Default::default(), events: chain_events(), apply_lock: Default::default(), cold: None, cache_mb: 0 })
     }
 
     /// Stream of applied / rolled-back blocks (SHIP-44 push sessions).
@@ -891,17 +966,30 @@ impl Storage {
     }
 
     pub fn get_block_by_height(&self, height: u64) -> Result<Option<Block>> {
-        match self.tree.get(height_key(height))? {
-            Some(v) => Ok(Some(self.decode(&v)?)),
+        match self.block_bytes(height)? {
+            Some(v) => Ok(Some(decode_block(&v, &self.network)?)),
             None => Ok(None),
         }
     }
 
     pub fn get_block_by_id(&self, id: &str) -> Result<Option<Block>> {
-        match self.tree.get(prefixed(PREFIX_BLOCK_ID, id))? {
-            Some(v) => self.get_block_by_height(ivec_to_height(&v)?),
+        let height = match self.tree.get(prefixed(PREFIX_BLOCK_ID, id))? {
+            Some(v) => Some(ivec_to_height(&v)?),
+            None => self.cold_height_of(id)?,
+        };
+        match height {
+            Some(h) => self.get_block_by_height(h),
             None => Ok(None),
         }
+    }
+
+    /// Blocks `from..=to` ascending: the cold store first, then sled.
+    fn blocks_between(&self, from: u64, to: u64) -> impl Iterator<Item = Result<Block>> + '_ {
+        let (first, last) = self.cold_range();
+        let cold = if last == 0 { 1..=0 } else { from.max(first)..=to.min(last) };
+        let hot_from = from.max(last + 1);
+        let hot: Box<dyn Iterator<Item = sled::Result<(IVec, IVec)>>> = if hot_from > to { Box::new(std::iter::empty()) } else { Box::new(self.tree.range(height_key(hot_from)..=height_key(to))) };
+        cold.filter_map(move |h| self.get_block_by_height(h).transpose()).chain(hot.map(move |item| self.decode(&item?.1)))
     }
 
     /// Highest stored height (0 when empty).
@@ -923,9 +1011,33 @@ impl Storage {
     /// Blocks ordered by height descending (API default), paginated.
     pub fn get_blocks(&self, offset: usize, limit: usize) -> Result<Vec<Block>> {
         let mut out = Vec::with_capacity(limit);
-        for item in self.tree.scan_prefix(PREFIX_BLOCK).rev().skip(offset).take(limit) {
-            let (_, v) = item?;
+        let (first, last) = self.cold_range();
+        let mut skip = offset as u64;
+        for item in self.tree.scan_prefix(PREFIX_BLOCK).rev() {
+            let (k, v) = item?;
+            if last != 0 && be_u64(&k[PREFIX_BLOCK.len()..]) <= last {
+                break;
+            }
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            if out.len() >= limit {
+                return Ok(out);
+            }
             out.push(self.decode(&v)?);
+        }
+        if last != 0 && skip <= last - first {
+            let mut h = last - skip;
+            while out.len() < limit && h >= first {
+                if let Some(b) = self.get_block_by_height(h)? {
+                    out.push(b);
+                }
+                if h == 0 {
+                    break;
+                }
+                h -= 1;
+            }
         }
         Ok(out)
     }
@@ -933,28 +1045,24 @@ impl Storage {
     /// Blocks `[from_height, from_height + limit)` ascending (used by sync / P2P).
     pub fn get_blocks_from(&self, from_height: u64, limit: usize) -> Result<Vec<Block>> {
         let mut out = Vec::with_capacity(limit);
-        for item in self
-            .tree
-            .range(height_key(from_height)..height_key(from_height.saturating_add(limit as u64)))
-        {
-            let (_, v) = item?;
-            out.push(self.decode(&v)?);
+        if limit > 0 {
+            for b in self.blocks_between(from_height, from_height.saturating_add(limit as u64 - 1)) {
+                out.push(b?);
+            }
         }
         Ok(out)
     }
 
     /// Number of stored blocks (full key scan — slow on a large chain; prefer `get_last_height`).
     pub fn block_count(&self) -> usize {
-        self.tree.scan_prefix(PREFIX_BLOCK).count()
+        let (first, last) = self.cold_range();
+        self.tree.scan_prefix(PREFIX_BLOCK).count() + if last == 0 { 0 } else { (last - first + 1) as usize }
     }
 
     // ------------------------------------------------------------ transactions
 
     pub fn get_transaction(&self, id: &str) -> Result<Option<Transaction>> {
-        let height = match self.tree.get(prefixed(PREFIX_TX, id))? {
-            Some(v) => ivec_to_height(&v)?,
-            None => return Ok(None),
-        };
+        let Some(height) = self.tx_height(id)? else { return Ok(None) };
         let block = match self.get_block_by_height(height)? {
             Some(b) => b,
             None => return Ok(None),
@@ -964,10 +1072,7 @@ impl Storage {
 
     /// Transaction plus the timestamp of its block (needed by the legacy API transformer).
     pub fn get_transaction_with_timestamp(&self, id: &str) -> Result<Option<(Transaction, u32)>> {
-        let height = match self.tree.get(prefixed(PREFIX_TX, id))? {
-            Some(v) => ivec_to_height(&v)?,
-            None => return Ok(None),
-        };
+        let Some(height) = self.tx_height(id)? else { return Ok(None) };
         let block = match self.get_block_by_height(height)? {
             Some(b) => b,
             None => return Ok(None),
@@ -1005,24 +1110,7 @@ impl Storage {
     /// Lazy walk over the height-ordered transaction index (`tl:` or `wt:<addr>:`) restricted to `heights`.
     /// Newest first unless `ascending`; nothing is decoded until the caller asks.
     pub fn transaction_index(&self, address: Option<&str>, heights: std::ops::RangeInclusive<u64>, ascending: bool) -> impl Iterator<Item = Result<TxIndexEntry>> + '_ {
-        let prefix = tx_index_prefix(address);
-        let plen = prefix.len();
-        let mut start = prefix.clone();
-        start.extend_from_slice(&heights.start().to_be_bytes());
-        start.extend_from_slice(&0u32.to_be_bytes());
-        let mut end = prefix;
-        end.extend_from_slice(&heights.end().to_be_bytes());
-        end.extend_from_slice(&u32::MAX.to_be_bytes());
-        let range = self.tree.range(start..=end);
-        let iter: Box<dyn Iterator<Item = sled::Result<(IVec, IVec)>>> = if ascending { Box::new(range) } else { Box::new(range.rev()) };
-        iter.map(move |item| {
-            let (k, v) = item?;
-            let k = k.as_ref();
-            let bad = || Error::Storage(sled::Error::Unsupported("corrupt transaction index key".into()));
-            let height = u64::from_be_bytes(k.get(plen..plen + 8).ok_or_else(bad)?.try_into().map_err(|_| bad())?);
-            let seq = u32::from_be_bytes(k.get(plen + 8..plen + 12).ok_or_else(bad)?.try_into().map_err(|_| bad())?);
-            Ok(TxIndexEntry { height, seq, id: String::from_utf8_lossy(&v).into_owned() })
-        })
+        self.merged_index(address, *heights.start(), *heights.end(), ascending)
     }
 
     /// Number of index entries in `heights` (key scan only — no block decoding).
@@ -1030,12 +1118,7 @@ impl Storage {
         if address.is_none() && heights == (0..=u64::MAX) {
             return self.transaction_count();
         }
-        let mut n = 0u64;
-        for e in self.transaction_index(address, heights, true) {
-            e?;
-            n += 1;
-        }
-        Ok(n)
+        self.merged_index_count(address, *heights.start(), *heights.end())
     }
 
     /// Transaction at `entry` with its block timestamp; `cache` keeps the last decoded block so consecutive
@@ -1657,6 +1740,10 @@ impl Storage {
     /// Lowest height whose block timestamp is `>= ts` (binary search — timestamps grow with height).
     /// Lowest stored block height (1 on a full chain; higher on sparse test databases), 0 when empty.
     pub fn first_height(&self) -> Result<u64> {
+        let (first, last) = self.cold_range();
+        if last != 0 {
+            return Ok(first);
+        }
         match self.tree.scan_prefix(PREFIX_BLOCK).keys().next() {
             Some(k) => {
                 let k = k?;
@@ -1818,6 +1905,9 @@ impl Storage {
         let height = self.get_last_height()?;
         if height <= 1 {
             return Err(Error::Sync("cannot roll back the genesis block".into()));
+        }
+        if height <= self.cold_range().1.max(self.tx_cold_height()) {
+            return Err(Error::Sync(format!("block {height} is in the cold store (deeper than the undo depth) — it cannot be rolled back")));
         }
         // SHIP-35: a certified block is final — hard mode refuses, soft mode only warns (legacy majority may still fork)
         if let Some(cert) = self.latest_finality_cert()?.filter(|c| c.height >= height) {
@@ -2088,9 +2178,8 @@ impl Storage {
             return Ok(());
         }
         let net = self.network.pubkey_hash;
-        for item in self.tree.range(height_key(from)..=height_key(to)) {
-            let (_, v) = item?;
-            let block = self.decode(&v)?;
+        for block in self.blocks_between(from, to) {
+            let block = block?;
             let ms = self.network.milestone(block.height);
             let init_count = block.transactions.iter().filter(|t| t.type_group == crate::models::TYPE_GROUP_TOKEN && t.type_ == crate::models::token::INIT).count() as u64;
             let burned = if init_count > 0 && !self.network.burn_address.is_empty() { init_count * ms.token_fees.init_burn() } else { 0 };

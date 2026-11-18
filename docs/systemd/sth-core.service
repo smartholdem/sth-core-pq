@@ -1,4 +1,4 @@
-# PQ Node (sth-core-pq) systemd unit.
+# PQ Node (sth-core-pq) — systemd unit.
 # Install:  sudo cp sth-core.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now sth-core
 # Adjust User / WorkingDirectory to your layout (here: user "mainnet", binary + node.yaml in /home/mainnet/sth-core).
 [Unit]
@@ -18,9 +18,9 @@ RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=60
 LimitNOFILE=65536
-# soft memory ceiling systemd restarts the node instead of the kernel OOM-killing the whole host
+# soft memory ceiling — systemd restarts the node instead of the kernel OOM-killing the whole host
 MemoryMax=1500M
-# logs -> journald (no nohup.out); size is capped by journald.conf (see docs/systemd/README.md)
+# logs → journald (no nohup.out); size is capped by journald.conf (see docs/systemd/README_RU.md)
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sth-core

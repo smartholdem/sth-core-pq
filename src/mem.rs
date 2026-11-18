@@ -143,3 +143,14 @@ pub fn spawn_freeze_watchdog(freeze_secs: u64, alerts: crate::node_config::Alert
         })
         .expect("freeze watchdog thread");
 }
+
+static LOW_MEMORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `low_memory: true` in node.yaml (1 GB RAM profile) — shown on the metrics page.
+pub fn set_low_memory(on: bool) {
+    LOW_MEMORY.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn low_memory() -> bool {
+    LOW_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
+}

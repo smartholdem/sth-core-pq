@@ -88,7 +88,7 @@ impl NodeContext {
                 tracing::info!(telegram = !config.alerts.telegram_chat_id.is_empty(), webhook = !config.alerts.webhook_url.is_empty(), "operator alerts enabled");
             }
         }
-        let storage = Arc::new(Storage::open_with_cache(Path::new(&config.db_path), network.clone(), config.db_cache_mb)?);
+        let storage = Arc::new(Storage::open_full(Path::new(&config.db_path), network.clone(), config.storage_options(true))?);
         storage.ensure_vote_index()?;
         let reward_address = config.reward_address()?;
         if let Some(a) = &reward_address {
@@ -179,6 +179,8 @@ impl NodeContext {
     pub async fn run(mut self, flags: RunFlags) -> Result<()> {
         tokio::spawn(crate::ntp::monitor(self.config.ntp_server.clone(), std::time::Duration::from_secs(600)));
         tokio::spawn(crate::mem::watchdog(std::time::Duration::from_secs(600)));
+        crate::mem::set_low_memory(self.config.low_memory);
+        spawn_history_archiver(self.storage.clone());
         crate::mem::spawn_freeze_watchdog(self.config.freeze_abort_secs, self.config.alerts.clone(), crate::alerts::node_label(&self.config, &self.network.name));
         self.start_iroh().await?;
         if let Some(iroh) = self.iroh.clone() {
@@ -418,4 +420,46 @@ pub async fn run_import(storage: Arc<Storage>, dir: PathBuf, fast: bool, strict:
         if report.interrupted { "interrupted — rerun to resume" } else { "complete" }
     );
     Ok(report)
+}
+
+/// Background mover of transaction indexes older than the hot window into the cold store. Its first pass on an upgraded
+/// database is the one-time migration; an interrupted pass continues from the stored cursor on the next start.
+fn spawn_history_archiver(storage: Arc<Storage>) {
+    let spawned = std::thread::Builder::new().name("history-archiver".into()).spawn(move || {
+        let cancel = AtomicBool::new(false);
+        loop {
+            if storage.cold_due() {
+                let started = std::time::Instant::now();
+                if storage.cold_status().map(|s| s.pending_blocks > 100_000).unwrap_or(false) {
+                    tracing::info!("cold block store: one-time move of old blocks out of sled started (resumable, the node keeps working)");
+                }
+                match storage.archive_blocks(&cancel, |s| tracing::info!("cold block store: {:.1} % · {} blocks moved · {} to go", s.progress_percent, s.blocks, s.pending_blocks)) {
+                    Ok(moved) if moved >= 100_000 => tracing::info!(moved, elapsed = ?started.elapsed(), "cold block store: old blocks moved — RESTART the node once at a convenient time: the main database is rebuilt at start and the memory is released"),
+                    Ok(moved) => tracing::debug!(moved, "cold block store: blocks moved"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cold block store: move stopped (nothing was lost) — retrying in 5 min");
+                        std::thread::sleep(Duration::from_secs(270));
+                    }
+                }
+            }
+            if storage.history_due() {
+                let started = std::time::Instant::now();
+                if storage.history_status().map(|s| s.pending_txs > 100_000).unwrap_or(false) {
+                    tracing::info!("transaction index: one-time move of old records to flat files started (resumable, the node keeps working)");
+                }
+                match storage.archive_history(&cancel, |s| tracing::info!("transaction index: {:.1} % · {} moved · {} to go", s.progress_percent, s.cold_txs, s.pending_txs)) {
+                    Ok(moved) if moved > 0 => tracing::info!(moved, elapsed = ?started.elapsed(), "transaction index: records older than the hot window moved to flat files"),
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "transaction index: move stopped (nothing was lost) — retrying in 5 min");
+                        std::thread::sleep(Duration::from_secs(270));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "history archiver thread not started");
+    }
 }
