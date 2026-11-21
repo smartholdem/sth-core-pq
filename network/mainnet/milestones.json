@@ -61,5 +61,12 @@
             "maxOpenOrders": 64
         },
         "minCoreVersion": "0.25.50"
+    },
+    {
+        "height": 12950000,
+        "tokenMarket": {
+            "pricePerToken": true
+        },
+        "minCoreVersion": "0.28.0"
     }
 ]

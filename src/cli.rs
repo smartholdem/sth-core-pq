@@ -36,6 +36,8 @@ pub struct ChainParams {
     /// Quantum Shield stage B: v3 accepted, surcharge per byte of second-signature blocks.
     pub pq_active: bool,
     pub pq_fee_per_byte: u64,
+    /// `tokenMarket.pricePerToken`: token-sell sends TokenSellV2 (price per whole token, fractional STH allowed).
+    pub price_per_token: bool,
     /// SHIP-41: the node's dynamic fee policy (`transactionPool.dynamicFees`) when enabled; None = static fees.
     pub dynamic_fees: Option<DynamicFeesConfig>,
 }
@@ -64,6 +66,7 @@ impl ChainParams {
             second_signature_fee: num(&c["fees"]["staticFees"]["secondSignature"]),
             pq_active: v["pq"]["active"] == true,
             pq_fee_per_byte: num(&v["pq"]["feePerByte"]),
+            price_per_token: c["tokenMarket"]["pricePerToken"] == true,
             dynamic_fees: {
                 let d = &v["transactionPool"]["dynamicFees"];
                 (d["enabled"] == true).then(|| DynamicFeesConfig {
@@ -265,7 +268,7 @@ pub enum TxCmd {
         #[arg(long)]
         amount: String,
     },
-    /// SHIP-43: sell part of your balance — `--amount` tokens at `--price` STH per token (e.g. 1 UFO at 100 STH).
+    /// SHIP-43: sell part of your balance — `--amount` tokens at `--price` STH per token (e.g. 100 SCAT at 0.04 STH).
     TokenSell {
         #[arg(long)]
         ticker: String,
@@ -510,7 +513,7 @@ pub async fn run(source: ChainSource, args: TxArgs) -> Result<()> {
             let height = match height { Some(r) => r.json::<Value>().await.ok().and_then(|v| v["data"]["now"].as_u64()).unwrap_or(0), None => 0 };
             let ms = network.milestone(height + 1);
             let dynamic_fees = cfg.mempool.dynamic_fees.enabled.then(|| cfg.mempool.dynamic_fees.clone());
-            (api, ChainParams { pubkey_hash: network.pubkey_hash, transfer_fee: ms.static_fee("transfer"), vote_fee: ms.static_fee("vote"), delegate_registration_fee: ms.static_fee("delegateRegistration"), delegate_resignation_fee: ms.static_fee("delegateResignation"), second_signature_fee: ms.static_fee("secondSignature"), token_fees: ms.token_fees.clone(), blocktime: ms.blocktime as u64, pq_active: ms.pq.active, pq_fee_per_byte: ms.pq.fee_per_byte, dynamic_fees })
+            (api, ChainParams { pubkey_hash: network.pubkey_hash, transfer_fee: ms.static_fee("transfer"), vote_fee: ms.static_fee("vote"), delegate_registration_fee: ms.static_fee("delegateRegistration"), delegate_resignation_fee: ms.static_fee("delegateResignation"), second_signature_fee: ms.static_fee("secondSignature"), token_fees: ms.token_fees.clone(), blocktime: ms.blocktime as u64, pq_active: ms.pq.active, pq_fee_per_byte: ms.pq.fee_per_byte, price_per_token: ms.token_market.price_per_token, dynamic_fees })
         }
         ChainSource::Api(api) => {
             let api = args.api.clone().unwrap_or_else(|| api.clone()).trim_end_matches('/').to_string();
@@ -696,15 +699,22 @@ pub async fn run(source: ChainSource, args: TxArgs) -> Result<()> {
         TxCmd::TokenSell { ticker, amount, price } => {
             let (id, dec) = ctx.token(ticker).await?;
             let amount_u = units(amount, dec)?;
-            // price per whole token → smartoshi per unit (10^-dec token)
             let per_token = units(price, 8)?;
-            let scale = 10u64.pow(dec as u32);
-            if per_token % scale != 0 {
-                bail!("--price {price} STH is not divisible into whole smartoshi per unit at {dec} decimals (use a multiple of {} STH)", scale as f64 / 1e8);
+            if per_token == 0 {
+                bail!("--price must be > 0");
             }
-            let per_unit = per_token / scale;
-            println!("ask     {amount} {} × {price} STH = {} STH total", ticker.to_uppercase(), (amount_u as u128 * per_unit as u128) as f64 / 1e8);
-            set(&mut body, json!({ "typeGroup": 3, "type": token::SELL, "fee": ms.token_fees.sell.to_string(), "asset": { "token": { "id": id, "amount": amount_u.to_string(), "price": per_unit.to_string() } } }));
+            let scale = 10u64.pow(dec as u32);
+            // TokenSellV2: price per whole token; legacy TokenSell: smartoshi per unit (10^-dec token)
+            let (type_, wire_price, unit) = if ms.price_per_token {
+                (token::SELL_V2, per_token, scale)
+            } else if per_token % scale == 0 {
+                (token::SELL, per_token / scale, 1)
+            } else {
+                bail!("--price {price} STH is not divisible into whole smartoshi per unit at {dec} decimals (use a multiple of {} STH); fractional prices need milestone tokenMarket.pricePerToken (mainnet from height 12950000, core 0.28.0)", scale as f64 / 1e8);
+            };
+            let total = (amount_u as u128 * wire_price as u128).div_ceil(unit as u128);
+            println!("ask     {amount} {} × {price} STH = {} STH total", ticker.to_uppercase(), total as f64 / 1e8);
+            set(&mut body, json!({ "typeGroup": 3, "type": type_, "fee": ms.token_fees.sell.to_string(), "asset": { "token": { "id": id, "amount": amount_u.to_string(), "price": wire_price.to_string() } } }));
         }
         TxCmd::TokenBuy { order, amount } => {
             let o = ctx.order(order).await?;
@@ -714,8 +724,10 @@ pub async fn run(source: ChainSource, args: TxArgs) -> Result<()> {
             if amount_u == 0 || amount_u > remaining {
                 bail!("order has {} units remaining", remaining);
             }
-            let price: u64 = o["price"].as_str().unwrap_or("0").parse()?;
-            println!("buy     {} units of {} at {} STH/unit = {} STH → {}", amount_u, o["symbol"].as_str().unwrap_or("?"), price as f64 / 1e8, (amount_u as u128 * price as u128) as f64 / 1e8, o["seller"].as_str().unwrap_or("?"));
+            let price: u128 = o["price"].as_str().unwrap_or("0").parse()?;
+            let unit: u128 = o["priceUnit"].as_str().unwrap_or("1").parse()?;
+            let per_token: u128 = o["pricePerToken"].as_str().map(str::parse).transpose()?.unwrap_or(price * 10u128.pow(dec as u32) / unit.max(1));
+            println!("buy     {} of {} at {} STH/token = {} STH → {}", amount_u as f64 / 10f64.powi(dec as i32), o["symbol"].as_str().unwrap_or("?"), per_token as f64 / 1e8, (amount_u as u128 * price).div_ceil(unit.max(1)) as f64 / 1e8, o["seller"].as_str().unwrap_or("?"));
             set(&mut body, json!({ "typeGroup": 3, "type": token::BUY, "fee": ms.token_fees.buy.to_string(), "asset": { "token": { "id": o["tokenId"], "orderId": o["orderId"], "amount": amount_u.to_string() } } }));
         }
         TxCmd::TokenCancel { order } => {

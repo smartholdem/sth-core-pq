@@ -87,7 +87,7 @@ fn serialize_type_payload(tx: &Transaction, w: &mut ByteWriter) -> Result<()> {
                 w.u64_le(a.amount.unwrap_or(0));
                 write_address(w, a.recipient_id.as_deref().ok_or_else(|| Error::Serialization("missing recipientId".into()))?)?;
             }
-            token::SELL => {
+            token::SELL | token::SELL_V2 => {
                 w.u64_le(a.amount.unwrap_or(0)).u64_le(a.price.unwrap_or(0));
             }
             token::BUY | token::CANCEL => {

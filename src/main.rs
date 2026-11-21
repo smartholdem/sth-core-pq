@@ -93,6 +93,17 @@ enum Command {
         #[arg(long)]
         to: u64,
     },
+    /// Cold storage: prints how many blocks live in the flat-file store / in sled and the sizes. `--migrate` moves the
+    /// old blocks out of sled now and rebuilds the main database (stop the node first; resumable, Ctrl+C is safe).
+    /// `--prune` is accepted for compatibility and does nothing since 0.27.0.
+    History {
+        #[arg(long)]
+        migrate: bool,
+        #[arg(long)]
+        prune: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Catch up with the network over the legacy REST API (temporary bootstrap; resumable).
     Sync {
         /// Comma-separated node URLs (default: node0..node5.smartholdem.io).
@@ -450,6 +461,57 @@ async fn async_main() -> anyhow::Result<()> {
             storage.apply_block(&block)?;
             storage.flush()?;
             tracing::info!(height = block.height, "block imported");
+        }
+        Command::History { migrate, prune, json } => {
+            let opts = base_cfg.history_options();
+            let mut sopts = base_cfg.storage_options(migrate);
+            sopts.history = opts;
+            let mut storage = Arc::new(Storage::open_full(&db_path, network.clone(), sopts.clone())?);
+            let _ = prune;
+            if migrate {
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let c = cancel.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    eprintln!("interrupted — finishing the current batch (run the command again to continue)");
+                    c.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+                let st = storage.clone();
+                let (blocks, txs) = tokio::task::spawn_blocking(move || -> sth_core::error::Result<(u64, u64)> {
+                    let blocks = st.archive_blocks(&cancel, |s| eprintln!("  blocks {:.1} % · {} moved · {} to go", s.progress_percent, s.blocks, s.pending_blocks))?;
+                    let txs = st.archive_history(&cancel, |s| eprintln!("  tx history {:.1} % · {} archived · {} to go", s.progress_percent, s.cold_txs, s.pending_txs))?;
+                    Ok((blocks, txs))
+                })
+                .await??;
+                eprintln!("{blocks} blocks moved to the cold store, {txs} transactions processed");
+                if storage.cold_status()?.rebuild_pending {
+                    // reopen: the main database is rebuilt now that the blocks are out
+                    storage.flush()?;
+                    drop(storage);
+                    storage = Arc::new(Storage::open_full(&db_path, network, sopts)?);
+                }
+            }
+            let s = storage.history_status()?;
+            let c = storage.cold_status()?;
+            if json {
+                println!("{}", serde_json::json!({ "coldBlocks": c, "history": s }));
+                return Ok(());
+            }
+            if c.enabled {
+                println!("cold blocks:    {} (heights {}..{}) · {:.0} MB in {} · {} · {} id segments", c.blocks, c.first_height, c.last_height, c.bytes as f64 / 1_048_576.0, c.path, if c.format >= 2 { "compressed" } else { "0.26.0 format, conversion pending" }, c.segments);
+                println!("blocks in sled: {} · {} deep enough to move{}", c.hot_blocks, c.pending_blocks, if c.rebuild_pending { " · main database rebuild pending (next node start)" } else { "" });
+            } else {
+                println!("cold blocks:    off — all {} blocks are in sled (cold_blocks.enabled: false)", c.hot_blocks);
+            }
+            if !s.enabled {
+                println!("tx index:       in the main db ({} transactions; history.enabled: false)", s.total_txs);
+            } else {
+                println!("tx index:       {} total · {} in the main db (hot window {}) · {} in flat files up to block {} ({:.1} MB, {} segments)", s.total_txs, s.hot_txs, s.hot_window, s.cold_txs, s.copied_height, s.history_bytes as f64 / 1_048_576.0, s.segments);
+                println!("to move:        {} transactions ({:.1} % done)", s.pending_txs, s.progress_percent);
+            }
+            if let Some(e) = c.last_error.iter().chain(s.last_error.iter()).next() {
+                println!("last error:     {e}");
+            }
         }
         Command::Rollback { to } => {
             let storage = Storage::open(&db_path, network)?;

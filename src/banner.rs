@@ -72,7 +72,7 @@ pub fn rows(cfg: &NodeConfig, network: &Network, ms: &Milestone, f: &Facts) -> V
     let p2p = &cfg.p2p;
     let mut r = Vec::with_capacity(28);
     r.push(Info("Network", format!("{} · nethash {} · pubKeyHash {}", network.name, short(&network.nethash), network.pubkey_hash)));
-    r.push(Info("Database", format!("{} · sled · {} MB cache · undo depth {}", cfg.db_path, cfg.db_cache_mb, group(crate::storage::UNDO_DEPTH))));
+    r.push(Info("Database", format!("{} · sled · {} MB cache{} · old blocks {} · undo depth {}", cfg.db_path, cfg.effective_db_cache_mb(), if cfg.low_memory { " (1 GB RAM mode)" } else { "" }, if cfg.cold_blocks.enabled { "in cold files" } else { "in sled" }, group(crate::storage::UNDO_DEPTH))));
     r.push(Info("Last block", match (&f.tip_id, f.tip_age_secs) {
         (Some(id), Some(a)) if f.tip_height > 0 => format!("{} · id {} · {}", group(f.tip_height), short(id), age(a)),
         _ => "none — genesis will be written".to_string(),

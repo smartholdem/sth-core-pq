@@ -1,4 +1,164 @@
 # Changelog
+## [0.28.1]
+
+### Fixed - `audit-all` reported (and with `--fix` "repaired") a correct balance of a market seller
+- The full-chain audit skipped the buyer of an sObject / token-market purchase but still compared the **seller**, whose
+  proceeds it never booked: the seller showed `DRIFT` by exactly the sale price and `--fix` lowered a correct balance.
+- Now the audit books the STH leg of every purchase to both sides: token fills from the stored order
+  (`seller`, `cost(amount)`), sObject sales from the owner / price followed along the chain. A purchase whose seller
+  cannot be determined makes the buyer `skipped` - nothing is repaired on a guess.
+- A node where 0.28.0 or older "repaired" such a wallet: run `audit-all --fix` once more on 0.28.1 - it restores the balance.
+- Single-wallet `audit-wallet`: wallets with market sell / buy transactions are reported as `skipped` (not comparable).
+- Consensus rules, block application and storage format are unchanged. Tests: `sobj_sell_and_buy`,
+  `token_market_orders_fill_cancel_and_rollback` now check `audit_all` after purchases.
+
+## [0.28.0]
+
+### Added - fractional token prices (`TokenSellV2`, consensus, mainnet height 12 950 000)
+- New transaction `typeGroup 3 / type 8` `TokenSellV2`: same payload as `TokenSell`, but `price` is smartoshi per
+  **whole** token, so asks like 0.04 STH per token work at 8 decimals. Activated by milestone
+  `tokenMarket.pricePerToken` (mainnet `12950000`, `minCoreVersion` 0.28.0); every delegate must run 0.28.0 before it.
+- Orders store `unit` (1 = legacy, 10^decimals = V2); a buy pays `ceil(amount × price / unit)`. Legacy `TokenSell`
+  is unchanged and stays valid; the book sorts both on one scale.
+- API: orders and trades gain `priceUnit` and `pricePerToken`; `/api/node/configuration` -> `tokenMarket.pricePerToken`;
+  `/api/transactions/types` lists `TokenSellV2` once active. `trades?groupBy=` candles are now per whole token
+  (`meta.priceScale: "perToken"`).
+- `sth-cli tx token-sell --price 0.04` sends `TokenSellV2` once the milestone is active (before it, the old rule and
+  a clear error); `token-buy` / `token-orders` show STH per token for both order kinds.
+
+## [0.27.0]
+
+### Added - `sth-cli` reads `.env`
+- `sth-cli` loads `KEY=VALUE` from `.env` in the current directory, then next to the binary (`sth-cli.exe` too):
+  `STH_PASSPHRASE`, `STH_SECOND_PASSPHRASE`, `STH_API`. Quotes, `export`, comments, CRLF and BOM are handled;
+  real environment variables take precedence.
+
+
+### Changed - clock alerts are quiet
+- `EARLY BLOCK held` / `FUTURE BLOCK discarded`: no alert when the delegate's clock is ahead by less than 3 s; otherwise
+  at most one alert per delegate in 4 hours (was: every `alerts.cooldown_secs`). Log lines and metrics are unchanged.
+
+### Changed - cold store format 2: compressed blocks, short id index (disk size)
+- **Blocks**: `blocks.zst` - chunks of 1 024 consecutive blocks, zstd level 15, `[raw len][packed len][zstd]`; a chunk
+  unpacks to the same length-prefixed records sled stored. `blocks.zix` - 16 bytes per chunk, held in memory.
+  `bid2-*.seg` - 12-byte `id prefix (8) + height (u32)` records; a hit is confirmed against the block itself.
+  One unpacked chunk is cached (sequential readers pay one unpack per 1 024 blocks).
+- **Conversion** of a 0.26.0 store at the first open (any command): new files are written next to the old ones, every
+  chunk is unpacked and compared before it is written, samples are read back from disk, then fsync -> manifest -> old
+  files deleted. Interrupted = starts over; failed (disk full) = the node still starts on the old files (read-only,
+  block mover paused, `coldBlocks.format: 1` + `lastError`), retried at the next start.
+- `cold_blocks.enabled: false` now really stops the mover (0.26.0 kept moving once a store existed).
+- Measured on a store written by real 0.26.0 code (1.1 M mainnet-like blocks): 285 MB -> 126 MB (271 -> 120 bytes per
+  block incl. indexes); conversion 25 s on one core (release-lowmem); reader digest identical before / after.
+
+### Changed - transaction index older than the hot window lives in compact flat files
+- Replaces the experimental second sled database of 0.26.0. `txs.dat` (38 bytes per transaction, chain order),
+  `txi-*.seg` (id prefix -> ordinal), `txw-*.seg` (address 21 bytes -> ordinal); size-tiered merges shared with the block
+  id index (`SegSet`). `history.enabled` is now `true` by default; `hot_window` 50 000; `path` / `cache_mb` /
+  `prune_migrated` are ignored. Only blocks deeper than `UNDO_DEPTH + 100` are indexed there; rollback into them is refused.
+- Readers: flat files for heights at or below the cursor, sled above - no merging; counts by address / height range
+  are binary searches. `/api/transactions`, wallet lists, timestamps filters, `GET /transactions/:id` answer identically
+  (tests compare before / mid-move / after).
+- Safety: sled records are compared with the ones derived from the blocks (and the number of `wt:` records per height
+  with a key scan); a range sled holds more for than the blocks explain is **not moved**. Files appended + fsynced +
+  read back before one atomic sled batch removes the records. Lost / truncated index files are rebuilt from the blocks at open.
+- Records of a 0.26.0 `history` sled database are taken back into the main tree at open; the directory is removed.
+- Measured (330 000 blocks, 300 000 transactions): main sled database 128 MB -> 34 MB, flat index 23.5 MB (94 bytes per
+  transaction). On mainnet (~21 400 transactions) nothing moves until the chain has more than 55 000.
+- `sth-core history` prints format, tx index counters and the last error; metrics page shows `compressed` /
+  `conversion pending` and the tx index line. `node.history`: removed `prunedHeight`, `prune`, `historyCacheMb`; added `segments`.
+- Dev profile: `zstd-sys` built with opt-level 3. New dependency line `zstd = "0.9"` (already in the tree through sled).
+- Downgrade: a converted store cannot be opened by 0.26.0. Details: docs/RELEASE-0.27.0.md.
+
+## [0.26.0]
+
+### Changed - storage layout: old blocks leave sled for flat files (memory)
+- **Why**: sled 0.34 keeps resident metadata for every page of an open database, whatever `cache_capacity` is - RSS grows
+  with the chain. On mainnet almost all records are blocks (`b:` + `bid:`, two per block; only ~21 000 transactions).
+- **Cold block store** (`cold_blocks:`, on by default): blocks deeper than `UNDO_DEPTH + 100` (1 100) from the tip move
+  to `<db_path>/cold`: `blocks.dat` (append-only records, the same bytes sled stored), `blocks.idx` (8-byte offset per
+  height), `bid-*.seg` (sorted 40-byte `id -> height` records, binary search, size-tiered merges). No resident index.
+  Every block reader (by height, by id, lists, ranges, audits, P2P serving) goes through both stores - answers are identical.
+- **Safety**: per batch of 5 000 blocks - append -> fsync -> read back and compare (block bytes and id lookups; the sled id
+  index must match the stored block) -> one atomic sled batch removes the records and stores the manifest. After a crash
+  the files are cut back to the manifest. A lost id segment is rebuilt from `blocks.dat`; a truncated `blocks.dat` makes
+  the node refuse to start. Rollback never reaches the cold store (it is deeper than the undo records) and is refused there.
+- **Automatic migration**: background thread on a running node (resumable); after it the log and the metrics page ask
+  for one restart - at that start the main database is **rebuilt** into a fresh one (old files untouched until the copy
+  is complete and counted; two-marker swap, repeatable after a crash). Only the rebuild releases sled's memory.
+- `sth-core history [--migrate] [--json]`: counters and sizes; `--migrate` does the move + rebuild offline.
+- `low_memory: true` - 1 GB RAM profile: main sled cache ≤ 16 MiB.
+- Metrics page: **memory** card (RSS, swap, database sizes, 1 GB badge) and **cold storage** card (blocks in flat files /
+  in sled, progress bar, "restart to release memory"); `/api/ntfry/metrics` -> `node.coldBlocks`, `node.history`, `node.lowMemory`.
+- Measured (synthetic mainnet-like chain, 1.1 M blocks, 22 000 transactions, bare open): RSS 80 MB -> 9–11 MB, disk
+  738 MB -> 24 MB sled + 285 MB cold files; move 145 s, rebuild 7 s; peak RSS during the move 178 MB (16 MiB cache).
+  Not measured on a real 8.6 GB mainnet database. Details: docs/MEMORY-SLED-FINDINGS_RU.md, docs/RELEASE-0.26.0.md.
+- Downgrade: a migrated database cannot be opened by 0.25.x.
+
+### Added - experimental, off by default
+- `history:` - transaction indexes older than a hot window in a second sled database. Works and is tested
+  (tests/tx_list.rs), but measured to RAISE memory (a second sled database has its own page table) - kept off; with
+  21 000 transactions on mainnet it has nothing to move anyway.
+
+## [0.25.52]
+
+### Fixed - a delegate with a fast clock made the NEXT delegate lose its block (report 16.11.2026)
+- Cause: a block forged 1-8 s before its slot was discarded on arrival ("FUTURE BLOCK discarded"), then reached only
+  part of the network through later pulls. The next delegate forged at the same height, and the earlier-slot rule
+  swapped nodes back to the early block -> 8 s stall ("chain recovered ... after 8s") and an orphaned block of a healthy delegate.
+- Now a properly signed block that extends the tip and is **less than one slot early** is *held* and applied by every
+  node exactly when its slot starts (`intake::park_future` / `apply_due_parked`, 50 ms applier). No fork, the next
+  delegate forges on top of it. One held block per delegate, at most 8 in total; dropped if the tip moved meanwhile.
+- A block **more than one slot early** is still discarded for good; the network forges on the previous block and only
+  the delegate with the wrong clock misses its slot.
+- Alerts: `EARLY BLOCK held ...` (kind `future-block-held`) / `FUTURE BLOCK discarded ...`; metrics `intake.futureHeld
+  { count, last }` next to `intake.futureRejected`; metrics page shows "early block(s) held until slot start".
+- Consensus rules, block format and API are unchanged; nodes on 0.25.51 keep working (they still discard early blocks).
+
+## [0.25.51]
+
+### Fixed - delegates shown as LEGACY although they forge on PQ nodes (community report 11.11.2026)
+- `DelegateAnnounce` carries `nodeId` of the forging node; receivers verify the signature against it instead of the
+  gossip `delivered_from` (= last hop), so announces stay valid over any number of Plumtree hops and cannot be lost to
+  a relayed copy arriving first. Old announces without `nodeId` still verify against the 1-hop sender (compatible).
+- vendor/iroh-gossip `net.rs`: a failed / disconnected dial now drops the peer's `Pending` entry; before, its non-empty
+  queue blocked every later dial to that peer until restart.
+- Gossip membership: active view 5 -> 8, passive 30 -> 48 (more direct paths in a ~20-30 node validator swarm).
+- Startup relay ranking (`p2p_iroh::relay_probe`): all relays pinged in parallel, unreachable ones left out at boot
+  (no 30 s timeout on a dead relay) and re-added when they answer again; ranking logged.
+- `/api/ntfry/delegates`: `reason` / `reasonText` for every non-PQ delegate (no-announce, announce-stale,
+  announce-bad-signature, announce-clock-skew, legacy-blocks, iroh-off); metrics page shows `why: ...`.
+- Docs: `docs/EXPLORER-DELEGATES-STATUS_RU.md` - explorer guide for delegate PQ / LEGACY status and reasons.
+- Release notes `docs/RELEASE-0.25.51.md` (thanks to delegate `cyber` for the report).
+- `Cargo.toml`: new `release-lowmem` profile (`cargo build --profile release-lowmem -j 2`) for 2-4 GB RAM build hosts.
+
+## [0.25.50]
+
+### Changed - mainnet milestone moved to height 12,500,000, new token fees
+- `network/mainnet/milestones.json`: activation height **12,365,000 -> 12,500,000**, `minCoreVersion: "0.25.50"`.
+- TokenInit default fee (`tokenFees.init`) **500 -> 5000 STH**, 50 % (2500 STH) burned.
+- Mainnet TokenMeta fee (`tokenFees.meta`) **10 -> 100 STH**.
+- Metrics page: legacy peers card/table removed (all delegates are on PQ core), "delegates on rust" -> "delegates on pq",
+  payout calculator removed, new **burned STH** card (burn address balance, % of supply, circulating) from `burn` in `/api/ntfry/metrics`.
+- `sth-core init newnet` is an interactive wizard (16 questions, ENTER = default; delegates, treasury premine, delegate stake, block reward (`--block-reward`, 0 = off) and P2P / API / metrics ports included; example address shown after the start symbol): name (folder, a-z and '-'), symbol,
+  token, messagePrefix, address start symbol (one letter, default = token's first letter or S; the pubKeyHash code is written automatically, `--address-start`), slip44 (0-2147483647), wif,
+  generated unspendable burn address `<TOKEN>burnAddress...`, "Activate all features? [Y/n]". `--yes` / non-TTY = defaults.
+- Anti-scam tickers (mainnet, from `sobjV2`): `STH` can never be registered; 268 CoinMarketCap-top tickers in the embedded
+  `network/mainnet/reserved-tokens.json` are registrable (type-5 sObject and TokenInit) only by the address in
+  `reserved-tokens-owner.txt`. Error: `TokenReservedError: Token Reserved - ... please choose another name`. Other
+  networks may put their own `reserved-tokens.json` (+ owner file) in network_dir.
+- Docs: `docs/EXPLORER-TOKENS-MARKET_RU.md` - explorer guide for typeGroup 3 (types, amounts, orders, trades, SmartObject sale).
+- `init newnet` enables iroh (finality votes, wallet stream) isolated from mainnet: empty bootstrap, no relays, no n0
+  DNS, UDP port = P2P port, deterministic `iroh.key` (EndpointId printed + bootstrap hint in node.yaml). Gossip topics and
+  address records were already nethash-bound; `GetStatus` from a peer with another nethash is now refused.
+- `init newnet` writes the generation time as `epoch` in milestones.json (slot 0 of the new chain; nethash unchanged).
+- Legacy follow without any configured legacy peer (private networks) logs one INFO line every 5 min instead of a WARN every 5 s.
+- Doctor: legacy peers / legacy acceptance are informational (never DEGRADED); only "no iroh neighbours AND no legacy peers" fails (isolated node).
+- Metrics: "legacy acceptance" hint removed; `sth-core doctor` skips the legacy acceptance check silently without a public legacy address.
+- State audit: reminder threshold 2 -> **7 days**; a stale or missing audit no longer turns the verdict DEGRADED (only
+  unrepaired drift -> UNHEALTHY); hints say `audit-all --fix` weekly, the node keeps running.
+- Docs and CLI help updated; release notes `docs/RELEASE-0.25.50.md`, announcement `docs/ANNOUNCE-0.25.50_RU.md`.
+
 
 ## [0.25.49]
 

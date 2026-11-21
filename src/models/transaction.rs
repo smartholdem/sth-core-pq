@@ -40,7 +40,16 @@ pub mod token {
     pub const SELL: u16 = 5;
     pub const BUY: u16 = 6;
     pub const CANCEL: u16 = 7;
-    pub const LAST: u16 = CANCEL;
+    /// SHIP-43 v2 ask: `asset.price` = smartoshi per WHOLE token (fractional STH prices), milestone `tokenMarket.pricePerToken`.
+    pub const SELL_V2: u16 = 8;
+    pub const LAST: u16 = SELL_V2;
+    pub fn is_sell(type_: u16) -> bool {
+        type_ == SELL || type_ == SELL_V2
+    }
+    /// Units of the token `asset.price` refers to: 1 (legacy SELL) or 10^decimals (SELL_V2).
+    pub fn price_unit(type_: u16, decimals: u8) -> u64 {
+        if type_ == SELL_V2 { 10u64.pow(decimals.min(MAX_DECIMALS) as u32) } else { 1 }
+    }
     pub const FLAG_MINTABLE: u8 = 1;
     pub const FLAG_BURNABLE: u8 = 2;
     pub const FLAG_FROZEN_CAP: u8 = 4;
@@ -126,7 +135,7 @@ pub struct TokenAsset {
     pub recipient_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<TokenMeta>,
-    /// SHIP-43: `TokenSell` price in smartoshi per token unit.
+    /// SHIP-43: `TokenSell` price in smartoshi per token unit (`TokenSellV2`: per whole token).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_u64_str")]
     pub price: Option<u64>,
     /// SHIP-43: `TokenBuy` / `TokenCancel` target order (= the TokenSell transaction id).

@@ -762,23 +762,23 @@ impl Session {
 
     /// SHIP-43: `order` after every TokenSell / TokenBuy / TokenCancel (plus `trade` for a buy), filtered by `tokens`.
     async fn on_dex_tx(&mut self, tx: &Transaction) -> Result<(), String> {
-        use crate::models::token::{BUY, CANCEL, SELL};
+        use crate::models::token::{BUY, CANCEL, SELL, SELL_V2};
         let Some(a) = tx.token_asset() else { return Ok(()) };
-        if !matches!(tx.type_, SELL | BUY | CANCEL) || !(self.tokens.is_empty() || self.tokens.contains(&a.id)) {
+        if !matches!(tx.type_, SELL | BUY | CANCEL | SELL_V2) || !(self.tokens.is_empty() || self.tokens.contains(&a.id)) {
             return Ok(());
         }
         let st = self.att.state.clone();
-        let order_id = if tx.type_ == SELL { tx.id.clone() } else { a.order_id.clone() };
+        let order_id = if matches!(tx.type_, SELL | SELL_V2) { tx.id.clone() } else { a.order_id.clone() };
         let token = st.storage.token_state(&a.id).ok().flatten();
         if let Some(order) = order_id.and_then(|id| st.storage.token_order(&id).ok().flatten()) {
-            let action = match tx.type_ { SELL => "sell", BUY => "buy", _ => "cancel" };
+            let action = match tx.type_ { SELL | SELL_V2 => "sell", BUY => "buy", _ => "cancel" };
             self.emit(json!({ "type": "order", "tokenId": a.id, "symbol": token.as_ref().map(|t| t.symbol.clone()), "action": action, "txId": tx.id, "order": crate::api::tokens::order_json(&order, token.as_ref()) })).await?;
         }
         if tx.type_ == BUY {
             if let Some(tr) = st.storage.token_trades(&a.id).filter_map(|r| r.ok()).take(64).find(|t| Some(&t.tx_id) == tx.id.as_ref()) {
                 self.emit(json!({
                     "type": "trade", "tokenId": a.id, "symbol": token.as_ref().map(|t| t.symbol.clone()),
-                    "trade": { "txId": tr.tx_id, "orderId": tr.order_id, "buyer": tr.buyer, "seller": tr.seller, "amount": tr.amount.to_string(), "price": tr.price.to_string(), "total": tr.total.to_string(), "height": tr.height, "timestamp": tr.timestamp },
+                    "trade": { "txId": tr.tx_id, "orderId": tr.order_id, "buyer": tr.buyer, "seller": tr.seller, "amount": tr.amount.to_string(), "price": tr.price.to_string(), "priceUnit": tr.unit.to_string(), "pricePerToken": token.as_ref().map(|t| (tr.price as u128 * 10u128.pow(t.decimals as u32) / tr.unit.max(1) as u128).to_string()), "total": tr.total.to_string(), "height": tr.height, "timestamp": tr.timestamp },
                 }))
                 .await?;
             }
