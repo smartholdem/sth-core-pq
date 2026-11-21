@@ -1,4 +1,5 @@
 # Changelog
+
 ## [0.28.1]
 
 ### Fixed - `audit-all` reported (and with `--fix` "repaired") a correct balance of a market seller
@@ -18,7 +19,7 @@
 - New transaction `typeGroup 3 / type 8` `TokenSellV2`: same payload as `TokenSell`, but `price` is smartoshi per
   **whole** token, so asks like 0.04 STH per token work at 8 decimals. Activated by milestone
   `tokenMarket.pricePerToken` (mainnet `12950000`, `minCoreVersion` 0.28.0); every delegate must run 0.28.0 before it.
-- Orders store `unit` (1 = legacy, 10^decimals = V2); a buy pays `ceil(amount × price / unit)`. Legacy `TokenSell`
+- Orders store `unit` (1 = legacy, 10^decimals = V2); a buy pays `ceil(amount x price / unit)`. Legacy `TokenSell`
   is unchanged and stays valid; the book sorts both on one scale.
 - API: orders and trades gain `priceUnit` and `pricePerToken`; `/api/node/configuration` -> `tokenMarket.pricePerToken`;
   `/api/transactions/types` lists `TokenSellV2` once active. `trades?groupBy=` candles are now per whole token
@@ -68,7 +69,7 @@
 - `sth-core history` prints format, tx index counters and the last error; metrics page shows `compressed` /
   `conversion pending` and the tx index line. `node.history`: removed `prunedHeight`, `prune`, `historyCacheMb`; added `segments`.
 - Dev profile: `zstd-sys` built with opt-level 3. New dependency line `zstd = "0.9"` (already in the tree through sled).
-- Downgrade: a converted store cannot be opened by 0.26.0. Details: docs/RELEASE-0.27.0.md.
+- Downgrade: a converted store cannot be opened by 0.26.0.
 
 ## [0.26.0]
 
@@ -92,7 +93,7 @@
   in sled, progress bar, "restart to release memory"); `/api/ntfry/metrics` -> `node.coldBlocks`, `node.history`, `node.lowMemory`.
 - Measured (synthetic mainnet-like chain, 1.1 M blocks, 22 000 transactions, bare open): RSS 80 MB -> 9–11 MB, disk
   738 MB -> 24 MB sled + 285 MB cold files; move 145 s, rebuild 7 s; peak RSS during the move 178 MB (16 MiB cache).
-  Not measured on a real 8.6 GB mainnet database. Details: docs/MEMORY-SLED-FINDINGS_RU.md, docs/RELEASE-0.26.0.md.
+  Not measured on a real 8.6 GB mainnet database. 
 - Downgrade: a migrated database cannot be opened by 0.25.x.
 
 ### Added - experimental, off by default
@@ -128,8 +129,6 @@
   (no 30 s timeout on a dead relay) and re-added when they answer again; ranking logged.
 - `/api/ntfry/delegates`: `reason` / `reasonText` for every non-PQ delegate (no-announce, announce-stale,
   announce-bad-signature, announce-clock-skew, legacy-blocks, iroh-off); metrics page shows `why: ...`.
-- Docs: `docs/EXPLORER-DELEGATES-STATUS_RU.md` - explorer guide for delegate PQ / LEGACY status and reasons.
-- Release notes `docs/RELEASE-0.25.51.md` (thanks to delegate `cyber` for the report).
 - `Cargo.toml`: new `release-lowmem` profile (`cargo build --profile release-lowmem -j 2`) for 2-4 GB RAM build hosts.
 
 ## [0.25.50]
@@ -147,7 +146,6 @@
   `network/mainnet/reserved-tokens.json` are registrable (type-5 sObject and TokenInit) only by the address in
   `reserved-tokens-owner.txt`. Error: `TokenReservedError: Token Reserved - ... please choose another name`. Other
   networks may put their own `reserved-tokens.json` (+ owner file) in network_dir.
-- Docs: `docs/EXPLORER-TOKENS-MARKET_RU.md` - explorer guide for typeGroup 3 (types, amounts, orders, trades, SmartObject sale).
 - `init newnet` enables iroh (finality votes, wallet stream) isolated from mainnet: empty bootstrap, no relays, no n0
   DNS, UDP port = P2P port, deterministic `iroh.key` (EndpointId printed + bootstrap hint in node.yaml). Gossip topics and
   address records were already nethash-bound; `GetStatus` from a peer with another nethash is now refused.
@@ -157,7 +155,6 @@
 - Metrics: "legacy acceptance" hint removed; `sth-core doctor` skips the legacy acceptance check silently without a public legacy address.
 - State audit: reminder threshold 2 -> **7 days**; a stale or missing audit no longer turns the verdict DEGRADED (only
   unrepaired drift -> UNHEALTHY); hints say `audit-all --fix` weekly, the node keeps running.
-- Docs and CLI help updated; release notes `docs/RELEASE-0.25.50.md`, announcement `docs/ANNOUNCE-0.25.50_RU.md`.
 
 
 ## [0.25.49]
@@ -542,7 +539,6 @@
   the DHT socket.
 - `discovery.n0_dns: false` builds the endpoint with `presets::Minimal` (no n0 DNS publish/resolve, no n0 relays):
   discovery = sthpq address book + Mainline DHT only. Default stays `true` (fallback) until operators confirm the DHT.
-- `docs/NETWORK-AUTONOMY.md`: full guide to the four new modules and the n0 phase-out; `README.md` index entry.
 
 ## [0.25.20]
 
@@ -1037,8 +1033,7 @@
   idle_timeout_secs: 300 }` defaults for a 1–2 GB node (idle QUIC connection ≈ 60–100 KB); per-EndpointId token bucket,
   connection cap (close code 1), frame caps, idle timeout. `/api/node/status -> data.irohWalletApi` stats.
 - Reference client `p2p_iroh::wallet_api::client` (`call`, `call_on`, `verify_pdata`, `EventStream`), tests
-  `tests/iroh_wallet_api.rs`, spec `https://github.com/smartholdem/SHIPs/blob/master/SHIPS/SHIP-44.md`, wallet developer
-  guide `docs/WALLET-IROH-INTEGRATION.md`.
+  `tests/iroh_wallet_api.rs`, spec `https://github.com/smartholdem/SHIPs/blob/master/SHIPS/SHIP-44.md`.
 - `sth-core iroh-id --url [--name <provider>]` prints the node's provider-style address `api://<EndpointId>/sth-core`;
   the same
   URL is in `/api/node/status -> irohWalletApi.url` and the startup log. Request paths without `/api` are mapped onto
@@ -1055,11 +1050,6 @@
   refuses
   self-connections), so any node can front itself or another node. `p2p_iroh::ws_bridge::{serve, bind}`; axum `ws`
   feature.
-- Docs: `docs/WALLET-WS-MSGPACK.md` (browser WebSocket bridge + MessagePack for wallet developers and node
-  operators),
-  nginx `wss://` templates `docs/nginx/ws-bridge.smartholdem.io.conf` (own domain) and
-  `docs/nginx/snippets/sth-ws-bridge.conf`
-  (same domain as the REST API).
 
 ## [0.20.0]
 
@@ -1159,8 +1149,7 @@
   always used the configured port only the label was wrong. Peers are now shown as `legacy:<ip>`.
 - `StaticFeeMismatchError` for token transactions now reports the fee the transaction pays next to the expected one, so
   a relay
-  running other `tokenFees` / core version than the forger is diagnosable from the log (`docs/NEWNET.md` -> "Второй
-  узел").
+  running other `tokenFees` / core version than the forger is diagnosable from the log.
 
 ### Added SHIP-35 BFT finality gadget (soft mode by default, legacy-safe)
 
@@ -1200,7 +1189,6 @@
   off, Rust-only) makes `Storage::active_delegates` hence round snapshots and forging order skip the delegate until
   `bannedUntilRound`. `/api/ntfry/finality` -> `slashing`, `equivocations[]`; metrics card shows "⚠ N double votes".
   `init newnet --finality-hard` now also enables slashing.
-- `docs/MILESTONES.md`: how to switch every feature on through `milestones.json` (keys, examples, mainnet order).
 - Equivocation dashboard: proofs are kept as history (`eq:<pk>:<height>`, `Storage::equivocation_history`),
   `/api/ntfry/delegates`
   -> per delegate `doubleVotes`, `bannedUntilRound`, `banned` + `slashing { enabled, rounds, currentRound }` +
@@ -1208,7 +1196,7 @@
   metrics page: column "double votes / banned until" in the delegates table and an "equivocation proofs" table
   (`data-testid="equivocations-table"`). `cargo run --example seed_equivocation -- <net dir>` seeds a demo proof.
 - `sth-cli tx`: core v2 transactions (transfer) pay the node's SHIP-41 dynamic minimum
-  `(addonBytes + wire bytes) × rate`
+  `(addonBytes + wire bytes) x rate`
   from `configuration.transactionPool.dynamicFees` (or `node.yaml` when run next to the node), rounded up to 0.001 STH
   (`cli::dynamic_fee`); the `fee` line prints the calculation. `--fee <STH>` overrides it (core types only); static fee
   is used
@@ -1275,7 +1263,7 @@
 ### Added fee metrics
 
 - `Mempool::low_fee_rejected()` (count of `ERR_LOW_FEE`), `Mempool::min_transfer_fee()` (dynamic
-  `(addon + 156 B) × rate` or static);
+  `(addon + 156 B) x rate` or static);
   `metrics.mempool.dynamicFees { enabled, minFeePool, minFeeBroadcast, addonBytes, minTransferFee, transferBytes, lowFeeRejected }`.
   Metrics page: mempool card shows `min transfer 0.0077 STH (dynamic) · N low-fee rejected`; the payout calculator uses
   the dynamic
@@ -1288,7 +1276,7 @@
   mainnet legacy values (`transfer` 100, `vote` 100, `delegateRegistration` 400 000, ...). Partial overrides keep the
   other defaults.
 - Mempool (`Mempool::check_core_fee`): a core v2 transaction enters the pool at
-  `fee ≥ (addon_bytes[type] + wire bytes) × min_fee_pool`
+  `fee ≥ (addon_bytes[type] + wire bytes) x min_fee_pool`
   (≈ 0.0076 STH for a transfer instead of the 1 STH static fee) and is relayed / gossiped only from `min_fee_broadcast`
   (below it:
   accepted, kept local `accept` without `broadcast`, as in legacy). `enabled: false` demands exactly the static fee of
@@ -1325,7 +1313,7 @@
 
 ### Added Quantum Shield stage B (v3 transactions, ML-DSA-44) behind milestone `pq`
 
-- Wire format v3 (`SPEC-PQ-V3.md`): type-1 payload `alg || pk_len || pk`, second-signature section as
+- Wire format v3: type-1 payload `alg || pk_len || pk`, second-signature section as
   `alg || len || sig` blocks,
   JSON `secondSignatures: [{ algorithm, signature }]`, `asset.signature.algorithm`; `M2 = sha256(BODY || SIG1)`, ML-DSA
   context
@@ -1462,7 +1450,6 @@
 - Nonce race handled: when earlier transactions of the sender are still in the pool the node's `expected N` is used and
   the
   transaction is re-signed and re-sent once. `tx-status --wait` waits until the transaction leaves the pool.
-- `docs/CLI.md`.
 
 ## [0.15.0]
 
@@ -1585,7 +1572,7 @@
   `GET /api/tokens/{id}/logo` serves the image (`image/svg+xml` / `image/png`, cache + CSP headers). Logo bytes never
   appear in JSON.
 - `sth-core tx ...` CLI signer for private networks / tests: `transfer`, `obj-register`, `obj-update`, `token-init`,
-  `token-transfer` (`--to ADDR:AMOUNT` ×N), `token-mint`, `token-burn`, `token-meta --logo file.svg|png`. Human amounts
+  `token-transfer` (`--to ADDR:AMOUNT` xN), `token-mint`, `token-burn`, `token-meta --logo file.svg|png`. Human amounts
   with
   decimals, nonce / fees / ids resolved through the local API, `--dry-run` prints the signed JSON, passphrase via
   `STH_PASSPHRASE`.
@@ -1774,8 +1761,7 @@
 - `memory: rss N MB` INFO log every 10 min (Linux) and `node.rssBytes` in `/api/ntfry/metrics`; the metrics page shows
   RSS next to uptime.
 - `db_cache_mb` in node.yaml (default 64): sled page cache size set 16–32 on a 1 GB VPS.
-- Payout calculator: Robinhood Chain (L2, ETH gas) column; article `ARTICLE-BNB-SOLANA-STH_RU.md` now compares four
-  networks.
+
 
 ## [0.9.2]
 
@@ -1786,7 +1772,6 @@
   from the node.
 - `/api/ntfry/metrics` -> `data.chain.multiPaymentLimit` and `data.chain.fees {transfer, multiPayment}` (smartoshi,
   current milestone).
-- Docs: `MULTIPAY-1024.md` (blocktime x tx/block matrix for 1 024-recipient multipayments), `CONSENSUS.md`(finality explained, BFT-gadget protocol).
 
 ## [0.9.1]
 
@@ -1867,7 +1852,7 @@
 
 ### Performance
 
-- **Signature verification 8× faster** (`tests/bench_block.rs`, 4 vCPU): block of 500 transfers verify 411 -> 52 ms,
+- **Signature verification 8x faster** (`tests/bench_block.rs`, 4 vCPU): block of 500 transfers verify 411 -> 52 ms,
   10 000 transfers 8.2 s -> 1.0 s (verify + apply 9.1 s -> 1.95 s a 10k-tx block now fits an 8 s slot).
     - `crypto/schnorr.rs`: the quadratic-residue test used `num-bigint` modpow on every signature (≈ 0.5 ms); now k256's
       native `FieldElement::sqrt()`. `s·G − e·A` is one Shamir/Straus `lincomb_ext` instead of two scalar
