@@ -21,6 +21,12 @@ pub struct NodeConfig {
     pub db_path: String,
     /// sled page cache in MiB (default 64). Lower it (16–32) on VPS with ≤1 GB RAM; sled may use ~2× this value.
     pub db_cache_mb: u32,
+    /// 1 GB RAM profile: caps the sled page cache (≤ 16 MiB). Use on VPS with ≤ 1 GB RAM.
+    pub low_memory: bool,
+    /// Compact transaction index (0.27.0): indexes older than the hot window live in flat files of the cold store.
+    pub history: HistoryConfig,
+    /// Cold block store (0.26.0): blocks deeper than the undo margin live in flat files outside sled.
+    pub cold_blocks: ColdBlocksConfig,
     /// Count the wallets for the startup banner (a full `w:` key scan, ~1–3 s on a mainnet database with a cold page
     /// cache). Informational only — the state itself lives in sled and is never regenerated at start (unlike the
     /// legacy "State Generation" steps); registered delegates are always counted (cheap `wu:` index).
@@ -426,6 +432,71 @@ impl Default for DynamicFeesConfig {
     }
 }
 
+/// `cold_blocks:` — flat-file store for blocks deeper than `UNDO_DEPTH + 100` (the bulk of sled's memory on mainnet).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ColdBlocksConfig {
+    /// false = blocks stay in sled (an existing cold store keeps being used — the blocks live there).
+    pub enabled: bool,
+    /// Directory of the flat files; empty = `<db_path>/cold`.
+    pub path: String,
+}
+
+impl Default for ColdBlocksConfig {
+    fn default() -> Self {
+        Self { enabled: true, path: String::new() }
+    }
+}
+
+/// `history:` — where the transaction indexes older than the hot window are kept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// true = transaction indexes older than `hot_window` move from sled to compact flat files in the cold store
+    /// directory; false = they stay in sled (already moved ones keep being read from the files).
+    pub enabled: bool,
+    /// Ignored since 0.27.0 (the files live in the cold store directory, `cold_blocks.path`).
+    pub path: String,
+    /// Ignored since 0.27.0 (flat files need no cache).
+    pub cache_mb: u32,
+    /// Newest transactions whose indexes stay in the main database.
+    pub hot_window: u64,
+    /// Ignored since 0.27.0 (moved records always leave the main database after verification).
+    pub prune_migrated: bool,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self { enabled: true, path: String::new(), cache_mb: 8, hot_window: crate::storage::HOT_TX_WINDOW, prune_migrated: true }
+    }
+}
+
+impl NodeConfig {
+    /// Main sled cache after the `low_memory` cap.
+    pub fn effective_db_cache_mb(&self) -> u32 {
+        if self.low_memory { self.db_cache_mb.min(16) } else { self.db_cache_mb }
+    }
+
+    /// Storage layout of this node; `rebuild` lets the open call rebuild the main database when it is due.
+    pub fn storage_options(&self, rebuild: bool) -> crate::storage::StorageOptions {
+        let c = &self.cold_blocks;
+        crate::storage::StorageOptions {
+            cache_mb: self.effective_db_cache_mb(),
+            history: self.history_options(),
+            cold: crate::storage::ColdOptions { enabled: c.enabled, path: (!c.path.trim().is_empty()).then(|| std::path::PathBuf::from(c.path.trim())), ..Default::default() },
+            rebuild,
+        }
+    }
+
+    pub fn history_options(&self) -> crate::storage::HistoryOptions {
+        let h = &self.history;
+        crate::storage::HistoryOptions {
+            enabled: h.enabled,
+            hot_window: h.hot_window,
+        }
+    }
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -435,6 +506,9 @@ impl Default for NodeConfig {
             ntp_server: "pool.ntp.org".into(),
             db_path: "./data".into(),
             db_cache_mb: 64,
+            low_memory: false,
+            history: HistoryConfig::default(),
+            cold_blocks: ColdBlocksConfig::default(),
             startup_scan: true,
             api: ApiConfig::default(),
             sync: SyncSection::default(),
@@ -541,6 +615,9 @@ impl NodeConfig {
         if self.delegate.min_quorum_peers == 0 {
             return Err(Error::Config("delegate.min_quorum_peers must be >= 1".into()));
         }
+        if self.history.hot_window < 1_000 {
+            return Err(Error::Config("history.hot_window must be >= 1000".into()));
+        }
         if self.p2p.parallel_peers == 0 {
             return Err(Error::Config("p2p.parallel_peers must be >= 1".into()));
         }
@@ -594,6 +671,22 @@ impl NodeConfig {
              # network_dir: optional folder with network.json / milestones.json / exceptions.json / genesisBlock.json[.gz]\n\
              #          (crypto-networks layout, `sth-core init --network-files` exports the embedded ones).\n\
              # db_cache_mb: sled page cache (MiB). 64 is fine for 2 GB+ RAM; use 16–32 on a 1 GB VPS (process RSS ≈ 2–3× this).\n\
+             # low_memory: true = 1 GB RAM profile (main sled cache ≤ 16 MiB).
+\
+             # cold_blocks: blocks deeper than 1 100 from the tip move from sled to flat files (`path`, empty = <db_path>/cold).
+\
+             #          sled keeps metadata of every stored page in RAM, flat files do not — this is what cuts the node's RSS.
+\
+             #          The move runs in the background (resumable, verified before anything is removed from sled); the main
+\
+             #          database is rebuilt once at the next start after it (that restart releases the memory).
+\
+             #          Since 0.27.0 the files are compressed (a 0.26.0 store is converted once at start).
+\
+             # history: transaction indexes older than `hot_window` (50 000 newest transactions) move from sled to compact
+\
+             #          flat files in the cold store directory (enabled: true). Verified before anything leaves sled, resumable.
+\
              # startup_scan: count the wallets for the startup banner (full key scan, ~1–3 s on mainnet). Informational only —\n\
              #               the state is kept in sled incrementally; integrity is checked by `sth-core audit-all`, not at start.\n\
              # freeze_abort_secs: runtime freeze watchdog — an OS thread aborts the process (systemd restarts it) when the async\n\

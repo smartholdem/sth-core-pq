@@ -757,8 +757,7 @@ impl Mempool {
         let token_buy = tx
             .token_asset()
             .filter(|_| tx.type_group == crate::models::TYPE_GROUP_TOKEN && tx.type_ == crate::models::token::BUY)
-            .and_then(|a| Some((a.amount.unwrap_or(0), self.storage.token_order(a.order_id.as_deref()?).ok().flatten()?.price)))
-            .map(|(n, p)| n.saturating_mul(p))
+            .and_then(|a| Some(self.storage.token_order(a.order_id.as_deref()?).ok().flatten()?.cost(a.amount.unwrap_or(0))))
             .unwrap_or(0);
         tx.amount as i128 + tx.fee as i128 + payments as i128 + buy_price as i128 + token_buy as i128
     }
@@ -792,7 +791,7 @@ impl crate::rules::TokenView for PoolTokenView<'_> {
             .filter_map(|p| p.token_asset().filter(|a| a.id == id).map(|a| (p.type_, a)))
             .map(|(t, a)| match t {
                 crate::models::token::TRANSFER => a.transfers.unwrap_or_default().iter().map(|i| i.amount).sum(),
-                crate::models::token::BURN | crate::models::token::SELL => a.amount.unwrap_or(0),
+                crate::models::token::BURN | crate::models::token::SELL | crate::models::token::SELL_V2 => a.amount.unwrap_or(0),
                 _ => 0,
             })
             .sum();
@@ -803,9 +802,10 @@ impl crate::rules::TokenView for PoolTokenView<'_> {
         use crate::models::token;
         let mut order = self.storage.token_order(id).ok().flatten().or_else(|| {
             let p = self.pool.get(id)?;
-            let a = p.token_asset().filter(|_| p.type_ == token::SELL)?;
+            let a = p.token_asset().filter(|_| token::is_sell(p.type_))?;
             let seller = crate::crypto::address_from_public_key(&p.sender_public_key, self.storage.network().pubkey_hash).ok()?;
-            Some(crate::storage::TokenOrder { id: id.to_string(), token_id: a.id, seller, amount: a.amount.unwrap_or(0), filled: 0, price: a.price.unwrap_or(0), height: 0, closed: None, fills: Vec::new() })
+            let unit = token::price_unit(p.type_, self.storage.token_state(&a.id).ok().flatten().map_or(0, |s| s.decimals));
+            Some(crate::storage::TokenOrder { id: id.to_string(), token_id: a.id, seller, amount: a.amount.unwrap_or(0), filled: 0, price: a.price.unwrap_or(0), unit, height: 0, closed: None, fills: Vec::new() })
         })?;
         for p in self.pool.values() {
             let Some(a) = p.token_asset().filter(|a| a.order_id.as_deref() == Some(id)) else { continue };
@@ -824,7 +824,7 @@ impl crate::rules::TokenView for PoolTokenView<'_> {
     }
     fn open_orders(&self, seller: &str, token_id: &str) -> usize {
         let on_chain = self.storage.wallet_orders(seller).unwrap_or_default().into_iter().filter(|o| o.token_id == token_id).count();
-        let pending = self.pool.values().filter(|p| p.sender_public_key == self.sender_pk && p.type_group == crate::models::TYPE_GROUP_TOKEN && p.type_ == crate::models::token::SELL && p.token_asset().is_some_and(|a| a.id == token_id)).count();
+        let pending = self.pool.values().filter(|p| p.sender_public_key == self.sender_pk && p.type_group == crate::models::TYPE_GROUP_TOKEN && crate::models::token::is_sell(p.type_) && p.token_asset().is_some_and(|a| a.id == token_id)).count();
         on_chain + pending
     }
     fn ticker_sobj(&self, id: &str) -> Option<(String, String, bool)> {

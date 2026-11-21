@@ -159,7 +159,7 @@ fn milestones(opts: &NewNetOptions) -> Result<String> {
     base.insert("ship13".into(), json!(true));
     base.insert("tokens".into(), json!(false));
     if opts.all_features {
-        base.insert("tokenMarket".into(), json!({ "enabled": true, "maxOpenOrders": 64 }));
+        base.insert("tokenMarket".into(), json!({ "enabled": true, "maxOpenOrders": 64, "pricePerToken": true }));
         base.insert("masternodes".into(), json!({ "enabled": true }));
     }
     base.insert("sobjV2".into(), json!(true));

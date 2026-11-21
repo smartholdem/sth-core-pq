@@ -384,6 +384,83 @@ fn token_market_types_wire_format_and_activation_gate() {
     assert!(err.starts_with("TokenOrderNotFoundError"), "{err}");
 }
 
+/// TokenSellV2 (milestone `tokenMarket.pricePerToken`): price per whole token, so 0.04 STH works at 8 decimals; buys
+/// round up in the seller's favour; legacy asks stay valid and the book sorts both on one scale.
+#[tokio::test]
+async fn token_market_v2_fractional_price_per_token() {
+    use sth_core::rules::check_token_format;
+    let ms_v2 = MAINNET_MILESTONES_JSON.replace("\"ship11\": true", "\"ship11\": true, \"aip36\": true, \"tokens\": true, \"tokenMarket\": { \"enabled\": true, \"pricePerToken\": true }");
+    let net = Network::from_json(MAINNET_NETWORK_JSON, &ms_v2, MAINNET_EXCEPTIONS_JSON, MAINNET_GENESIS_GZ).unwrap();
+    let alice = KeyPair::from_passphrase("alice").unwrap();
+    let bob = KeyPair::from_passphrase("bob").unwrap();
+    let (a, b) = (alice.address(63).unwrap(), bob.address(63).unwrap());
+    let sell_v2 = |k: &KeyPair, n: u64, id: &str, amount: u64, price: u64| token_tx(k, n, token::SELL_V2, 100_000_000, serde_json::json!({ "id": id, "amount": amount.to_string(), "price": price.to_string() }));
+
+    // wire round-trip; gate: refused without pricePerToken
+    let t = sign(sell_v2(&alice, 1, &"ab".repeat(32), 10, 4_000_000), &alice);
+    let back = deserialize_transaction(&serialize_transaction(&t, SerializeOptions::default(), &net).unwrap()).unwrap();
+    assert_eq!((back.type_, back.token_asset()), (token::SELL_V2, t.token_asset()));
+    assert!(check_token_format(&t, network_market().milestone(2)).unwrap_err().contains("pricePerToken"));
+    assert!(check_token_format(&t, net.milestone(2)).is_ok());
+
+    let mut c = Chain::new(net);
+    for addr in [&a, &b] {
+        c.storage.update_wallet_state(addr, 100_000_000_000_000, 0).unwrap();
+    }
+    let reg = sign(ticker(&alice, 1, "SCAT"), &alice);
+    c.try_block(vec![reg.clone()]).unwrap();
+    let id = reg.id.clone().unwrap();
+    let one = 100_000_000u64; // 1 SCAT = 10^8 units
+    c.try_block(vec![sign(token_tx(&alice, 2, token::INIT, INIT_FEE, serde_json::json!({ "id": id, "decimals": 8, "flags": 0, "initialSupply": (1_000 * one).to_string(), "supplyCap": (1_000 * one).to_string() })), &alice)]).unwrap();
+    c.storage.set_undo_enabled(true);
+    let sth = |c: &Chain, addr: &str| c.storage.get_wallet(addr).unwrap().unwrap().balance;
+
+    // 100 SCAT at 0.04 STH per token (4 000 000 smartoshi) + a legacy ask at 1 smartoshi per unit (= 1 STH per token)
+    let ask = sign(sell_v2(&alice, 3, &id, 100 * one, 4_000_000), &alice);
+    let legacy = sign(sell(&alice, 4, &id, one, 1), &alice);
+    c.try_block(vec![legacy.clone(), ask.clone()]).unwrap();
+    let oid = ask.id.clone().unwrap();
+    let o = c.storage.token_order(&oid).unwrap().unwrap();
+    assert_eq!((o.price, o.unit, o.cost(o.remaining()), o.price_per_token(8)), (4_000_000, one, 4 * one, 4_000_000));
+    let book = c.storage.token_orders(&id).unwrap();
+    assert_eq!(book.iter().map(|o| o.id.clone()).collect::<Vec<_>>(), vec![oid.clone(), legacy.id.clone().unwrap()], "0.04 STH ask sorts before 1 STH");
+
+    // 25 SCAT cost exactly 1 STH; a 1-unit buy pays ceil(0.04 smartoshi) = 1
+    let (a0, b0) = (sth(&c, &a), sth(&c, &b));
+    c.try_block(vec![sign(buy(&bob, 1, &id, &oid, 25 * one), &bob)]).unwrap();
+    assert_eq!(c.bal(&b, &id), 25 * one);
+    assert_eq!(sth(&c, &b), b0 - one as i64 - 10_000_000);
+    assert_eq!(sth(&c, &a), a0 + one as i64);
+    c.try_block(vec![sign(buy(&bob, 2, &id, &oid, 1), &bob)]).unwrap();
+    assert_eq!(sth(&c, &b), b0 - one as i64 - 1 - 20_000_000);
+    let tr = c.storage.token_trades(&id).next().unwrap().unwrap();
+    assert_eq!((tr.amount, tr.total, tr.unit), (1, 1, one));
+
+    // API: per-token price for both order kinds, transaction type listed
+    let mempool = Arc::new(sth_core::mempool::Mempool::new(c.storage.clone(), vec![], 100));
+    let state = Arc::new(sth_core::api::AppState::new(c.storage.clone(), mempool, vec![]));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { sth_core::api::serve_listener(state, listener).await.unwrap() });
+    let book: serde_json::Value = reqwest::get(format!("{base}/api/tokens/SCAT/orders")).await.unwrap().json().await.unwrap();
+    assert_eq!((book["data"][0]["pricePerToken"].as_str(), book["data"][0]["priceUnit"].as_str()), (Some("4000000"), Some("100000000")));
+    assert_eq!((book["data"][1]["pricePerToken"].as_str(), book["data"][1]["priceUnit"].as_str()), (Some("100000000"), Some("1")));
+    let remaining = 75 * one - 1;
+    assert_eq!(book["data"][0]["total"], (remaining as u128 * 4_000_000).div_ceil(one as u128).to_string());
+    let trades: serde_json::Value = reqwest::get(format!("{base}/api/tokens/SCAT/trades")).await.unwrap().json().await.unwrap();
+    assert_eq!(trades["data"][1]["pricePerToken"], "4000000");
+    let types: serde_json::Value = reqwest::get(format!("{base}/api/transactions/types")).await.unwrap().json().await.unwrap();
+    assert_eq!(types["data"]["3"]["TokenSellV2"], 8);
+
+    // rollback: fills undone, then the v2 sell disappears
+    c.rollback();
+    c.rollback();
+    assert_eq!((c.bal(&b, &id), sth(&c, &b)), (0, b0));
+    c.rollback();
+    assert!(c.storage.token_order(&oid).unwrap().is_none());
+    assert_eq!(c.bal(&a, &id), 1_000 * one);
+}
+
 /// SHIP-43 stage B: escrow on sell, partial fills with the STH leg, cancel returns the remainder, exact rollback,
 /// mempool sees pending fills, order book API.
 #[tokio::test]
@@ -530,8 +607,16 @@ async fn token_market_orders_fill_cancel_and_rollback() {
     let candles: serde_json::Value = reqwest::get(format!("{base}/api/tokens/UFO/trades?groupBy=day&days=0")).await.unwrap().json().await.unwrap();
     let cs = candles["data"].as_array().unwrap();
     assert_eq!(cs.len(), 1, "both fills in one block → one day: {candles}");
-    assert_eq!((cs[0]["open"].as_str(), cs[0]["close"].as_str(), cs[0]["high"].as_str(), cs[0]["low"].as_str()), (Some("100000000"), Some("200000000"), Some("200000000"), Some("100000000")));
+    assert_eq!((cs[0]["open"].as_str(), cs[0]["close"].as_str(), cs[0]["high"].as_str(), cs[0]["low"].as_str()), (Some("10000000000"), Some("20000000000"), Some("20000000000"), Some("10000000000")), "candles are per whole token");
+    assert_eq!(candles["meta"]["priceScale"], "perToken");
     assert_eq!((cs[0]["volume"].as_str(), cs[0]["trades"].as_u64()), (Some("40"), Some(2)));
+    // audit-all books every fill to buyer and seller: the only difference left is the test funding
+    let report = c.storage.audit_all(|_| {}).unwrap();
+    assert_eq!(report.skipped, 0, "token purchases are computed, not skipped");
+    for w in [&a, &b, &k] {
+        let d = report.drifted.iter().find(|d| d.address == **w).unwrap();
+        assert_eq!(i128::from(d.stored_balance.unwrap()) - d.computed_balance, 100_000_000_000_000, "{w}");
+    }
 }
 
 #[test]

@@ -66,7 +66,7 @@ fn deserialize_type_payload(tx: &mut Transaction, r: &mut ByteReader) -> Result<
                 a.amount = Some(r.u64_le()?);
                 a.recipient_id = Some(read_address(r)?);
             }
-            token::SELL => {
+            token::SELL | token::SELL_V2 => {
                 a.amount = Some(r.u64_le()?);
                 a.price = Some(r.u64_le()?);
             }

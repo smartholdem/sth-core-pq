@@ -14,7 +14,7 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(name = "sth-cli", version, about = "SmartHoldem node client — query the REST API and send signed transactions")]
 struct Cli {
-    /// Node REST API, e.g. https://node0.smartholdem.io or http://127.0.0.1:4004 (remembered for next runs).
+    /// Node REST API, e.g. https://node0.smartholdem.io or http://127.0.0.1:4003 (remembered for next runs).
     #[arg(long, global = true, env = "STH_API")]
     api: Option<String>,
     /// Machine-readable output (raw JSON).
@@ -181,11 +181,40 @@ fn describe(t: &Value, me: &str) -> String {
                 5 => format!("token {id} ask: {} units at {} STH/unit", token["amount"], coins(&token["price"])),
                 6 => format!("token {id} buy {} units from order {}…", token["amount"], &token["orderId"].as_str().unwrap_or("")[..8]),
                 7 => format!("token {id} cancel order {}…", &token["orderId"].as_str().unwrap_or("")[..8]),
+                8 => format!("token {id} ask: {} units at {} STH/token", token["amount"], coins(&token["price"])),
                 _ => format!("token tx type {ty}"),
             }
         }
         (g, ty) => format!("tx group {g} type {ty}"),
     }
+}
+
+/// Load `KEY=VALUE` pairs from `.env` (current dir, then next to the binary); real environment variables win.
+fn load_dotenv() {
+    let mut files = vec![PathBuf::from(".env")];
+    if let Some(d) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join(".env"))) {
+        files.push(d);
+    }
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(&f) else { continue };
+        for (k, v) in parse_dotenv(&text) {
+            if std::env::var_os(&k).is_none() {
+                std::env::set_var(k, v);
+            }
+        }
+    }
+}
+
+fn parse_dotenv(text: &str) -> Vec<(String, String)> {
+    text.trim_start_matches('\u{feff}').lines().filter_map(|l| {
+        let l = l.trim();
+        let l = l.strip_prefix("export ").unwrap_or(l);
+        if l.is_empty() || l.starts_with('#') { return None; }
+        let (k, v) = l.split_once('=')?;
+        let v = v.trim();
+        let v = if v.len() >= 2 && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\''))) { &v[1..v.len() - 1] } else { v };
+        Some((k.trim().to_string(), v.to_string()))
+    }).filter(|(k, _)| !k.is_empty()).collect()
 }
 
 fn kv(rows: &[(&str, String)]) {
@@ -197,6 +226,7 @@ fn kv(rows: &[(&str, String)]) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_dotenv();
     let cli = Cli::parse();
     let api = resolve_api(cli.api.clone());
     let http = reqwest::Client::new();
@@ -392,8 +422,8 @@ async fn main() -> Result<()> {
                 let dec = o["decimals"].as_u64().unwrap_or(0) as u32;
                 let scale = 10f64.powi(dec as i32);
                 let remaining = o["remaining"].as_str().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / scale;
-                let price_unit = o["price"].as_str().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-                println!("  {:>14.8} STH/token  {:>16.*} left  total {:>12} STH  {}  order {}", price_unit * scale / 1e8, dec as usize, remaining, coins(&o["total"]), o["seller"].as_str().unwrap_or("?"), &o["orderId"].as_str().unwrap_or("")[..16]);
+                let per_token = o["pricePerToken"].as_str().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                println!("  {:>14.8} STH/token  {:>16.*} left  total {:>12} STH  {}  order {}", per_token / 1e8, dec as usize, remaining, coins(&o["total"]), o["seller"].as_str().unwrap_or("?"), &o["orderId"].as_str().unwrap_or("")[..16]);
             }
             Ok(())
         }
@@ -513,5 +543,14 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dotenv_tests {
+    #[test]
+    fn parses_quotes_export_comments_crlf() {
+        let r = super::parse_dotenv("\u{feff}# c\r\nSTH_PASSPHRASE=\"a b c\"\r\nexport STH_API='http://x:4003'\nEMPTY=\"\"\n\nbad\n");
+        assert_eq!(r, vec![("STH_PASSPHRASE".into(), "a b c".into()), ("STH_API".into(), "http://x:4003".into()), ("EMPTY".into(), "".into())]);
     }
 }

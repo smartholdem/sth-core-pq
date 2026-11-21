@@ -308,6 +308,9 @@ pub async fn metrics(State(st): State<Shared>) -> ApiResult {
             "pqCommitments": st.storage.pq_commitment_count(), "pqActive": st.storage.pq_key_count(), "pqStage": if ms.pq.blocks { "C" } else if st.network.milestone(tip + 1).pq.active { "B" } else { "A" },
             "pqBlocks": ms.pq.blocks, "lastBlockVersion": last.as_ref().map(|b| b.version),
             "lastAudit": st.storage.last_audit()?,
+            "lowMemory": crate::mem::low_memory(),
+            "history": st.storage.history_status()?,
+            "coldBlocks": st.storage.cold_status()?,
         },
         "chain": {
             "height": tip, "id": last.as_ref().and_then(|b| b.id.clone()),

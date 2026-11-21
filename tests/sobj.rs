@@ -438,6 +438,14 @@ fn sobj_sell_and_buy() {
     assert_eq!(c.storage.get_sobject(&id).unwrap().unwrap().0, c_addr);
     assert_eq!(bal(&c, &c_addr), 100_000_000_000 + 250_000_000_000 - 300_000_000_000 - sobj::FEE_BUY as i64);
 
+    // audit-all books the price to the seller and the buyer: the only difference left is the test funding
+    let report = c.storage.audit_all(|_| {}).unwrap();
+    assert_eq!(report.skipped, 0, "market purchases are computed, not skipped");
+    for (w, funded) in [(&a, 100_000_000_000_000i128), (&b, 200_100_000_000), (&c_addr, 100_000_000_000)] {
+        let d = report.drifted.iter().find(|d| d.address == **w).unwrap();
+        assert_eq!(i128::from(d.stored_balance.unwrap()) - d.computed_balance, funded, "{w}");
+    }
+
     // legacy rules: sell / buy refused
     let mut legacy = Chain::new(network_aip36());
     legacy.storage.update_wallet_state(&a, 100_000_000_000_000, 0).unwrap();

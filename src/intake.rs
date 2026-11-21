@@ -91,7 +91,27 @@ pub fn future_slot_ms(block: &crate::models::Block, network: &crate::config::Net
     (early > FUTURE_SLOT_GRACE_MS).then_some(early)
 }
 
-/// Count a future block (metrics `intake.futureRejected` / `intake.futureHeld`) and alert once per cooldown.
+/// A delegate clock that is ahead by less than this is not worth an alert (the block is held and applied on time).
+pub const CLOCK_ALERT_MIN_MS: i64 = 3_000;
+/// At most one clock alert per delegate in this time.
+pub const CLOCK_ALERT_EVERY_MS: i64 = 4 * 3600 * 1000;
+
+/// True when an early / future block of `generator` should raise an alert now; remembers that it did.
+pub fn clock_alert_due(generator: &str, early_ms: i64, now_ms: i64) -> bool {
+    static LAST: OnceLock<Mutex<std::collections::HashMap<String, i64>>> = OnceLock::new();
+    if early_ms < CLOCK_ALERT_MIN_MS {
+        return false;
+    }
+    let mut last = LAST.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if last.get(generator).is_some_and(|t| now_ms - *t < CLOCK_ALERT_EVERY_MS) {
+        return false;
+    }
+    last.insert(generator.to_string(), now_ms);
+    true
+}
+
+/// Count a future block (metrics `intake.futureRejected` / `intake.futureHeld`); alert when the clock is ahead by
+/// 3 s or more, at most once per delegate in 4 hours.
 /// `held` = the block is parked until its slot starts (clock ahead by less than a slot), otherwise it is dropped.
 pub fn note_future_block(storage: &crate::storage::Storage, block: &crate::models::Block, early_ms: i64, held: bool) {
     let username = crate::crypto::address_from_public_key(&block.generator_public_key, storage.network().pubkey_hash).ok().and_then(|a| storage.get_wallet(&a).ok().flatten()).and_then(|w| w.username);
@@ -112,20 +132,23 @@ pub fn note_future_block(storage: &crate::storage::Storage, block: &crate::model
         }
     }
     let secs = early_ms as f64 / 1000.0;
+    let alert = clock_alert_due(&block.generator_public_key, early_ms, now_ms()) && crate::alerts::enabled();
     if held {
         tracing::warn!("Block {} by {name} arrived {secs:.1}s before its slot — held and applied when the slot starts (delegate {name}'s clock runs ahead)", block.height);
-        crate::alerts::notify(
+        let _ = alert && crate::alerts::notify(
             "future-block-held",
             format!("EARLY BLOCK held: height {} by delegate {name} arrived {secs:.1}s before its slot. It is applied when the slot starts, other delegates are not affected. The system clock of {name}'s node is ahead by about that much — tell the operator to enable NTP (timedatectl set-ntp true / chrony).", block.height),
-            false,
-        );
+            true,
+        )
+        .is_some();
     } else {
         tracing::warn!("Discarded block {} by {name}: it takes a future slot starting in {secs:.1}s — delegate {name}'s clock runs ahead", block.height);
-        crate::alerts::notify(
+        let _ = alert && crate::alerts::notify(
             "future-block",
             format!("FUTURE BLOCK discarded: height {} by delegate {name} takes a slot that starts in {secs:.1}s (more than one slot ahead). The system clock of {name}'s node is ahead by about that much — tell the operator to enable NTP (timedatectl set-ntp true / chrony). Until then that delegate misses its slots; other delegates are not affected.", block.height),
-            false,
-        );
+            true,
+        )
+        .is_some();
     }
 }
 
@@ -566,6 +589,18 @@ pub fn spawn_stall_watchdog(storage: std::sync::Arc<crate::storage::Storage>, pe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_alert_skips_small_drift_and_fires_once_per_four_hours_per_delegate() {
+        let hour = 3600 * 1000;
+        assert!(!clock_alert_due("d1", 2_200, 0), "under 3 s: never");
+        assert!(!clock_alert_due("d1", 2_999, hour));
+        assert!(clock_alert_due("d1", 3_000, hour));
+        assert!(!clock_alert_due("d1", 9_000, hour + 1));
+        assert!(!clock_alert_due("d1", 9_000, 5 * hour - 1));
+        assert!(clock_alert_due("d2", 4_000, 2 * hour), "another delegate has its own timer");
+        assert!(clock_alert_due("d1", 3_500, 5 * hour));
+    }
 
     #[test]
     fn records_last_block_and_averages_per_source() {

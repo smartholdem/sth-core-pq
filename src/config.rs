@@ -241,6 +241,8 @@ pub struct TokenMarketParams {
     pub enabled: bool,
     /// Open orders per seller per token (0 = default 64).
     pub max_open_orders: u32,
+    /// TokenSellV2 (type 8): price in smartoshi per whole token, so fractional STH prices work at any decimals.
+    pub price_per_token: bool,
 }
 
 fn default_init_fee() -> u64 {
@@ -743,6 +745,11 @@ mod tests {
         assert_eq!((m.token_fees.sell, m.token_fees.buy, m.token_fees.cancel), (100_000_000, 10_000_000, 10_000_000));
         assert_eq!(m.min_core_version, "0.25.50");
         assert!(!m.pq.active && !m.pq.blocks && !m.finality.active && !m.masternodes.enabled);
+        assert!(!m.token_market.price_per_token);
+        assert!(!n.milestone(12_949_999).token_market.price_per_token);
+        let v2 = n.milestone(12_950_000);
+        assert!(v2.token_market.price_per_token && v2.token_market.enabled && v2.tokens);
+        assert_eq!((v2.token_market.max_open_orders, v2.min_core_version.as_str()), (64, "0.28.0"));
         assert_eq!(m.static_fee("transfer"), 100_000_000);
     }
 

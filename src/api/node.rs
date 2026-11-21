@@ -121,7 +121,7 @@ fn static_fee_map(st: &Shared) -> Result<Map<String, Value>, Error> {
 
 fn token_market_json(m: &crate::config::Milestone) -> Value {
     let max = if m.token_market.max_open_orders == 0 { crate::rules::MAX_OPEN_ORDERS as u32 } else { m.token_market.max_open_orders };
-    json!({ "enabled": m.token_market.enabled, "maxOpenOrders": max, "fees": { "sell": m.token_fees.sell.to_string(), "buy": m.token_fees.buy.to_string(), "cancel": m.token_fees.cancel.to_string() } })
+    json!({ "enabled": m.token_market.enabled, "maxOpenOrders": max, "pricePerToken": m.token_market.price_per_token, "fees": { "sell": m.token_fees.sell.to_string(), "buy": m.token_fees.buy.to_string(), "cancel": m.token_fees.cancel.to_string() } })
 }
 
 fn masternodes_json(m: &crate::config::Milestone) -> Value {
@@ -286,6 +286,9 @@ pub async fn transaction_types(State(st): State<Shared>) -> ApiResult {
             data["3"]["TokenSell"] = json!(5);
             data["3"]["TokenBuy"] = json!(6);
             data["3"]["TokenCancel"] = json!(7);
+            if st.network.milestone(last_height(&st)? + 1).token_market.price_per_token {
+                data["3"]["TokenSellV2"] = json!(8);
+            }
         }
     }
     Ok(Json(json!({ "data": data })))

@@ -296,9 +296,12 @@ pub fn check_token_format(tx: &Transaction, ms: &crate::config::Milestone) -> Re
             check_token_meta(a.meta.as_ref().ok_or("TokenMetaInvalidError: missing asset.token.meta")?)?;
             f.meta
         }
-        token::SELL | token::BUY | token::CANCEL => {
+        token::SELL | token::BUY | token::CANCEL | token::SELL_V2 => {
             if !ms.token_market.enabled {
                 return Err("TokenTypeNotActiveError: tokenMarket is not enabled at this height (SHIP-43)".into());
+            }
+            if tx.type_ == token::SELL_V2 && !ms.token_market.price_per_token {
+                return Err("TokenTypeNotActiveError: TokenSellV2 needs milestone tokenMarket.pricePerToken".into());
             }
             let oid_ok = a.order_id.as_deref().is_some_and(|o| o.len() == 64 && o.chars().all(|c| c.is_ascii_hexdigit()));
             match tx.type_ {
@@ -307,8 +310,14 @@ pub fn check_token_format(tx: &Transaction, ms: &crate::config::Milestone) -> Re
                     if amount == 0 || price == 0 {
                         return Err("TokenOrderInvalidError: amount and price must be > 0".into());
                     }
-                    if (amount as u128) * (price as u128) > u64::MAX as u128 {
+                    if tx.type_ == token::SELL && (amount as u128) * (price as u128) > u64::MAX as u128 {
                         return Err("TokenOrderOverflowError: amount × price exceeds u64".into());
+                    }
+                    f.sell
+                }
+                token::SELL_V2 => {
+                    if a.amount.unwrap_or(0) == 0 || a.price.unwrap_or(0) == 0 {
+                        return Err("TokenOrderInvalidError: amount and price must be > 0".into());
                     }
                     f.sell
                 }
@@ -422,7 +431,7 @@ pub fn token_buy_total(tx: &Transaction, view: &dyn TokenView) -> u64 {
     }
     let Some(a) = tx.token_asset() else { return 0 };
     let Some(o) = a.order_id.as_deref().and_then(|id| view.order(id)) else { return 0 };
-    a.amount.unwrap_or(0).saturating_mul(o.price)
+    o.cost(a.amount.unwrap_or(0))
 }
 
 /// SHIP-43 default `tokenMarket.maxOpenOrders`.
@@ -432,9 +441,13 @@ pub const MAX_OPEN_ORDERS: usize = 64;
 pub fn check_token(tx: &Transaction, a: &crate::models::TokenAsset, sender: &str, view: &dyn TokenView) -> Result<(), String> {
     use crate::models::token;
     match tx.type_ {
-        token::SELL => {
-            view.token_state(&a.id).ok_or("TokenNotFoundError")?;
+        token::SELL | token::SELL_V2 => {
+            let st = view.token_state(&a.id).ok_or("TokenNotFoundError")?;
             let amount = a.amount.unwrap_or(0);
+            let unit = token::price_unit(tx.type_, st.decimals) as u128;
+            if (amount as u128 * a.price.unwrap_or(0) as u128).div_ceil(unit) > u64::MAX as u128 {
+                return Err("TokenOrderOverflowError: amount × price exceeds u64".into());
+            }
             if view.token_balance(sender, &a.id) < amount {
                 return Err("TokenInsufficientBalanceError".into());
             }

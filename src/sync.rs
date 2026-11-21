@@ -665,10 +665,11 @@ impl BatchTokenView<'_> {
                     st.meta = a.meta.clone();
                 }
             }
-            token::SELL => {
+            token::SELL | token::SELL_V2 => {
                 let amount = a.amount.unwrap_or(0);
                 bump(sender, -(amount as i128));
-                self.orders.insert(tx_id.to_string(), crate::storage::TokenOrder { id: tx_id.to_string(), token_id: a.id.clone(), seller: sender.to_string(), amount, filled: 0, price: a.price.unwrap_or(0), height, closed: None, fills: Vec::new() });
+                let unit = token::price_unit(type_, crate::rules::TokenView::token_state(self, &a.id).map_or(0, |s| s.decimals));
+                self.orders.insert(tx_id.to_string(), crate::storage::TokenOrder { id: tx_id.to_string(), token_id: a.id.clone(), seller: sender.to_string(), amount, filled: 0, price: a.price.unwrap_or(0), unit, height, closed: None, fills: Vec::new() });
             }
             token::BUY | token::CANCEL => {
                 let oid = a.order_id.clone().unwrap_or_default();
